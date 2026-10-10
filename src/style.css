@@ -1,0 +1,127 @@
+:root {
+  font-family: system-ui, -apple-system, Segoe UI, sans-serif;
+  color: #243041;
+  background: #e8ebef;
+  font-size: 14px;
+  line-height: 1.4;
+}
+
+* { box-sizing: border-box; }
+body { margin: 0; }
+[hidden] { display: none !important; }
+h1, h2, p { margin: 0; }
+h1 { font-size: 1.25rem; letter-spacing: -0.03em; }
+h2 { font-size: 1.2rem; }
+
+#app {
+  min-height: 100svh;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  padding: 12px;
+}
+
+.app-header, .toolbar, .export-bar, .row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+}
+.app-header { padding: 0 2px; }
+#collectionSummary { color: #586575; }
+.status-chip {
+  margin-left: auto;
+  font-size: 12px;
+  padding: 4px 9px;
+  border-radius: 20px;
+  background: #dce1e7;
+}
+.status-chip.ok { color: #12643b; background: #d4eddf; }
+.toolbar { padding: 8px; background: #fff; border-radius: 8px; }
+.workspace-status { display: flex; justify-content: space-between; flex-wrap: wrap; gap: 4px 12px; font-size: 12px; padding: 0 4px; }
+#liveText { font-variant-numeric: tabular-nums; color: #596676; }
+.hint { color: #667384; font-size: 12px; }
+
+button, input, select { font: inherit; }
+button {
+  min-height: 44px;
+  border: 1px solid #c5cdd8;
+  border-radius: 6px;
+  padding: 8px 13px;
+  background: #f8f9fb;
+  color: #243041;
+  cursor: pointer;
+}
+button:hover:not(:disabled) { background: #e7edf5; }
+button.primary { border-color: #2865bd; color: #fff; background: #2865bd; }
+button.primary:hover:not(:disabled) { background: #1f519b; }
+button.danger { color: #a42c2c; }
+button:disabled { opacity: 0.45; cursor: not-allowed; }
+:focus-visible { outline: 2px solid #2865bd; outline-offset: 2px; }
+
+.plot-shell {
+  flex: 1;
+  min-height: 360px;
+  background: #f5f6f8;
+  border: 1px solid #bbc4d0;
+  border-radius: 6px;
+  overflow: hidden;
+}
+#plot { display: block; width: 100%; height: max(360px, calc(100svh - 225px)); }
+.plot-background { fill: #fff; }
+#plot .grid line { stroke-width: 1; }
+#plot .grid .minor { stroke: #eff1f4; }
+#plot .grid .major { stroke: #dde2e9; }
+#plot .origin-axes { fill: none; stroke: #bbc4d0; stroke-width: 1; }
+#plot .bed-outline { fill: none; stroke: #788697; stroke-width: 1; }
+#plot .geometry { fill: none; }
+#plot .geometry * { vector-effect: non-scaling-stroke; stroke-width: 1.4; }
+#plot .head-marker { fill: none; stroke: #db4242; stroke-width: 1.5; }
+#plot .rulers { font-size: 11px; fill: #647285; font-variant-numeric: tabular-nums; }
+.export-bar { padding: 0 2px; }
+.export-bar > .hint { margin-right: auto; }
+#exportStatus { flex-basis: 100%; font-size: 12px; }
+#exportStatus:empty { display: none; }
+
+dialog {
+  width: min(620px, calc(100vw - 24px));
+  max-height: calc(100svh - 32px);
+  padding: 20px;
+  border: 1px solid #c7ced8;
+  border-radius: 12px;
+  color: inherit;
+  background: #fff;
+  box-shadow: 0 20px 70px #15243840;
+}
+dialog::backdrop { background: #17233580; }
+dialog > *, form > * { margin-bottom: 16px; }
+dialog > :last-child, form > :last-child { margin-bottom: 0; }
+.dialog-header { display: flex; align-items: center; justify-content: space-between; gap: 16px; }
+.form-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 14px; }
+label { display: flex; flex-direction: column; gap: 5px; font-size: 13px; }
+input, select { width: 100%; min-width: 0; padding: 9px; border: 1px solid #c5cdd8; border-radius: 5px; background: #fff; }
+input[type='color'] { min-height: 42px; padding: 4px; }
+label.check { flex-direction: row; align-items: center; }
+input[type='checkbox'] { width: auto; }
+fieldset { border: 1px solid #dde2e9; border-radius: 6px; padding: 14px; }
+legend { color: #596676; padding: 0 6px; }
+fieldset .row { margin-bottom: 14px; }
+#pointsDialog { width: min(980px, calc(100vw - 24px)); }
+.table-wrap { overflow-x: auto; }
+table { border-collapse: collapse; width: 100%; min-width: 650px; }
+th, td { padding: 6px; text-align: left; border-bottom: 1px solid #e6eaf0; }
+th { font-size: 12px; color: #667384; }
+td input { min-width: 75px; }
+
+@media (max-width: 600px) {
+  #app { padding: 8px; gap: 8px; }
+  .app-header { gap: 6px; }
+  #collectionSummary { order: 4; flex-basis: 100%; font-size: 12px; }
+  .toolbar { gap: 6px; }
+  .toolbar button { flex: 1 1 28%; padding: 8px; font-size: 12px; }
+  #plot { height: max(360px, calc(100svh - 310px)); }
+  .export-bar button { flex: 1; padding: 8px; font-size: 12px; }
+  .export-bar > .hint { flex-basis: 100%; }
+  .form-grid { grid-template-columns: 1fr; }
+  dialog { padding: 14px; }
+}
