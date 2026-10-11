@@ -79,6 +79,88 @@ The Cloudflare backend must enforce authorization on every operation; relay IDs 
 
 Settings dialogs apply on **Apply settings**; Cancel/Escape leaves the collection unchanged. Coordinates and labels remain editable after finishing. The connection secret stays in memory only and is not part of browser autosave or session backups.
 
+## Live update (append-only drawing)
+
+**Live update to LightBurn** is off by default. At a new/empty group, choose your
+shape, colours and labels, then enable it and approve the warning. In cloud mode,
+RAP must be connected with fresh coordinates and this browser must have control.
+Local development mode also requires a verified LightBurn workspace.
+
+- Each circle capture imports one new circle. Each polyline/polygon capture
+  after the first imports only the edge from the preceding point. A first path
+  point has no edge, but imports its label if enabled. Coincident points do not
+  create phantom edges.
+- Numbers/names are sent once with each new point, using that group's numbering
+  and label settings. **Finish** sends only a valid polygon's closing edge,
+  without resending its earlier edges or labels.
+- The browser saves immutable updates with the captured points before sending.
+  At most **20 updates**, including the in-flight update, can be pending.
+  Imports are serial; capture can continue while confirmation is pending.
+  The status shows pending and confirmed counts. A full queue blocks further
+  live captures until capacity becomes available.
+- Live groups' existing points, Undo and settings are locked while live mode is
+  active or its queue is unresolved. Finish a group to choose settings for the
+  next one. Unrelated older groups stay editable. Clear/session replacement and
+  destination changes are blocked until live work is resolved.
+- Switching the toggle off drains already queued work; subsequent captures stay
+  local. Editing/deleting points afterwards changes **PathPlotter only**.
+  LightBurn's existing imported objects are not updated or removed.
+- Only one tab can own live drawing at a time, using the browser's Web Locks
+  support. Other tabs cannot edit the same saved work while that owner is active.
+- **Send to LightBurn** remains a full-collection import, not a synchronization
+  operation. It is unavailable during live work and warns about duplicates after
+  live imports. **Download SVG** still exports the complete collection.
+
+### Recovery and limitations
+
+On reload, Live update stays off and saved updates are paused; nothing is
+automatically resent. In cloud mode, use **Check live import** to query RAP.
+For a failed, expired, uncertain or interrupted import, inspect LightBurn/RAP and
+use **Acknowledge import outcome** to remove that update without retrying it.
+Then explicitly **Resume queued updates**, or **Abandon unsent updates**.
+Abandoning preserves captured points and does not remove any LightBurn artwork.
+Local imports have no queryable historical confirmation; inspect LightBurn
+before acknowledging them. Missing geometry must be corrected manually.
+
+The queue is bound to the original destination and coordinate context. A
+different machine/workspace cannot silently inherit it. Storage errors prevent
+new captures/updates from being committed and sent. Preserve browser storage or
+export a backup before clearing anything; session-file import rejects backups
+containing unresolved live work rather than replaying them on another machine.
+
+This is **append-only drawing**, not bidirectional synchronization. Each imported
+edge is a separate LightBurn object; a visually closed outline is not necessarily
+one joined shape suitable for fills/offsets. Join objects manually in LightBurn
+when needed. The REST API does not expose selective vector removal or replacement.
+Its `file_imported` event has no job ID, so avoid unrelated imports while drawing.
+HTTP 202 is acceptance, not success. Unknown outcomes stop dispatch and never
+trigger automatic re-upload.
+
+The relay allows **1,000 imports per rolling 24 hours per RAP** with separate
+bounded pending SVG storage. Each nonempty delta counts as an import. Quota errors
+pause the queue explicitly; this is not a promise of free hosting. Actual visible
+latency includes browser/RAP polling, network, LightBurn import time and backlog.
+
+### Rollout and hardware check
+
+Use the updated frontend, Worker and RAP together. Restart RAP with the updated
+files; deploy the updated Worker before cloud testing (GitHub Pages alone does
+not deploy it). CI packages the RAP sources into its downloadable artifact.
+No API capability changes or additional Cloudflare services are required.
+
+Test in a disposable LightBurn project without running the laser:
+
+1. Capture three circles; verify each appears once at its workpiece coordinates.
+2. Finish, change colour/type and capture horizontal and vertical segments with
+   numbering. Verify placement, colour and upright labels without earlier duplicates.
+3. Capture a non-collinear polygon; verify the last-to-first edge appears only
+   after Finish. Inspect the separate objects and manually join if needed.
+4. Capture rapidly while imports are pending; confirm fresh coordinates continue
+   and the ordered queue drains. Turn the toggle off and verify queued work drains.
+5. Verify reload pauses queued work and recovery does not repeat an attempted import.
+6. Observe selection/zoom changes and capture-to-visible latency in LightBurn.
+   Mocked tests cannot certify hardware placement, responsiveness or import UX.
+
 ## Important constraints
 
 - This app does not jog/move the machine and does not start jobs.

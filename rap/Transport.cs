@@ -69,6 +69,7 @@ namespace PathPlotterRap
                 string value;
                 if (events.TryDequeue(out value)) return value;
                 if (closed) return null;
+                if (timeoutMs <= 0) return null;
                 Thread.Sleep(10);
             } while (timer.ElapsedMilliseconds < timeoutMs);
             return null;

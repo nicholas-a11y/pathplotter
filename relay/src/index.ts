@@ -15,7 +15,8 @@ const BROWSER_LEASE_MS = 15_000;
 const PAIRING_LIFETIME_MS = 5 * 60_000;
 const JOB_LIFETIME_MS = 60_000;
 const JOB_RETENTION_MS = 24 * 60 * 60_000;
-const JOB_LIMIT = 10;
+const JOB_LIMIT = 1_000;
+const PENDING_JOB_LIMIT = 10;
 
 type JsonObject = Record<string, unknown>;
 type Snapshot = {
@@ -1060,6 +1061,10 @@ export class RelayDO extends DurableObject<Env> {
         "SELECT id FROM jobs WHERE status IN ('claimed', 'attempting', 'accepted') LIMIT 1",
       ).toArray()[0];
       if (active) throw new HttpError(409, "import_in_progress");
+      const pending = this.ctx.storage.sql.exec<{ count: number }>(
+        "SELECT COUNT(*) AS count FROM jobs WHERE svg IS NOT NULL",
+      ).one().count;
+      if (pending >= PENDING_JOB_LIMIT) throw new HttpError(429, "pending_job_limit_reached");
       const retained = this.ctx.storage.sql.exec<{ count: number }>(
         "SELECT COUNT(*) AS count FROM jobs WHERE created_at > ?",
         now - JOB_RETENTION_MS,

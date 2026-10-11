@@ -287,6 +287,177 @@ describe("PathPlotter relay HTTP contract", () => {
     expect((await json<{ status: string }>(expiredJob)).status).toBe("expired");
   });
 
+  it("admits exactly 1,000 jobs per rolling 24 hours and reconciles duplicates at the limit", async () => {
+    const relay = await register();
+    const agent = await startAgent(relay);
+    const browser = await pairBrowser(agent);
+    expect((await call(`/v1/relays/${relay.relayId}/control`, {
+      credential: browser.credential,
+      bindings: relay.bindings,
+      body: {},
+    })).status).toBe(200);
+    await update(agent, 2);
+
+    vi.useFakeTimers();
+    const now = Date.now();
+    vi.setSystemTime(now);
+    for (let index = 0; index < 999; index += 1) {
+      const payload = jobPayload();
+      payload.checksum = await checksum(SVG);
+      const queued = await call(`/v1/relays/${relay.relayId}/jobs`, {
+        credential: browser.credential,
+        bindings: relay.bindings,
+        body: payload,
+      });
+      expect(queued.status, `admission ${index + 1}`).toBe(200);
+      vi.setSystemTime(now + 60_001);
+      const expired = await call(`/v1/relays/${relay.relayId}/jobs/${payload.id}`, {
+        credential: browser.credential,
+        bindings: relay.bindings,
+      });
+      expect((await json<{ status: string }>(expired)).status, `expiry ${index + 1}`).toBe("expired");
+      vi.setSystemTime(now);
+    }
+
+    const thousandth = jobPayload();
+    thousandth.checksum = await checksum(SVG);
+    const lastAllowed = await call(`/v1/relays/${relay.relayId}/jobs`, {
+      credential: browser.credential,
+      bindings: relay.bindings,
+      body: thousandth,
+    });
+    expect(lastAllowed.status).toBe(200);
+    expect((await json<{ status: string }>(lastAllowed)).status).toBe("queued");
+
+    const reconciliation = await call(`/v1/relays/${relay.relayId}/jobs`, {
+      credential: browser.credential,
+      bindings: relay.bindings,
+      body: thousandth,
+    });
+    expect(reconciliation.status).toBe(200);
+    expect((await json<{ id: string; status: string }>(reconciliation))).toEqual({
+      id: thousandth.id,
+      status: "queued",
+    });
+
+    const overLimit = jobPayload();
+    overLimit.checksum = thousandth.checksum;
+    const rejected = await call(`/v1/relays/${relay.relayId}/jobs`, {
+      credential: browser.credential,
+      bindings: relay.bindings,
+      body: overLimit,
+    });
+    expect(rejected.status).toBe(429);
+    expect(await json<{ error: string }>(rejected)).toEqual({ error: "job_limit_reached" });
+  }, 30_000);
+
+  it("limits pending SVG payloads independently and releases them after expiry", async () => {
+    const relay = await register();
+    const agent = await startAgent(relay);
+    const browser = await pairBrowser(agent);
+    await call(`/v1/relays/${relay.relayId}/control`, {
+      credential: browser.credential,
+      bindings: relay.bindings,
+      body: {},
+    });
+    await update(agent, 2);
+
+    const pending: Record<string, unknown>[] = [];
+    for (let index = 0; index < 10; index += 1) {
+      const payload = jobPayload();
+      payload.checksum = await checksum(SVG);
+      const response = await call(`/v1/relays/${relay.relayId}/jobs`, {
+        credential: browser.credential,
+        bindings: relay.bindings,
+        body: payload,
+      });
+      expect(response.status, `pending payload ${index + 1}`).toBe(200);
+      pending.push(payload);
+    }
+
+    const reconciliation = await call(`/v1/relays/${relay.relayId}/jobs`, {
+      credential: browser.credential,
+      bindings: relay.bindings,
+      body: pending[0],
+    });
+    expect(reconciliation.status).toBe(200);
+
+    const eleventh = jobPayload();
+    eleventh.checksum = await checksum(SVG);
+    const full = await call(`/v1/relays/${relay.relayId}/jobs`, {
+      credential: browser.credential,
+      bindings: relay.bindings,
+      body: eleventh,
+    });
+    expect(full.status).toBe(429);
+    expect(await json<{ error: string }>(full)).toEqual({ error: "pending_job_limit_reached" });
+
+    vi.useFakeTimers();
+    const now = Date.now();
+    vi.setSystemTime(now + 60_001);
+    const expired = await call(`/v1/relays/${relay.relayId}/jobs/${pending[0].id}`, {
+      credential: browser.credential,
+      bindings: relay.bindings,
+    });
+    expect((await json<{ status: string }>(expired)).status).toBe("expired");
+    vi.setSystemTime(now);
+    await update(agent, 3);
+    await call(`/v1/relays/${relay.relayId}/control`, {
+      credential: browser.credential,
+      bindings: relay.bindings,
+      body: {},
+    });
+    const admitted = await call(`/v1/relays/${relay.relayId}/jobs`, {
+      credential: browser.credential,
+      bindings: relay.bindings,
+      body: eleventh,
+    });
+    expect(admitted.status).toBe(200);
+  });
+
+  it("deletes job results after their 24-hour retention window", async () => {
+    const relay = await register();
+    const agent = await startAgent(relay);
+    const browser = await pairBrowser(agent);
+    await call(`/v1/relays/${relay.relayId}/control`, {
+      credential: browser.credential,
+      bindings: relay.bindings,
+      body: {},
+    });
+    await update(agent, 2);
+    const payload = jobPayload();
+    payload.checksum = await checksum(SVG);
+    const queued = await call(`/v1/relays/${relay.relayId}/jobs`, {
+      credential: browser.credential,
+      bindings: relay.bindings,
+      body: payload,
+    });
+    expect(queued.status).toBe(200);
+
+    vi.useFakeTimers();
+    vi.setSystemTime(Date.now() + 24 * 60 * 60_000);
+    const removed = await call(`/v1/relays/${relay.relayId}/jobs/${payload.id}`, {
+      credential: browser.credential,
+      bindings: relay.bindings,
+    });
+    expect(removed.status).toBe(404);
+
+    await update(agent, 3);
+    await call(`/v1/relays/${relay.relayId}/control`, {
+      credential: browser.credential,
+      bindings: relay.bindings,
+      body: {},
+    });
+    const afterRetention = jobPayload();
+    afterRetention.checksum = await checksum(SVG);
+    const admitted = await call(`/v1/relays/${relay.relayId}/jobs`, {
+      credential: browser.credential,
+      bindings: relay.bindings,
+      body: afterRetention,
+    });
+    expect(admitted.status).toBe(200);
+  });
+
   it("accounts for delayed publication, serializes imports, and fences old generations", async () => {
     const relay = await register();
     const agent = await startAgent(relay);
@@ -348,6 +519,15 @@ describe("PathPlotter relay HTTP contract", () => {
     const claimedResponse = await update(agent, 5);
     const claimed = await json<{ job: { id: string; status: string; svg: string } | null }>(claimedResponse);
     expect(claimed.job).toMatchObject({ id: jobId, status: "claimed", svg: SVG });
+    const competingJob = jobPayload();
+    competingJob.checksum = await checksum(SVG);
+    const conflict = await call(`/v1/relays/${relay.relayId}/jobs`, {
+      credential: browser.credential,
+      bindings: relay.bindings,
+      body: competingJob,
+    });
+    expect(conflict.status).toBe(409);
+    expect(await json<{ error: string }>(conflict)).toEqual({ error: "import_in_progress" });
     const nextUpdate = await update(agent, 6);
     expect((await json<{ job: unknown }>(nextUpdate)).job).toBeNull();
 

@@ -30,6 +30,7 @@ $script:Sequence = 0L
 $script:PendingPairings = @{}
 $script:CommandBuffer = ''
 $script:StopRequested = $false
+$script:ActiveImport = $null
 $script:LightBurnRoot = 'http://127.0.0.1:19520'
 
 function Get-Field($Object, [string]$Name) {
@@ -460,7 +461,66 @@ function Get-ImportResult([string]$Data) {
     return 'failed'
 }
 
+function Complete-Import([string]$Status, [string]$Message = '') {
+    $active = $script:ActiveImport
+    if ($null -eq $active) { return }
+    try {
+        Set-Record $active.id $Status $Message
+        Write-Host ('Import result: ' + $Status)
+    } finally {
+        $script:ActiveImport = $null
+        if ($null -ne $active.stream) { $active.stream.Dispose() }
+    }
+}
+
+function Stop-Import {
+    if ($null -eq $script:ActiveImport) { return }
+    if ($script:ActiveImport.attempted) {
+        Complete-Import 'unknown' 'RAP stopped or lost cloud generation during import. Inspect LightBurn; no automatic retry.'
+    } else {
+        Complete-Import 'failed' 'Import refused before upload: RAP stopped or lost cloud generation.'
+    }
+}
+
+function Assert-ImportOwnership {
+    if ($script:StopRequested -or $null -eq $script:Generation -or
+        $script:ActiveImport.generation -ne $script:Generation) {
+        throw 'RAP stopped or lost cloud generation.'
+    }
+}
+
+function Update-Import {
+    if ($null -eq $script:ActiveImport) { return }
+    $active = $script:ActiveImport
+    if ($script:StopRequested -or $null -eq $script:Generation -or $active.generation -ne $script:Generation) {
+        Stop-Import
+        return
+    }
+    if ($active.phase -ne 'waiting') { return }
+    try {
+        if ($script:Clock.ElapsedMilliseconds -ge $active.deadline) {
+            Complete-Import 'unknown' 'Upload accepted but no genuine file_imported confirmation within 20 seconds. Inspect LightBurn; do not automatically resend.'
+            return
+        }
+        # One nonblocking dequeue per iteration bounds work even for invalid events.
+        $result = Get-ImportResult ($active.stream.Take(0))
+        if ($null -ne $result) {
+            $message = ''
+            if ($result -eq 'failed') { $message = 'LightBurn file_imported explicitly reported failure.' }
+            Complete-Import $result $message
+        } elseif (-not $active.stream.IsOpen) {
+            Complete-Import 'unknown' 'Upload accepted but SSE closed without genuine file_imported confirmation. Inspect LightBurn; do not automatically resend.'
+        }
+    } catch {
+        if ($null -ne $script:ActiveImport) {
+            Complete-Import 'unknown' 'Import confirmation unavailable. Inspect LightBurn; no automatic retry.'
+        } else { throw }
+    }
+}
+
 function Invoke-Import($Job, $Observation) {
+    # The retained stream is the import mutex, including the confirmation window.
+    if ($null -ne $script:ActiveImport) { return }
     $id = Get-Field $Job 'id'
     if ($id -isnot [string] -or $id -notmatch '^[A-Za-z0-9_-]{1,128}$') { throw 'Cloud returned an invalid job identifier.' }
     if ($script:Journal.ContainsKey($id)) {
@@ -469,14 +529,17 @@ function Invoke-Import($Job, $Observation) {
         Save-Journal
         return
     }
-    $stream = $null
-    $attempted = $false
+    $active = @{ id = $id; generation = $script:Generation; stream = $null; attempted = $false; phase = 'starting'; deadline = 0L }
+    $script:ActiveImport = $active
     try {
+        Assert-ImportOwnership
         $bytes = Assert-Job $Job $Observation
         Set-Record $id 'claimed'
-        $stream = New-ImportStream
+        $active.stream = New-ImportStream
+        $stream = $active.stream
         if (-not $stream.WaitReady(3000)) { throw 'LightBurn SSE did not send its connected readiness comment.' }
         $fresh = Get-Observation
+        Assert-ImportOwnership
         $bytes = Assert-Job $Job $fresh
         if (-not $stream.IsOpen) { throw 'LightBurn event stream closed before upload.' }
         Set-Record $id 'attempting'
@@ -484,35 +547,25 @@ function Invoke-Import($Job, $Observation) {
         Send-Record $id
         # Cloud acknowledgement may have taken seconds. Revalidate afterwards.
         $fresh = Get-Observation
+        Assert-ImportOwnership
         $bytes = Assert-Job $Job $fresh
         if (-not $stream.IsOpen) { throw 'LightBurn event stream closed before upload.' }
         $stream.Arm()
-        $attempted = $true
+        $active.attempted = $true
         $response = Send-Upload $Job $bytes
         if ($response.code -ne 202) {
-            Set-Record $id 'unknown' 'Unexpected upload response; inspect LightBurn before any manual resend.'
+            Complete-Import 'unknown' 'Unexpected upload response; inspect LightBurn before any manual resend.'
             return
         }
+        $active.deadline = $script:Clock.ElapsedMilliseconds + 20000
         Set-Record $id 'accepted'
         try { Send-Record $id } catch { Write-Host 'Cloud import acknowledgement unavailable; saved locally.' }
-        $deadline = $script:Clock.ElapsedMilliseconds + 20000
-        while ($script:Clock.ElapsedMilliseconds -lt $deadline -and $stream.IsOpen) {
-            $result = Get-ImportResult ($stream.Take(200))
-            if ($null -ne $result) {
-                $message = ''
-                if ($result -eq 'failed') { $message = 'LightBurn file_imported explicitly reported failure.' }
-                Set-Record $id $result $message
-                Write-Host ("Import result: " + $result)
-                return
-            }
-        }
-        Set-Record $id 'unknown' 'Upload accepted but no genuine file_imported confirmation. Inspect LightBurn; do not automatically resend.'
+        $active.phase = 'waiting'
+        Assert-ImportOwnership
     } catch {
-        if ($attempted) { Set-Record $id 'unknown' 'Import side effect may have occurred. Inspect LightBurn; no automatic retry.' }
-        else { Set-Record $id 'failed' 'Import refused before upload: invalid job, stale context, unavailable SSE, or cloud ownership not acknowledged.' }
-        Write-Host ('Import result: ' + $script:Journal[$id].status)
-    } finally {
-        if ($null -ne $stream) { $stream.Dispose() }
+        if ($null -eq $script:ActiveImport) { throw }
+        if ($active.attempted) { Complete-Import 'unknown' 'Import side effect may have occurred. Inspect LightBurn; no automatic retry.' }
+        else { Complete-Import 'failed' 'Import refused before upload: invalid job, stale context, unavailable SSE, or cloud ownership not acknowledged.' }
     }
 }
 
@@ -656,12 +709,17 @@ function Start-Rap {
         catch { throw 'Another RAP instance is running, or the local state directory cannot be locked.' }
         Load-Journal
         Initialize-Config
+        $script:StopRequested = $false
+        $script:Generation = $null
+        $script:ServerTime = $null
+        $script:ClockUncertainty = $null
         Write-Host 'RAP running. Browser Send authorizes SVG import only, never laser start/jog/fire. Type help for commands; Ctrl+C or quit stops.'
         $backoff = 500
         $lastHealth = ''
         $nextRead = 0L
         while (-not $script:StopRequested) {
             Read-ConsoleCommand
+            Update-Import
             if ($script:StopRequested) { break }
             $delay = $nextRead - $script:Clock.ElapsedMilliseconds
             if ($delay -gt 0) { Start-Sleep -Milliseconds ([int][Math]::Min(50, $delay)); continue }
@@ -702,6 +760,7 @@ function Start-Rap {
                 $script:ServerTime = $null
                 $script:ClockUncertainty = $null
                 $script:PendingPairings = @{}
+                Stop-Import
                 $health = 'Cloud disconnected, unauthorized, fenced, or invalid response. Fresh samples withheld; reconnecting.'
                 if ($lastHealth -ne $health) { Write-Host $health; $lastHealth = $health }
                 $nextRead = $script:Clock.ElapsedMilliseconds + $backoff
@@ -709,13 +768,15 @@ function Start-Rap {
             }
         }
     } finally {
-        if ($null -ne $script:Generation -and $null -ne $script:Config -and -not [string]::IsNullOrEmpty($script:Config.credential)) {
-            try {
-                $script:Sequence++
-                $null = Invoke-Cloud '/agent/update' @{ generation = $script:Generation; sequence = $script:Sequence; connected = $false; position = $null; context = $null; observationAgeMs = 0; observedAtServer = $null; clockUncertaintyMs = $null; error = 'RAP stopped.' }
-            } catch { }
+        try { Stop-Import } finally {
+            if ($null -ne $script:Generation -and $null -ne $script:Config -and -not [string]::IsNullOrEmpty($script:Config.credential)) {
+                try {
+                    $script:Sequence++
+                    $null = Invoke-Cloud '/agent/update' @{ generation = $script:Generation; sequence = $script:Sequence; connected = $false; position = $null; context = $null; observationAgeMs = 0; observedAtServer = $null; clockUncertaintyMs = $null; error = 'RAP stopped.' }
+                } catch { }
+            }
+            if ($null -ne $lock) { $lock.Dispose() }
         }
-        if ($null -ne $lock) { $lock.Dispose() }
     }
 }
 

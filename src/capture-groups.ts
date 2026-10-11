@@ -1,3 +1,5 @@
+import type { LiveQueue } from './live-updates'
+
 export type ShapeType = 'circles' | 'polyline' | 'polygon'
 
 export interface Point {
@@ -10,6 +12,8 @@ export interface Point {
 }
 
 export interface CaptureGroup {
+  liveLocked?: boolean
+  liveImported?: boolean
   name: string
   type: ShapeType
   points: Point[]
@@ -25,6 +29,7 @@ export interface CaptureGroup {
 }
 
 export interface Collection extends CaptureGroup {
+  liveQueue?: LiveQueue
   coordinateContext?: string
   groups: CaptureGroup[]
 }
@@ -38,8 +43,10 @@ export function allPoints(collection: Collection): Point[] {
 }
 
 export function finishCapture(collection: Collection): void {
-  const { groups: _groups, coordinateContext: _context, ...group } = collection
+  const { groups: _groups, coordinateContext: _context, liveQueue: _queue, ...group } = collection
   collection.groups.push({ ...group, finished: true, points: group.points.map(point => ({ ...point })) })
   collection.points = []
+  delete collection.liveLocked
+  delete collection.liveImported
   collection.finished = true
 }

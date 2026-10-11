@@ -3,6 +3,9 @@ import { captureGroups, allPoints, finishCapture, type Collection, type CaptureG
 import { layerPalette, isLayerColor } from './layer-palette'
 import { SettledPosition } from './settled-position'
 import { RelayClient, loadIdentity, saveIdentity, pairingInvitation, relayRequest, relayBaseUrl, parseJob } from './relay'
+import { appendCollectionPrimitives, primitiveBounds, hasEnoughPoints, serializeSvg, buildDelta, fmt, type BuiltSvg, type Primitive } from './geometry'
+import { LIVE_QUEUE_LIMIT, emptyLiveQueue, makeUpdate, enqueue, recordOutcome, parseLiveQueue, type LiveUpdate, type ImportTarget, type LiveQueue } from './live-updates'
+import { openImportStream, type ImportResult } from './import-stream'
 
 interface LivePosition {
   x: number
@@ -10,26 +13,8 @@ interface LivePosition {
   updatedAt: number
 }
 
-interface PolylinePrimitive {
-  kind: 'polyline'
-  points: Array<{ x: number; y: number }>
-  color: string
-  close: boolean
-}
-
-interface CirclePrimitive {
-  kind: 'circle'
-  cx: number
-  cy: number
-  r: number
-  color: string
-}
-
-type Primitive = PolylinePrimitive | CirclePrimitive
-
 const CAPABILITIES = ['state', 'project', 'upload']
 const STORAGE_KEY = 'pathplotter.collection.v3'
-const STROKE_WIDTH_MM = 0.2
 
 function colorPicker(inputId: string, label: string): string {
   return `<div class="color-picker-field">
@@ -43,51 +28,6 @@ function colorPicker(inputId: string, label: string): string {
     </details>
     <p class="color-picker-message hint" role="status"></p>
   </div>`
-}
-
-const glyphStrokes: Record<string, string[]> = {
-  A: ['0,1 0.5,0 1,1', '0.2,0.6 0.8,0.6'],
-  B: ['0,0 0,1', '0,0 0.65,0 0.8,0.15 0.8,0.35 0.65,0.5 0,0.5', '0,0.5 0.65,0.5 0.8,0.65 0.8,0.85 0.65,1 0,1'],
-  C: ['1,0.1 0.8,0 0.2,0 0,0.2 0,0.8 0.2,1 0.8,1 1,0.9'],
-  D: ['0,0 0,1', '0,0 0.7,0 1,0.3 1,0.7 0.7,1 0,1'],
-  E: ['1,0 0,0 0,1 1,1', '0,0.5 0.7,0.5'],
-  F: ['0,0 0,1', '0,0 1,0', '0,0.5 0.7,0.5'],
-  G: ['1,0.2 0.8,0 0.2,0 0,0.2 0,0.8 0.2,1 0.8,1 1,0.8 1,0.6 0.6,0.6'],
-  H: ['0,0 0,1', '1,0 1,1', '0,0.5 1,0.5'],
-  I: ['0,0 1,0', '0.5,0 0.5,1', '0,1 1,1'],
-  J: ['1,0 1,0.8 0.8,1 0.3,1 0,0.7'],
-  K: ['0,0 0,1', '1,0 0,0.5 1,1'],
-  L: ['0,0 0,1 1,1'],
-  M: ['0,1 0,0 0.5,0.6 1,0 1,1'],
-  N: ['0,1 0,0 1,1 1,0'],
-  O: ['0.2,0 0.8,0 1,0.2 1,0.8 0.8,1 0.2,1 0,0.8 0,0.2 0.2,0'],
-  P: ['0,1 0,0 0.7,0 1,0.25 1,0.45 0.7,0.65 0,0.65'],
-  Q: ['0.2,0 0.8,0 1,0.2 1,0.8 0.8,1 0.2,1 0,0.8 0,0.2 0.2,0', '0.6,0.75 1,1'],
-  R: ['0,1 0,0 0.7,0 1,0.25 1,0.45 0.7,0.65 0,0.65', '0.45,0.65 1,1'],
-  S: ['1,0.15 0.8,0 0.2,0 0,0.2 0.2,0.45 0.8,0.55 1,0.8 0.8,1 0.2,1 0,0.85'],
-  T: ['0,0 1,0', '0.5,0 0.5,1'],
-  U: ['0,0 0,0.8 0.2,1 0.8,1 1,0.8 1,0'],
-  V: ['0,0 0.5,1 1,0'],
-  W: ['0,0 0.25,1 0.5,0.4 0.75,1 1,0'],
-  X: ['0,0 1,1', '1,0 0,1'],
-  Y: ['0,0 0.5,0.5 1,0', '0.5,0.5 0.5,1'],
-  Z: ['0,0 1,0 0,1 1,1'],
-  0: ['0.2,0 0.8,0 1,0.2 1,0.8 0.8,1 0.2,1 0,0.8 0,0.2 0.2,0'],
-  1: ['0.5,0 0.5,1', '0.25,0.2 0.5,0', '0.25,1 0.75,1'],
-  2: ['0,0.2 0.2,0 0.8,0 1,0.2 1,0.4 0,1 1,1'],
-  3: ['0,0.1 0.25,0 0.8,0 1,0.2 0.75,0.5 1,0.8 0.8,1 0.25,1 0,0.9'],
-  4: ['0.85,0 0.85,1', '0,0.65 1,0.65', '0,0.65 0.7,0'],
-  5: ['1,0 0.2,0 0,0.45 0.75,0.45 1,0.65 0.8,1 0.2,1 0,0.85'],
-  6: ['1,0.2 0.8,0 0.2,0 0,0.2 0,0.8 0.2,1 0.8,1 1,0.8 0.8,0.55 0,0.55'],
-  7: ['0,0 1,0 0.25,1'],
-  8: ['0.2,0 0.8,0 1,0.2 0.8,0.5 0.2,0.5 0,0.2 0.2,0', '0.2,0.5 0.8,0.5 1,0.8 0.8,1 0.2,1 0,0.8 0.2,0.5'],
-  9: ['1,0.2 0.8,0 0.2,0 0,0.2 0,0.4 0.2,0.6 0.8,0.6 1,0.4 1,0.2', '1,0.4 1,0.8 0.8,1 0.2,1 0,0.8'],
-  '-': ['0.1,0.5 0.9,0.5'],
-  '_': ['0,1 1,1'],
-  '.': ['0.45,1 0.55,1'],
-  ':': ['0.45,0.25 0.55,0.25', '0.45,0.8 0.55,0.8'],
-  '/': ['0,1 1,0'],
-  ' ': [],
 }
 
 const app = document.querySelector<HTMLDivElement>('#app')
@@ -111,6 +51,14 @@ app.innerHTML = `
     <button id="pointsBtn" class="secondary">Edit points</button>
     <button id="clearBtn" class="secondary">Clear points</button>
   </nav>
+  <section class="live-update-bar" aria-label="Live update controls">
+    <label class="check"><input id="liveUpdateToggle" type="checkbox" />Live update to LightBurn</label>
+    <span id="liveUpdateStatus" role="status">Off. Enable at a new group to append circles or segments.</span>
+    <button id="liveCheckBtn" class="secondary" hidden>Check live import</button>
+    <button id="liveResumeBtn" class="secondary" hidden>Resume queued updates</button>
+    <button id="liveReconcileBtn" class="secondary" hidden>Acknowledge import outcome</button>
+    <button id="liveAbandonBtn" class="danger" hidden>Abandon unsent updates</button>
+  </section>
   <div class="workspace-status">
     <p id="statusText" role="status">Ready. Connect to LightBurn to capture.</p>
     <p id="liveText">No head position available.</p>
@@ -260,7 +208,16 @@ const plotEl = must<SVGSVGElement>('plot')
 const pointsTableEl = must<HTMLTableSectionElement>('pointsTable')
 const exportStatusEl = must<HTMLParagraphElement>('exportStatus')
 
+let savedStateError = ''
 let state: Collection = loadState()
+let liveEnabled = false
+let liveTarget: ImportTarget | null = null
+let liveDispatching = false
+let liveRecoveryInFlight = false
+let releaseLiveLock: (() => void) | null = null
+let otherTabOwnsLive = captureGroups(state).some(group => group.liveLocked) || !!state.liveQueue?.items.length
+let localContextRevision: string | null = null
+if (state.liveQueue?.items.length) state.liveQueue.paused = 'Saved updates found. Check the last import, then explicitly resume or abandon.'
 let livePosition: LivePosition | null = null
 const settledPosition = new SettledPosition()
 let localObservationSequence = 0
@@ -273,6 +230,7 @@ let workspaceSize: { x: number; y: number } | null = null
 let connectionCloseTimer: number | null = null
 let relay: RelayClient | null = null
 let mode: 'relay' | 'local' = import.meta.env.DEV ? 'local' : 'relay'
+if (state.liveQueue?.items[0]) mode = state.liveQueue.items[0].target.mode
 let pairingEpoch = 0
 const PENDING_IMPORT_KEY = 'pathplotter.relay.pending-import.v1'
 let pendingImport: { id: string; relayId: string } | null = null
@@ -289,8 +247,213 @@ try {
   pendingImport = { id: 'unreadable-journal', relayId: '' }
   setExportStatus(errorToMessage(error))
 }
+const savedLiveHead = state.liveQueue?.items[0]
+if (savedLiveHead && savedLiveHead.id === pendingImport?.id) savedLiveHead.phase = 'submitted'
 const modeInput = must<HTMLSelectElement>('connectionMode')
 modeInput.value = mode
+
+function liveQueue(): LiveQueue { return state.liveQueue ?? emptyLiveQueue() }
+async function acquireLiveLock(): Promise<void> {
+  if (releaseLiveLock) return
+  if (!navigator.locks) throw new Error('This browser cannot safely lock live updates across tabs. Use a browser with Web Locks support.')
+  await new Promise<void>((resolve, reject) => {
+    void navigator.locks.request('pathplotter-live-update', { ifAvailable: true }, async lock => {
+      if (!lock) { reject(new Error('Another PathPlotter tab owns Live update. Close or reconcile it first.')); return }
+      await new Promise<void>(release => { releaseLiveLock = release; resolve() })
+      releaseLiveLock = null
+    }).catch(reject)
+  })
+}
+function liveOwnsWork(): boolean { return otherTabOwnsLive || liveEnabled || liveQueue().items.length > 0 || !!liveQueue().paused }
+function liveCaptureBlocked(): boolean {
+  return otherTabOwnsLive || liveRecoveryInFlight || !!liveQueue().paused || (liveEnabled && liveQueue().items.length >= LIVE_QUEUE_LIMIT)
+}
+function liveFinishBlocked(): boolean {
+  if (otherTabOwnsLive || liveRecoveryInFlight || liveQueue().paused) return true
+  return liveEnabled && liveQueue().items.length >= LIVE_QUEUE_LIMIT && !state.finished && !!buildDelta(state, 'finish')
+}
+function unlockLiveGroups(next: Collection): void {
+  if (!liveEnabled && !next.liveQueue?.items.length && !next.liveQueue?.paused) {
+    for (const group of captureGroups(next)) delete group.liveLocked
+  }
+}
+function commitCollection(next: Collection): void {
+  unlockLiveGroups(next)
+  localStorage.setItem(STORAGE_KEY, JSON.stringify(next))
+  state = next
+  renderAll()
+  if (!liveOwnsWork()) releaseLiveLock?.()
+}
+
+async function currentImportTarget(): Promise<ImportTarget> {
+  if (mode === 'relay') {
+    requireRelayContext()
+    if (!relay?.snapshot?.context) throw new Error('No fresh relay workspace.')
+    return { mode, baseUrl: relay.identity.baseUrl, relayId: relay.identity.relayId, contextRevision: relay.snapshot.context.revision }
+  }
+  await fetchStatus()
+  if (!localContextRevision) throw new Error('LightBurn workspace identity is unavailable.')
+  return { mode, baseUrl: normalizeBaseUrl(baseUrlInput.value), contextRevision: localContextRevision }
+}
+
+async function verifyImportTarget(target: ImportTarget): Promise<void> {
+  if (mode !== target.mode || (mode === 'local' && normalizeBaseUrl(baseUrlInput.value) !== target.baseUrl) ||
+      (mode === 'relay' && (relay?.identity.baseUrl !== target.baseUrl || relay.identity.relayId !== target.relayId))) {
+    throw new Error('Reconnect to the original Live update destination; queued artwork must not be retargeted.')
+  }
+  const current = await currentImportTarget()
+  if (current.contextRevision !== target.contextRevision) throw new Error('LightBurn workspace changed. Inspect it before abandoning or continuing live work.')
+}
+
+must<HTMLInputElement>('liveUpdateToggle').addEventListener('change', async event => {
+  const toggle = event.currentTarget as HTMLInputElement
+  if (!toggle.checked) {
+    liveEnabled = false
+    const next = structuredClone(state)
+    try { commitCollection(next) }
+    catch (error) { setStatus(`Cannot save Live update state: ${errorToMessage(error)}`) }
+    renderControls()
+    void drainLiveQueue()
+    return
+  }
+  try {
+    if (requestInFlight || uploadInFlight || pendingImport || liveQueue().items.length || liveQueue().paused) {
+      throw new Error('Resolve pending imports and wait for current work before enabling Live update.')
+    }
+    if (state.points.length) throw new Error('Finish the existing capture, then enable Live update at a new group.')
+    requestInFlight = true
+    renderControls()
+    await acquireLiveLock()
+    liveTarget = await currentImportTarget()
+    if (!window.confirm('Live update adds new circles/segments to the current LightBurn project. Sent points cannot be deleted or updated through the API. Avoid other imports while this mode is active. Enable?')) return
+    liveEnabled = true
+    const next = structuredClone(state)
+    next.liveQueue = emptyLiveQueue()
+    commitCollection(next)
+  } catch (error) { liveEnabled = false; setStatus(errorToMessage(error)) }
+  finally { requestInFlight = false; toggle.checked = liveEnabled; if (!liveOwnsWork()) releaseLiveLock?.(); renderControls() }
+})
+
+async function drainLiveQueue(): Promise<void> {
+  if (liveRecoveryInFlight || liveDispatching || uploadInFlight || liveQueue().paused || !liveQueue().items.length) return
+  liveDispatching = true
+  uploadInFlight = true
+  renderControls()
+  try {
+    await acquireLiveLock()
+    while (liveQueue().items.length && !liveQueue().paused) {
+      const update = liveQueue().items[0]!
+      if (update.phase !== 'queued') throw new Error('Check and reconcile the submitted live import before continuing.')
+      const result = await submitImport(update, () => {
+        const next = structuredClone(state)
+        const head = next.liveQueue?.items[0]
+        if (!head || head.id !== update.id) throw new Error('Live queue changed before submission.')
+        head.phase = 'submitted'
+        for (const group of captureGroups(next)) if (group.liveLocked) group.liveImported = true
+        commitCollection(next)
+      })
+      const next = structuredClone(state)
+      if (!next.liveQueue) throw new Error('Live journal is missing.')
+      recordOutcome(next.liveQueue, update.id, result.status, result.error)
+      commitCollection(next)
+    }
+  } catch (error) {
+    const next = structuredClone(state)
+    next.liveQueue ??= emptyLiveQueue()
+    next.liveQueue.paused = errorToMessage(error)
+    try { commitCollection(next) }
+    catch (saveError) {
+      state.liveQueue = next.liveQueue
+      setStatus(`Live update stopped; journal save failed: ${errorToMessage(saveError)}. Inspect LightBurn before reloading.`)
+    }
+  } finally {
+    uploadInFlight = false
+    liveDispatching = false
+    renderAll()
+  }
+}
+
+must<HTMLButtonElement>('liveCheckBtn').addEventListener('click', async () => {
+  const head = liveQueue().items[0]
+  if (!head || liveDispatching || liveRecoveryInFlight) return
+  liveRecoveryInFlight = true
+  renderControls()
+  try {
+    await acquireLiveLock()
+    if (head.target.mode !== 'relay') throw new Error('Local imports have no queryable result. Inspect LightBurn and acknowledge the outcome.')
+    const client = relay
+    if (!client || client.identity.relayId !== head.target.relayId || client.identity.baseUrl !== head.target.baseUrl) throw new Error('Reconnect to the original relay to check this import.')
+    const job = parseJob(await client.request(`/jobs/${encodeURIComponent(head.id)}`))
+    const result = await followRelayJob(client, job, head.id)
+    const next = structuredClone(state)
+    if (!next.liveQueue) throw new Error('Live queue is missing.')
+    recordOutcome(next.liveQueue, head.id, result.status, result.error)
+    next.liveQueue.paused ||= 'Import checked. Explicitly resume remaining queued updates.'
+    commitCollection(next)
+    if (result.status !== 'unknown' && pendingImport?.id === head.id) clearPendingImport()
+  } catch (error) { setStatus(`Live import check: ${errorToMessage(error)}`) }
+  finally { liveRecoveryInFlight = false; renderAll() }
+})
+must<HTMLButtonElement>('liveResumeBtn').addEventListener('click', async () => {
+  if (liveRecoveryInFlight || liveDispatching || requestInFlight || pendingImport) { setStatus('Resolve the saved import before resuming the live queue.'); return }
+  liveRecoveryInFlight = true
+  renderControls()
+  try {
+    await acquireLiveLock()
+    const head = liveQueue().items[0]
+    if (head && head.phase !== 'queued') throw new Error('Check or acknowledge the previous import first. It will not be resent.')
+    if (head) await verifyImportTarget(head.target)
+    if (!window.confirm('Continue sending saved updates to their original LightBurn workspace? No previously submitted update will be retried.')) return
+    const next = structuredClone(state)
+    next.liveQueue ??= emptyLiveQueue()
+    next.liveQueue.paused = ''
+    commitCollection(next)
+  } catch (error) { setStatus(errorToMessage(error)) }
+  finally { liveRecoveryInFlight = false; renderControls(); void drainLiveQueue() }
+})
+must<HTMLButtonElement>('liveReconcileBtn').addEventListener('click', async () => {
+  const head = liveQueue().items[0]
+  if (!head || head.phase === 'queued' || liveDispatching || liveRecoveryInFlight) return
+  if (!window.confirm(`Inspect RAP/LightBurn for import ${head.id}. Acknowledge its outcome and remove it from the queue WITHOUT resending it? Missing geometry must be corrected manually. Remaining updates stay paused.`)) return
+  try {
+    await acquireLiveLock()
+    const next = structuredClone(state)
+    next.liveQueue!.items.shift()
+    next.liveQueue!.paused = 'Outcome acknowledged without retry. Explicitly resume remaining updates.'
+    commitCollection(next)
+    if (pendingImport?.id === head.id) clearPendingImport()
+  } catch (error) { setStatus(errorToMessage(error)) }
+})
+must<HTMLButtonElement>('liveAbandonBtn').addEventListener('click', async () => {
+  if (liveRecoveryInFlight || liveDispatching || requestInFlight) return
+  const head = liveQueue().items[0]
+  if (head && head.phase !== 'queued') { setStatus('Check or acknowledge the submitted import before abandoning unsent updates.'); return }
+  if (!window.confirm('Abandon unsent updates? Captured points stay saved. Objects already imported into LightBurn are NOT removed.')) return
+  try {
+    await acquireLiveLock()
+    liveEnabled = false
+    const next = structuredClone(state)
+    next.liveQueue = emptyLiveQueue()
+    commitCollection(next)
+    savedStateError = ''
+    setStatus('Unsent updates abandoned. Point edits now affect PathPlotter only, not LightBurn.')
+  } catch (error) { setStatus(errorToMessage(error)) }
+})
+window.addEventListener('storage', async event => {
+  if (event.key !== STORAGE_KEY) return
+  liveEnabled = false
+  otherTabOwnsLive = true
+  renderControls()
+  try {
+    if (liveDispatching) throw new Error('Saved live state changed in another tab during import. Inspect LightBurn; do not resend.')
+    const locks = await navigator.locks?.query()
+    otherTabOwnsLive = locks?.held?.some(lock => lock.name === 'pathplotter-live-update') ?? false
+    state = loadState()
+    if (state.liveQueue?.items.length) state.liveQueue.paused = 'Saved state changed in another tab. Check the import before resuming.'
+    if (otherTabOwnsLive) setStatus('Another tab owns Live update. Use that tab until it finishes or closes.')
+    renderAll()
+  } catch (error) { setStatus(errorToMessage(error)) }
+})
 
 function updateConnectionMode(): void {
   must<HTMLElement>('relayConnection').hidden = mode !== 'relay'
@@ -354,7 +517,7 @@ function attachRelay(identity: NonNullable<ReturnType<typeof loadIdentity>>): vo
 }
 
 modeInput.addEventListener('change', () => {
-  if (uploadInFlight || requestInFlight || connectionInFlight) { modeInput.value = mode; setStatus('Wait for the current request before changing connection.'); return }
+  if (liveOwnsWork() || uploadInFlight || requestInFlight || connectionInFlight) { modeInput.value = mode; setStatus('Finish/reconcile live updates and wait for current work before changing connection.'); return }
   mode = modeInput.value === 'local' ? 'local' : 'relay'
   ++pairingEpoch
   updateConnectionMode()
@@ -365,6 +528,7 @@ must<HTMLButtonElement>('pairRelayBtn').addEventListener('click', async () => {
   button.disabled = true
   const epoch = ++pairingEpoch
   try {
+    if (liveOwnsWork()) throw new Error('Finish or reconcile live updates before replacing the pairing.')
     if (relay && !window.confirm('Replace this browser’s existing relay pairing?')) return
     const baseUrl = relayBaseUrl(must<HTMLInputElement>('relayUrl').value)
     const relayId = must<HTMLInputElement>('relayId').value.trim()
@@ -408,7 +572,7 @@ must<HTMLButtonElement>('takeControlBtn').addEventListener('click', async () => 
   } catch (error) { must<HTMLParagraphElement>('relayMessage').textContent = errorToMessage(error) }
 })
 must<HTMLButtonElement>('unlinkRelayBtn').addEventListener('click', async () => {
-  if (uploadInFlight) { setStatus('Wait for the import result before unlinking.'); return }
+  if (liveOwnsWork() || uploadInFlight) { setStatus('Finish or reconcile live updates before unlinking.'); return }
   if (!window.confirm('Remove this browser’s local pairing? Revoke its grant in RAP to remove server access.')) return
   ++pairingEpoch
   try {
@@ -420,7 +584,7 @@ must<HTMLButtonElement>('unlinkRelayBtn').addEventListener('click', async () => 
   } catch (error) { setStatus(errorToMessage(error)) }
 })
 must<HTMLButtonElement>('revalidateBtn').addEventListener('click', () => {
-  if (uploadInFlight || requestInFlight) return
+  if (liveOwnsWork() || uploadInFlight || requestInFlight) return
   const key = contextKey()
   if (!key || !relay?.canCapture()) { setStatus('A fresh RAP workspace and capture control are required.'); return }
   if (window.confirm('Confirm all existing point coordinates belong to the currently connected machine and workpiece origin? This does not move or transform any points.')) {
@@ -431,6 +595,7 @@ must<HTMLButtonElement>('revalidateBtn').addEventListener('click', () => {
 })
 must<HTMLButtonElement>('checkImportBtn').addEventListener('click', async () => {
   if (uploadInFlight) return
+  if (liveQueue().items.length) { must<HTMLButtonElement>('liveCheckBtn').click(); return }
   try {
     if (!pendingImport) throw new Error('No pending relay import is saved in this browser.')
     if (!relay || relay.identity.relayId !== pendingImport.relayId) throw new Error('Reconnect to the relay used for the pending import.')
@@ -441,6 +606,7 @@ must<HTMLButtonElement>('checkImportBtn').addEventListener('click', async () => 
 })
 must<HTMLButtonElement>('resolveImportBtn').addEventListener('click', () => {
   if (uploadInFlight || !pendingImport) return
+  if (liveQueue().items.length) { must<HTMLButtonElement>('liveReconcileBtn').click(); return }
   if (window.confirm(`Check RAP and LightBurn for job ${pendingImport.id} first. Confirm you have reconciled its outcome and understand another Send may duplicate artwork.`)) {
     try { clearPendingImport() }
     catch (error) { setExportStatus(errorToMessage(error)) }
@@ -471,12 +637,29 @@ for (const input of [baseUrlInput, secretInput, appNameInput]) {
   input.addEventListener('input', cancelConnectionClose)
 }
 
+if (navigator.locks) {
+  void navigator.locks.query().then(locks => {
+    otherTabOwnsLive = locks.held?.some(lock => lock.name === 'pathplotter-live-update') ?? false
+    if (!otherTabOwnsLive) unlockLiveGroups(state)
+    renderAll()
+  }).catch(error => { otherTabOwnsLive = true; setStatus(`Cannot determine Live update ownership: ${errorToMessage(error)}`); renderControls() })
+}
+window.setInterval(() => {
+  if (!otherTabOwnsLive || !navigator.locks) return
+  void navigator.locks.query().then(locks => {
+    if (!locks.held?.some(lock => lock.name === 'pathplotter-live-update')) {
+      otherTabOwnsLive = false
+      unlockLiveGroups(state)
+      renderAll()
+    }
+  }).catch(error => setStatus(`Cannot check live ownership: ${errorToMessage(error)}`))
+}, 1000)
 renderAll()
 updateConnectionMode()
 function consumePairingLink(): boolean {
   const invitation = pairingInvitation(location.hash)
   if (invitation) {
-    if (uploadInFlight) throw new Error('Wait for the import outcome before opening a different pairing invitation.')
+    if (liveOwnsWork() || uploadInFlight) throw new Error('Finish or reconcile live updates before opening another pairing invitation.')
     history.replaceState(null, '', location.pathname + location.search)
     mode = 'relay'
     modeInput.value = mode
@@ -553,6 +736,7 @@ function renderPaletteSelection(): void {
 }
 must<HTMLFormElement>('settingsForm').addEventListener('submit', event => {
   event.preventDefault()
+  if (otherTabOwnsLive || savedStateError || requestInFlight || (state.liveLocked && state.points.length)) { setStatus('Resolve saved work or finish this live group before changing capture settings.'); return }
   const type = must<HTMLSelectElement>('shapeType').value as ShapeType
   const diameter = must<HTMLInputElement>('circleDiameterMm').valueAsNumber
   const height = must<HTMLInputElement>('labelHeightMm').valueAsNumber
@@ -598,6 +782,8 @@ function updateDiameterVisibility(): void {
 }
 
 must<HTMLButtonElement>('connectBtn').addEventListener('click', async () => {
+  if (liveEnabled || liveDispatching) { setStatus('Turn live mode off and wait for import completion before connecting again.'); return }
+  if (liveQueue().items.length && !secretInput.value.trim()) { setStatus('Enter the existing LightBurn secret to check queued work; new pairing is blocked until reconciliation.'); return }
   const baseUrl = normalizeBaseUrl(baseUrlInput.value)
   const appName = appNameInput.value.trim() || 'PathPlotter'
   const connectButton = must<HTMLButtonElement>('connectBtn')
@@ -643,10 +829,14 @@ must<HTMLButtonElement>('connectBtn').addEventListener('click', async () => {
 })
 
 must<HTMLButtonElement>('clearBtn').addEventListener('click', () => {
-  if (requestInFlight || uploadInFlight) return
-  if (allPoints(state).length > 0 && !window.confirm('Clear all captured groups and points? Capture settings will be kept.')) return
+  if (liveOwnsWork() || requestInFlight || uploadInFlight) return
+  const liveWarning = captureGroups(state).some(group => group.liveImported) ? ' Previously imported LightBurn artwork will NOT be removed.' : ''
+  if (allPoints(state).length > 0 && !window.confirm(`Clear all captured groups and points? Capture settings will be kept.${liveWarning}`)) return
   state.points = []
   state.groups = []
+  delete state.liveImported
+  delete state.liveLocked
+  delete state.liveQueue
   delete state.coordinateContext
   state.finished = false
   persistAndRender()
@@ -657,8 +847,9 @@ must<HTMLButtonElement>('captureBtn').addEventListener('click', () => {
   void capturePoint()
 })
 
-must<HTMLButtonElement>('finishBtn').addEventListener('click', () => {
-  if (requestInFlight || uploadInFlight) {
+must<HTMLButtonElement>('finishBtn').addEventListener('click', async () => {
+  if (liveFinishBlocked()) { setStatus('Resolve the paused/full live queue before closing this polygon.'); return }
+  if (requestInFlight || (uploadInFlight && !liveDispatching)) {
     setStatus('Wait for the current request to finish.')
     return
   }
@@ -672,13 +863,23 @@ must<HTMLButtonElement>('finishBtn').addEventListener('click', () => {
     setStatus(`Not enough points to finish ${state.type}.`)
     return
   }
-  finishCapture(state)
-  persistAndRender()
-  setStatus('Group finished. Change settings if needed, then Resume to capture a new group.')
+  requestInFlight = true
+  renderControls()
+  try {
+    const built = liveEnabled ? buildDelta(state, 'finish') : null
+    const update = built && liveTarget ? await makeUpdate(built, liveTarget) : null
+    const next = structuredClone(state)
+    if (update) { next.liveQueue ??= emptyLiveQueue(); enqueue(next.liveQueue, update) }
+    finishCapture(next)
+    commitCollection(next)
+    setStatus('Group finished. Change settings if needed, then Resume to capture a new group.')
+    void drainLiveQueue()
+  } catch (error) { setStatus(`Could not finish: ${errorToMessage(error)}`) }
+  finally { requestInFlight = false; renderControls() }
 })
 
 must<HTMLButtonElement>('undoBtn').addEventListener('click', () => {
-  if (requestInFlight || uploadInFlight) return
+  if (state.liveLocked || requestInFlight || uploadInFlight) return
   if (state.points.length === 0) {
     setStatus('Nothing to undo.')
     return
@@ -686,7 +887,7 @@ must<HTMLButtonElement>('undoBtn').addEventListener('click', () => {
   state.points.pop()
   state.finished = false
   persistAndRender()
-  setStatus('Removed last point.')
+  setStatus(state.liveImported ? 'Removed last point in PathPlotter only. Imported LightBurn artwork was not removed.' : 'Removed last point.')
 })
 
 must<HTMLButtonElement>('downloadSvgBtn').addEventListener('click', () => {
@@ -731,10 +932,14 @@ must<HTMLInputElement>('loadSessionInput').addEventListener('change', async even
   }
   try {
     const text = await file.text()
-    if (requestInFlight || uploadInFlight) throw new Error('Wait for the current request before importing.')
+    if (liveOwnsWork() || requestInFlight || uploadInFlight) throw new Error('Reconcile live work and wait for the current request before importing.')
     const parsed = JSON.parse(text) as { version?: unknown; state?: unknown }
     if (parsed.version !== 2 && parsed.version !== 3) throw new Error('Only version 2 or 3 session files are supported.')
     const imported = validateCollection(parsed.state)
+    if (imported.liveQueue?.items.length || imported.liveQueue?.paused) {
+      throw new Error('This backup contains live import work. Restore it only after reconciling its LightBurn destination; queued imports cannot be imported through Session.')
+    }
+    for (const group of captureGroups(imported)) delete group.liveLocked
     if (allPoints(state).length > 0 && !window.confirm('Replace all current groups with this session?')) return
     state = imported
     persistAndRender()
@@ -796,11 +1001,26 @@ async function fetchStatus(): Promise<void> {
   if (status.connected !== true) throw new Error('LightBurn is available, but no machine is connected.')
   const projectResponse = await authorizedFetch('/api/project')
   if (!projectResponse.ok) throw new Error(`Workspace request failed (${projectResponse.status})`)
-  const project = await projectResponse.json() as { workspace?: { workpiece_size?: { x?: number; y?: number } } }
+  const project = await projectResponse.json() as { filename?: unknown; device?: unknown; workspace?: {
+    machine_size?: { x?: number; y?: number }; workpiece_size?: { x?: number; y?: number };
+    workpiece_offset?: { x?: number; y?: number }; machine_view?: unknown
+  } }
   const size = project.workspace?.workpiece_size
   workspaceSize = size && typeof size.x === 'number' && typeof size.y === 'number' &&
     Number.isFinite(size.x) && Number.isFinite(size.y) && size.x > 0 && size.y > 0
     ? { x: size.x, y: size.y } : null
+  const workspace = project.workspace
+  localContextRevision = null
+  if (workspace && finiteNumber(workspace.machine_size?.x) && finiteNumber(workspace.machine_size?.y) &&
+      finiteNumber(workspace.workpiece_offset?.x) && finiteNumber(workspace.workpiece_offset?.y) &&
+      typeof workspace.machine_view === 'boolean') {
+    const stable = { workspace: { machine_size: workspace.machine_size, workpiece_size: workspaceSize,
+      workpiece_offset: workspace.workpiece_offset, machine_view: workspace.machine_view },
+      filename: project.filename, device: project.device }
+    const bytes = new TextEncoder().encode(JSON.stringify(stable))
+    localContextRevision = [...new Uint8Array(await crypto.subtle.digest('SHA-256', bytes))]
+      .map(value => value.toString(16).padStart(2, '0')).join('')
+  }
   renderPlot()
   connectionStateEl.textContent = 'Connected'
   connectionStateEl.classList.add('ok')
@@ -851,7 +1071,7 @@ function startPreview(): void {
 }
 
 async function capturePoint(): Promise<void> {
-  if (requestInFlight) {
+  if (requestInFlight || (uploadInFlight && !liveDispatching) || liveCaptureBlocked()) {
     return
   }
   if (state.finished) {
@@ -865,12 +1085,11 @@ async function capturePoint(): Promise<void> {
       const key = requireRelayContext()
       const position = relay?.snapshot?.position
       if (!position) throw new Error('No fresh workpiece coordinates.')
-      state.points.push({ id: makeId('pt'), name: '', x: position.x, y: position.y, labelOffsetX: 0, labelOffsetY: 0 })
-      state.coordinateContext = key
-      persistAndRender()
+      await saveCapturedPoint({ id: makeId('pt'), name: '', x: position.x, y: position.y, labelOffsetX: 0, labelOffsetY: 0 }, key)
       setStatus(`Captured point ${state.points.length} from latest RAP sample.`)
       return
     }
+    if (liveEnabled && liveTarget) await verifyImportTarget(liveTarget)
     const response = await authorizedFetch('/api/position')
     if (!response.ok) {
       throw new Error(`Position request failed (${response.status})`)
@@ -889,11 +1108,9 @@ async function capturePoint(): Promise<void> {
       labelOffsetX: 0,
       labelOffsetY: 0,
     }
-    state.points.push(point)
-    delete state.coordinateContext
+    await saveCapturedPoint(point)
     livePosition = { x, y, updatedAt: Date.now() }
     settledPosition.observe(`local:${++localObservationSequence}`, x, y)
-    persistAndRender()
     setStatus(`Captured point ${state.points.length}.`)
   } catch (error) {
     setStatus(errorToMessage(error))
@@ -901,6 +1118,27 @@ async function capturePoint(): Promise<void> {
     requestInFlight = false
     renderControls()
   }
+}
+
+async function saveCapturedPoint(point: Point, coordinateContext?: string): Promise<void> {
+  if (liveEnabled && mode === 'relay' && liveTarget?.contextRevision !== relay?.snapshot?.context?.revision) {
+    throw new Error('Workspace changed during Live update. Turn it off and reconcile queued work.')
+  }
+  const group = { ...state, points: [...state.points, point] }
+  const built = liveEnabled ? buildDelta(group, 'capture') : null
+  if (liveEnabled && !liveTarget) throw new Error('Live update destination is unavailable.')
+  const update = built && liveTarget ? await makeUpdate(built, liveTarget) : null
+  const next = structuredClone(state)
+  next.points.push(point)
+  if (coordinateContext) next.coordinateContext = coordinateContext
+  else delete next.coordinateContext
+  if (liveEnabled) {
+    next.liveLocked = true
+    next.liveQueue ??= emptyLiveQueue()
+    if (update) enqueue(next.liveQueue, update)
+  }
+  commitCollection(next)
+  void drainLiveQueue()
 }
 
 async function authorizedFetch(path: string, init?: RequestInit): Promise<Response> {
@@ -930,7 +1168,7 @@ async function bearerToken(secret: string): Promise<string> {
 }
 
 async function sendToLightBurn(): Promise<void> {
-  if (uploadInFlight || requestInFlight) return
+  if (otherTabOwnsLive || uploadInFlight || requestInFlight || liveEnabled || liveQueue().items.length || liveQueue().paused) return
   const built = buildSvgForCollection()
   if (!built) {
     setExportStatus('Capture enough points for the selected shape before sending.')
@@ -939,83 +1177,12 @@ async function sendToLightBurn(): Promise<void> {
   uploadInFlight = true
   renderControls()
   try {
+    if (captureGroups(state).some(group => group.liveImported) &&
+        !window.confirm('Some geometry was already sent by Live update. Sending the whole collection adds duplicates in LightBurn. Send anyway?')) return
     if (built.unsupportedCharacters.length && !window.confirm(`Unsupported label characters will be omitted: ${[...new Set(built.unsupportedCharacters)].join(', ')}. Send anyway?`)) return
-    if (mode === 'relay') {
-      if (pendingImport) throw new Error(`Previous import ${pendingImport.id} is unresolved. Use Check last import in Connection before sending again.`)
-      const key = requireRelayContext()
-      const client = relay
-      if (!client) throw new Error('Pair with RAP first.')
-      const bytes = new TextEncoder().encode(built.svg)
-      if (bytes.byteLength > 512 * 1024) throw new Error('SVG exceeds the 512 KiB relay limit. Download it for manual import.')
-      const checksum = [...new Uint8Array(await crypto.subtle.digest('SHA-256', bytes))]
-        .map(value => value.toString(16).padStart(2, '0')).join('')
-      requireRelayContext()
-      const id = crypto.randomUUID()
-      const revision = client.snapshot?.context?.revision
-      if (!revision || contextKey() !== key) throw new Error('Workspace changed while preparing SVG.')
-      pendingImport = { id, relayId: client.identity.relayId }
-      try { localStorage.setItem(PENDING_IMPORT_KEY, JSON.stringify(pendingImport)) }
-      catch (error) {
-        pendingImport = null
-        throw new Error(`Cannot save import journal; no job was sent: ${errorToMessage(error)}`)
-      }
-      setExportStatus(`Submitting relay job ${id}.`)
-      let result: ReturnType<typeof parseJob>
-      try {
-        result = parseJob(await client.request('/jobs', {
-          id, svg: built.svg, checksum, filename: `pathplotter-${Date.now()}.svg`, anchor: built.anchor, contextRevision: revision,
-        }))
-      } catch (error) {
-        throw new Error(`Job ${id} submission outcome is unresolved: ${errorToMessage(error)}. Use Check last import; do not resubmit blindly.`)
-      }
-      await followRelayJob(client, result)
-      return
-    }
-    await fetchStatus()
-    setExportStatus('Uploading SVG to LightBurn...')
-    const confirmation = waitForFileImported(20000)
-    const response = await authorizedFetch('/api/file/upload', {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/octet-stream',
-        'X-Filename': `pathplotter-${Date.now()}.svg`,
-        'X-Position-X': String(built.anchor.x),
-        'X-Position-Y': String(built.anchor.y),
-        'X-Origin': 'center',
-      },
-      body: new TextEncoder().encode(built.svg),
-    })
-    if (response.status !== 202) {
-      setExportStatus(`Upload was rejected (${response.status}).`)
-      return
-    }
-
-    async function followRelayJob(client: RelayClient, initial: ReturnType<typeof parseJob>): Promise<void> {
-      let job = initial
-      const deadline = performance.now() + 90000
-      while (true) {
-        setExportStatus(`RAP import ${job.id}: ${job.status}${job.error ? ` — ${job.error}` : ''}.`)
-        if (['confirmed', 'failed', 'expired', 'unknown'].includes(job.status)) {
-          if (job.status !== 'unknown') clearPendingImport()
-          return
-        }
-        if (performance.now() > deadline) {
-          setExportStatus(`RAP job ${job.id}: outcome not yet known. Check RAP before submitting another import; do not retry blindly.`)
-          return
-        }
-        await new Promise(resolve => window.setTimeout(resolve, 1000))
-        try { job = parseJob(await client.request(`/jobs/${encodeURIComponent(job.id)}`)) }
-        catch (error) { throw new Error(`Cannot determine outcome of RAP job ${job.id}: ${errorToMessage(error)}. Check RAP; do not retry blindly.`) }
-      }
-    }
-    const imported = await confirmation
-    if (imported.status === 'confirmed') {
-      setExportStatus('LightBurn confirmed import success.')
-    } else if (imported.status === 'failed') {
-      setExportStatus(`LightBurn reported import failure: ${imported.error ?? 'unknown error'}`)
-    } else {
-      setExportStatus(`Upload accepted (202), but import confirmation is unknown: ${imported.error ?? 'timed out waiting for file_imported event'}`)
-    }
+    const update = await makeUpdate({ ...built, unsupportedCharacters: [] }, await currentImportTarget())
+    const imported = await submitImport(update, () => {})
+    setExportStatus(`LightBurn import ${imported.status}${imported.error ? `: ${imported.error}` : '.'}`)
   } catch (error) {
     setExportStatus(errorToMessage(error))
   } finally {
@@ -1024,226 +1191,69 @@ async function sendToLightBurn(): Promise<void> {
   }
 }
 
-async function waitForFileImported(timeoutMs: number): Promise<{ status: 'confirmed' | 'failed' | 'unknown'; error?: string }> {
-  const controller = new AbortController()
-  const timeout = window.setTimeout(() => controller.abort(), timeoutMs)
+async function submitImport(update: LiveUpdate, beforeSubmission: () => void): Promise<ImportResult> {
+  const digest = [...new Uint8Array(await crypto.subtle.digest('SHA-256', new TextEncoder().encode(update.svg)))]
+    .map(value => value.toString(16).padStart(2, '0')).join('')
+  if (digest !== update.checksum) throw new Error('Saved live geometry checksum does not match. No update was sent.')
+  await verifyImportTarget(update.target)
+  if (update.target.mode === 'relay') {
+    const client = relay
+    if (!client) throw new Error('Pair with RAP first.')
+    if (pendingImport) throw new Error(`Import ${pendingImport.id} is unresolved. Check it before sending more geometry.`)
+    pendingImport = { id: update.id, relayId: client.identity.relayId }
+    try { localStorage.setItem(PENDING_IMPORT_KEY, JSON.stringify(pendingImport)) }
+    catch (error) {
+      pendingImport = null
+      throw new Error(`Cannot save import journal; no job was sent: ${errorToMessage(error)}`)
+    }
+    try { beforeSubmission() }
+    catch (error) { clearPendingImport(); throw error }
+    const job = parseJob(await client.request('/jobs', {
+      id: update.id, svg: update.svg, checksum: update.checksum,
+      filename: `pathplotter-${update.id}.svg`, anchor: update.anchor, contextRevision: update.target.contextRevision,
+    }))
+    const imported = await followRelayJob(client, job, update.id)
+    if (imported.status !== 'unknown') clearPendingImport()
+    return imported
+  }
+  const stream = await openImportStream(signal => authorizedFetch('/api/events', { headers: { Accept: 'text/event-stream' }, signal }))
   try {
-    const response = await authorizedFetch('/api/events', {
-      headers: { Accept: 'text/event-stream' },
-      signal: controller.signal,
+    await verifyImportTarget(update.target)
+    beforeSubmission()
+    stream.arm()
+    const response = await authorizedFetch('/api/file/upload', {
+      method: 'POST', headers: { 'Content-Type': 'application/octet-stream',
+        'X-Filename': `pathplotter-${update.id}.svg`, 'X-Position-X': String(update.anchor.x),
+        'X-Position-Y': String(update.anchor.y), 'X-Origin': 'center' },
+      body: new TextEncoder().encode(update.svg),
+      signal: AbortSignal.timeout(10000),
     })
-    if (!response.ok || !response.body) {
-      return { status: 'unknown', error: `events stream unavailable (${response.status})` }
-    }
-    const reader = response.body.getReader()
-    const decoder = new TextDecoder()
-    let buffer = ''
-    let currentEvent = 'message'
-    let dataLines: string[] = []
-    while (true) {
-      const { done, value } = await reader.read()
-      if (done) {
-        return { status: 'unknown', error: 'event stream closed before confirmation' }
-      }
-      buffer += decoder.decode(value, { stream: true })
-      const lines = buffer.split(/\r?\n/)
-      buffer = lines.pop() ?? ''
-      for (const line of lines) {
-        if (line.startsWith('event:')) {
-          currentEvent = line.slice(6).trim()
-          continue
-        }
-        if (line.startsWith('data:')) {
-          dataLines.push(line.slice(5).trim())
-          continue
-        }
-        if (line.trim() !== '') {
-          continue
-        }
-        if (dataLines.length > 0) {
-          const raw = dataLines.join('\n')
-          dataLines = []
-          const payload = safeJson(raw)
-          const isImportEvent =
-            currentEvent === 'file_imported' ||
-            (payload && typeof payload === 'object' && ('success' in payload || payload.type === 'file_imported'))
-          if (isImportEvent && payload && typeof payload === 'object' && 'success' in payload) {
-            const success = Boolean(payload.success)
-            if (success) {
-              return { status: 'confirmed' }
-            }
-            return { status: 'failed', error: typeof payload.error === 'string' ? payload.error : 'file_imported reported failure' }
-          }
-        }
-        currentEvent = 'message'
-      }
-    }
-  } catch (error) {
-    if ((error as Error).name === 'AbortError') {
-      return { status: 'unknown', error: 'timed out waiting for file_imported event' }
-    }
-    return { status: 'unknown', error: errorToMessage(error) }
-  } finally {
-    window.clearTimeout(timeout)
-    controller.abort()
+    if (response.status !== 202) return { status: 'unknown', error: `Upload returned ${response.status}. Inspect LightBurn before continuing.` }
+    return await stream.result
+  } finally { stream.close() }
+}
+
+async function followRelayJob(client: RelayClient, initial: ReturnType<typeof parseJob>, expectedId: string): Promise<ImportResult> {
+  let job = initial
+  const deadline = performance.now() + 90000
+  while (true) {
+    if (job.id !== expectedId) throw new Error('Relay returned a different import ID. Inspect RAP before continuing.')
+    setExportStatus(`RAP import ${job.id}: ${job.status}${job.error ? ` — ${job.error}` : ''}.`)
+    if (['confirmed', 'failed', 'expired', 'unknown'].includes(job.status)) return { status: job.status as ImportResult['status'], error: job.error }
+    if (performance.now() > deadline) return { status: 'unknown', error: 'Import outcome not yet known. Check RAP before continuing.' }
+    await new Promise(resolve => window.setTimeout(resolve, 500))
+    job = parseJob(await client.request(`/jobs/${encodeURIComponent(job.id)}`))
   }
 }
 
-function safeJson(text: string): any {
-  try {
-    return JSON.parse(text)
-  } catch {
-    return null
-  }
-}
-
-function buildSvgForCollection(): { svg: string; anchor: { x: number; y: number }; unsupportedCharacters: string[] } | null {
+function buildSvgForCollection(): BuiltSvg | null {
   if (!hasExportGeometry()) {
     return null
   }
   const primitives: Primitive[] = []
   const unsupportedCharacters: string[] = []
   for (const group of captureGroups(state)) appendCollectionPrimitives(group, primitives, unsupportedCharacters)
-  if (primitives.length === 0) {
-    return null
-  }
-  const bounds = primitiveBounds(primitives)
-  const width = Math.max(0.001, bounds.maxX - bounds.minX)
-  const height = Math.max(0.001, bounds.maxY - bounds.minY)
-  const anchor = { x: (bounds.minX + bounds.maxX) / 2, y: (bounds.minY + bounds.maxY) / 2 }
-  const svgBody = primitives
-    .map(primitive => {
-      if (primitive.kind === 'circle') {
-        return `<circle cx="${fmt(primitive.cx - bounds.minX)}" cy="${fmt(bounds.maxY - primitive.cy)}" r="${fmt(primitive.r)}" fill="none" stroke="${escapeXml(primitive.color)}" stroke-width="${fmt(STROKE_WIDTH_MM)}" />`
-      }
-      const path = primitive.points
-        .map((point, index) => `${index === 0 ? 'M' : 'L'} ${fmt(point.x - bounds.minX)} ${fmt(bounds.maxY - point.y)}`)
-        .join(' ')
-      const closed = primitive.close ? ' Z' : ''
-      return `<path d="${path}${closed}" fill="none" stroke="${escapeXml(primitive.color)}" stroke-width="${fmt(STROKE_WIDTH_MM)}" />`
-    })
-    .join('\n')
-  const svg = `<?xml version="1.0" encoding="UTF-8"?>\n<svg xmlns="http://www.w3.org/2000/svg" width="${fmt(width)}mm" height="${fmt(height)}mm" viewBox="0 0 ${fmt(width)} ${fmt(height)}">\n${svgBody}\n</svg>`
-  return { svg, anchor, unsupportedCharacters }
-}
-
-function appendCollectionPrimitives(set: CaptureGroup, primitives: Primitive[], unsupportedCharacters: string[]): void {
-  if (!hasEnoughPoints(set)) {
-    return
-  }
-  if (set.type === 'circles') {
-    for (const point of set.points) {
-      primitives.push({
-        kind: 'circle',
-        cx: point.x,
-        cy: point.y,
-        r: Math.max(0.01, set.circleDiameterMm / 2),
-        color: set.strokeColor,
-      })
-    }
-  } else {
-    primitives.push({
-      kind: 'polyline',
-      points: set.points.map(point => ({ x: point.x, y: point.y })),
-      close: set.type === 'polygon',
-      color: set.strokeColor,
-    })
-  }
-  if (!set.showNumbers && !set.showNames) {
-    return
-  }
-  for (let index = 0; index < set.points.length; index += 1) {
-    const point = set.points[index]
-    const parts: string[] = []
-    if (set.showNumbers) {
-      parts.push(String(index + 1))
-    }
-    if (set.showNames && point.name.trim()) {
-      parts.push(point.name.trim())
-    }
-    const label = parts.join(':')
-    if (!label) {
-      continue
-    }
-    const labelPolylines = strokeTextPolylines(
-      label,
-      point.x + set.labelOffsetX + point.labelOffsetX,
-      point.y + set.labelOffsetY + point.labelOffsetY,
-      set.labelHeightMm,
-      unsupportedCharacters,
-    )
-    for (const line of labelPolylines) {
-      primitives.push({
-        kind: 'polyline',
-        points: line,
-        close: false,
-        color: set.labelColor,
-      })
-    }
-  }
-}
-
-function strokeTextPolylines(
-  text: string,
-  x: number,
-  y: number,
-  height: number,
-  unsupportedCharacters: string[],
-): Array<Array<{ x: number; y: number }>> {
-  const upper = text.toUpperCase()
-  const polylines: Array<Array<{ x: number; y: number }>> = []
-  const scale = Math.max(0.2, height)
-  let cursor = x
-  for (const character of upper) {
-    const strokes = glyphStrokes[character]
-    if (!strokes) {
-      unsupportedCharacters.push(character)
-      cursor += scale * 1.25
-      continue
-    }
-    for (const stroke of strokes) {
-      const points = stroke.split(' ').map(token => {
-        const [sx, sy] = token.split(',').map(Number)
-        return { x: cursor + sx * scale, y: y - sy * scale }
-      })
-      polylines.push(points)
-    }
-    cursor += scale * 1.25
-  }
-  return polylines
-}
-
-function primitiveBounds(primitives: Primitive[]): { minX: number; minY: number; maxX: number; maxY: number } {
-  let minX = Number.POSITIVE_INFINITY
-  let minY = Number.POSITIVE_INFINITY
-  let maxX = Number.NEGATIVE_INFINITY
-  let maxY = Number.NEGATIVE_INFINITY
-  for (const primitive of primitives) {
-    if (primitive.kind === 'circle') {
-      minX = Math.min(minX, primitive.cx - primitive.r)
-      minY = Math.min(minY, primitive.cy - primitive.r)
-      maxX = Math.max(maxX, primitive.cx + primitive.r)
-      maxY = Math.max(maxY, primitive.cy + primitive.r)
-      continue
-    }
-    for (const point of primitive.points) {
-      minX = Math.min(minX, point.x)
-      minY = Math.min(minY, point.y)
-      maxX = Math.max(maxX, point.x)
-      maxY = Math.max(maxY, point.y)
-    }
-  }
-  return { minX, minY, maxX, maxY }
-}
-
-function hasEnoughPoints(set: CaptureGroup): boolean {
-  if (set.type === 'circles') {
-    return set.points.length >= 1
-  }
-  if (set.type === 'polyline') {
-    return set.points.length >= 2
-  }
-  return set.points.length >= 3
+  return serializeSvg(primitives, unsupportedCharacters)
 }
 
 function escapeXml(value: string): string {
@@ -1253,10 +1263,6 @@ function escapeXml(value: string): string {
     .replaceAll('>', '&gt;')
     .replaceAll('"', '&quot;')
     .replaceAll("'", '&apos;')
-}
-
-function fmt(value: number): string {
-  return Number(value.toFixed(6)).toString()
 }
 
 function makeId(prefix: string): string {
@@ -1280,6 +1286,7 @@ function downloadBlob(blob: Blob, filename: string): void {
 }
 
 function persistAndRender(): void {
+  if (otherTabOwnsLive || savedStateError) { setStatus(savedStateError || 'Another tab owns Live update.'); return }
   try {
     window.localStorage.setItem(STORAGE_KEY, JSON.stringify(state))
   } catch (error) {
@@ -1293,8 +1300,9 @@ function loadState(): Collection {
     const raw = window.localStorage.getItem(STORAGE_KEY) ?? window.localStorage.getItem('pathplotter.collection.v2')
     return raw ? validateCollection(JSON.parse(raw)) : emptyCollection()
   } catch (error) {
-    setStatus(`Saved collection could not be loaded: ${errorToMessage(error)}`)
-    return emptyCollection()
+    savedStateError = `Saved collection could not be loaded: ${errorToMessage(error)}. Preserve its browser storage and inspect LightBurn before abandoning saved work.`
+    setStatus(savedStateError)
+    return { ...emptyCollection(), liveQueue: { ...emptyLiveQueue(), paused: savedStateError } }
   }
 }
 
@@ -1323,7 +1331,9 @@ function validateCaptureGroup(value: unknown): CaptureGroup {
       typeof value.showNumbers !== 'boolean' || typeof value.showNames !== 'boolean' ||
       !finiteNumber(value.circleDiameterMm) || value.circleDiameterMm <= 0 ||
       !finiteNumber(value.labelHeightMm) || value.labelHeightMm < 0.2 ||
-      !finiteNumber(value.labelOffsetX) || !finiteNumber(value.labelOffsetY)) {
+      !finiteNumber(value.labelOffsetX) || !finiteNumber(value.labelOffsetY) ||
+      (value.liveLocked !== undefined && typeof value.liveLocked !== 'boolean') ||
+      (value.liveImported !== undefined && typeof value.liveImported !== 'boolean')) {
     throw new Error('Invalid collection settings.')
   }
   const ids = new Set<string>()
@@ -1345,6 +1355,8 @@ function validateCaptureGroup(value: unknown): CaptureGroup {
     showNumbers: value.showNumbers, showNames: value.showNames,
     labelColor: value.labelColor, labelHeightMm: value.labelHeightMm,
     labelOffsetX: value.labelOffsetX, labelOffsetY: value.labelOffsetY,
+    ...(typeof value.liveLocked === 'boolean' ? { liveLocked: value.liveLocked } : {}),
+    ...(typeof value.liveImported === 'boolean' ? { liveImported: value.liveImported } : {}),
   }
 }
 
@@ -1359,7 +1371,8 @@ function validateCollection(value: unknown): Collection {
       throw new Error('Invalid finished capture groups.')
     }
     const result: Collection = { ...active, groups,
-      ...(typeof value.coordinateContext === 'string' ? { coordinateContext: value.coordinateContext } : {}) }
+      ...(typeof value.coordinateContext === 'string' ? { coordinateContext: value.coordinateContext } : {}),
+      ...(value.liveQueue !== undefined ? { liveQueue: parseLiveQueue(value.liveQueue) } : {}) }
     const ids = new Set<string>()
     for (const group of captureGroups(result)) {
       for (const point of group.points) {
@@ -1386,21 +1399,36 @@ function renderAll(): void {
 }
 
 function renderControls(): void {
-  const busy = requestInFlight || uploadInFlight
+  const busy = otherTabOwnsLive || requestInFlight || (uploadInFlight && !liveDispatching)
   must<HTMLSpanElement>('collectionSummary').textContent =
     `${state.type} · ${allPoints(state).length} points · ${state.groups.length} finished groups`
   const relayReady = mode !== 'relay' || relay?.canCapture() === true
   const contextMatches = mode !== 'relay' || !allPoints(state).length || state.coordinateContext === contextKey()
-  must<HTMLButtonElement>('captureBtn').disabled = busy || state.finished || !relayReady || !contextMatches
+  must<HTMLButtonElement>('captureBtn').disabled = busy || state.finished || !relayReady || !contextMatches || liveCaptureBlocked()
   must<HTMLButtonElement>('finishBtn').textContent = state.finished ? 'Resume' : 'Finish'
-  must<HTMLButtonElement>('finishBtn').disabled = busy || (!state.finished && !hasEnoughPoints(state))
-  must<HTMLButtonElement>('undoBtn').disabled = busy || state.points.length === 0
-  must<HTMLButtonElement>('clearBtn').disabled = busy || allPoints(state).length === 0
-  must<HTMLButtonElement>('settingsBtn').disabled = busy
+  must<HTMLButtonElement>('finishBtn').disabled = busy || liveFinishBlocked() || (!state.finished && !hasEnoughPoints(state))
+  must<HTMLButtonElement>('undoBtn').disabled = busy || !!state.liveLocked || state.points.length === 0
+  must<HTMLButtonElement>('clearBtn').disabled = busy || liveOwnsWork() || allPoints(state).length === 0
+  must<HTMLButtonElement>('settingsBtn').disabled = busy || !!savedStateError || !!(state.liveLocked && state.points.length)
   must<HTMLButtonElement>('pointsBtn').disabled = busy
-  must<HTMLButtonElement>('sendBtn').disabled = busy || !hasExportGeometry() || !relayReady || !contextMatches ||
+  must<HTMLButtonElement>('sendBtn').disabled = busy || uploadInFlight || liveOwnsWork() || !hasExportGeometry() || !relayReady || !contextMatches ||
     (mode === 'relay' && pendingImport !== null)
   must<HTMLButtonElement>('downloadSvgBtn').disabled = busy || !hasExportGeometry()
+  const queue = liveQueue()
+  if (!requestInFlight) must<HTMLInputElement>('liveUpdateToggle').checked = liveEnabled
+  must<HTMLInputElement>('liveUpdateToggle').disabled = requestInFlight || (!liveEnabled && (uploadInFlight || !!queue.items.length || !!queue.paused))
+  must<HTMLElement>('liveUpdateStatus').textContent = otherTabOwnsLive ? 'Another tab owns Live update. Use that tab or wait for it to close.' : queue.paused ? `Paused: ${queue.paused} · ${queue.items.length} pending` :
+    `${liveEnabled ? 'On' : queue.items.length ? 'Off · draining' : 'Off'} · ${queue.items.length}/${LIVE_QUEUE_LIMIT} pending · ${queue.confirmed} confirmed${queue.items.length >= LIVE_QUEUE_LIMIT ? ' · Queue full; wait for imports' : ''}`
+  const head = queue.items[0]
+  must<HTMLButtonElement>('liveCheckBtn').hidden = !queue.paused || !head || head.phase === 'queued'
+  must<HTMLButtonElement>('liveReconcileBtn').hidden = !queue.paused || !head || head.phase === 'queued'
+  must<HTMLButtonElement>('liveResumeBtn').hidden = !queue.paused || !!(head && head.phase !== 'queued') || !!savedStateError
+  must<HTMLButtonElement>('liveAbandonBtn').hidden = !queue.paused && !queue.items.length
+  for (const id of ['liveCheckBtn', 'liveReconcileBtn', 'liveResumeBtn', 'liveAbandonBtn']) must<HTMLButtonElement>(id).disabled = liveRecoveryInFlight || liveDispatching || requestInFlight
+  must<HTMLInputElement>('loadSessionInput').disabled = busy || liveOwnsWork()
+  baseUrlInput.disabled = liveEnabled || liveDispatching
+  secretInput.disabled = liveEnabled || liveDispatching
+  modeInput.disabled = liveOwnsWork() || busy || uploadInFlight
 }
 
 function renderEditor(): void {
@@ -1423,22 +1451,30 @@ function renderEditor(): void {
     ).join(''))
     .join('')
   pointsTableEl.querySelectorAll<HTMLInputElement>('input[data-point]').forEach(input => {
+    input.disabled = otherTabOwnsLive || captureGroups(state).some(group => group.liveLocked && group.points.some(point => point.id === input.dataset.id))
     input.addEventListener('change', () => {
       updatePointFromInput(input)
     })
   })
   pointsTableEl.querySelectorAll<HTMLButtonElement>('button[data-point="delete"]').forEach(button => {
+    button.disabled = otherTabOwnsLive || captureGroups(state).some(group => group.liveLocked && group.points.some(point => point.id === button.dataset.id))
     button.addEventListener('click', () => {
       const pointId = button.dataset.id
       if (!pointId) {
         return
       }
+      if (otherTabOwnsLive || requestInFlight || captureGroups(state).some(group => group.liveLocked && group.points.some(point => point.id === pointId))) {
+        setStatus('Live group points are locked until live mode is off and pending work is reconciled.')
+        return
+      }
+      const wasImported = captureGroups(state).some(group => group.liveImported && group.points.some(point => point.id === pointId))
       for (const group of captureGroups(state)) group.points = group.points.filter(point => point.id !== pointId)
       state.groups = state.groups.filter(group => group.points.length > 0)
       if (captureGroups(state).some(group => group.points.length > 0 && !hasEnoughPoints(group))) {
         setStatus('A group has too few points for its shape. Delete the rest of that group before exporting.')
       }
       persistAndRender()
+      if (wasImported) setStatus('Point deleted in PathPlotter only. Previously imported LightBurn geometry was not removed.')
     })
   })
 }
@@ -1449,6 +1485,10 @@ function updatePointFromInput(input: HTMLInputElement): void {
   if (!pointId || !key) {
     return
   }
+  if (otherTabOwnsLive || requestInFlight || captureGroups(state).some(group => group.liveLocked && group.points.some(point => point.id === pointId))) {
+    setStatus('Live group points are locked until live mode is off and pending work is reconciled.')
+    return
+  }
   const point = allPoints(state).find(entry => entry.id === pointId)
   if (!point) {
     return
@@ -1456,6 +1496,9 @@ function updatePointFromInput(input: HTMLInputElement): void {
   if (key === 'name') {
     point.name = input.value
     persistAndRender()
+    if (captureGroups(state).some(group => group.liveImported && group.points.some(entry => entry.id === pointId))) {
+      setStatus('Name edited in PathPlotter only. Previously imported LightBurn labels were not updated.')
+    }
     return
   }
   if (key === 'id') {
@@ -1469,6 +1512,9 @@ function updatePointFromInput(input: HTMLInputElement): void {
   }
   point[key] = numeric
   persistAndRender()
+  if (captureGroups(state).some(group => group.liveImported && group.points.some(entry => entry.id === pointId))) {
+    setStatus('Point edited in PathPlotter only. Previously imported LightBurn geometry was not updated.')
+  }
 }
 
 function renderPlot(): void {

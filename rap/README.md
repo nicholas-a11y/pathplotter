@@ -38,8 +38,9 @@ execution policy, unblock files, install certificates, or modify global policy.
 
 ## Console commands and revocation
 
-Commands run between serialized observations; imports can occupy the console
-for up to approximately 40 seconds while confirmation is awaited.
+Commands run between serialized observations. Import setup still performs
+bounded synchronous HTTP requests and SSE readiness checks; commands can be
+delayed during setup, but not by the 20-second confirmation wait.
 
 | Command | Effect |
 | --- | --- |
@@ -68,8 +69,11 @@ Windows user or an administrator.
 
 RAP targets a **500 ms cycle**, without overlapping status/project/position
 reads. It validates status and documented workspace/device context each cycle.
-Latency, cloud requests and import confirmation can make the actual interval
-longer. API success is an observation, not proof of a newly measured controller
+Latency, cloud requests and synchronous import setup can make the actual interval
+longer. Confirmation is cooperatively polled without waiting across main-loop
+iterations, retaining one SSE stream while coordinate reads/publications continue.
+This is not a hard 500 ms delivery guarantee, and the **2-second stale cutoff
+is unchanged**. API success is an observation, not proof of a newly measured controller
 position. Missing workpiece X/Y never fall back to machine coordinates or zero.
 Missing workpiece dimensions remain `null`; missing machine size, workpiece
 offset or machine-view context fails closed.
@@ -112,6 +116,15 @@ or explicitly fails import. Generic success/type fields are not confirmations.
 An unavailable SSE stream prevents upload; there is no polling fallback for
 import confirmation.
 
+Only one import is active, including its confirmation window. The SSE reader
+is retained after HTTP 202 and checked nonblockingly until a genuine event,
+stream closure, or a monotonic 20-second deadline after the upload response.
+The main loop continues publishing fresh observations during that window; it
+does not start a second import until the first is terminal. Terminal status is
+journaled before releasing the stream and reconciled with the cloud on subsequent
+updates. Stop, unexpected exit, or cloud generation loss disposes the stream;
+an attempted import becomes unknown, while a setup aborted before upload fails.
+
 An accepted upload without confirmation, timeout/disconnect around upload,
 unexpected upload response, or restart during claimed/attempting/accepted state
 becomes **unknown**. RAP never automatically resends it. Inspect LightBurn and
@@ -148,11 +161,22 @@ tests DPAPI/atomic state/ACLs, exact HMAC/SVG/freshness/context validation
 (including delayed-publication and missing-calibration cases),
 strict SSE recognition and raw HTTP transport against ephemeral loopback
 **test fixtures**, and mocked approval/revocation/import ordering, fencing,
-missing confirmation, duplicate delivery and
-restart reconciliation. It never contacts LightBurn/cloud, requests hardware
+nonblocking main-loop publication during confirmation, serial imports, timeout,
+stop/exit cleanup, duplicate delivery and restart reconciliation.
+It never contacts LightBurn/cloud, requests hardware
 pairing, uploads to hardware, or changes the user's real RAP state. Its isolated
 test state and compilation scratch files stay within `rap` and are removed.
 No test framework or runtime installation is needed.
+
+### Live update rollout
+
+This RAP change enables coordinate publication during pending imports only.
+It does not enable browser Live update, alter relay admission limits, or accept
+additional SVG vocabulary. Deploy it alongside the separately tested browser
+queue and relay changes, with Live update default off. Before enabling live
+drawing on hardware, verify fresh coordinates during delayed confirmation,
+ordered imports, timeout/stop/restart recovery, and unchanged existing LightBurn
+objects. Inspect uncertain outcomes manually; never replay an attempted job.
 
 API shapes were verified against official
 [LightBurn-REST documentation](https://github.com/LightBurnSoftware/LightBurn-REST/tree/43d3a4ec5aeb14219f0acaefc8fe01ede57f63ac/docs)

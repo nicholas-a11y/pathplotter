@@ -337,21 +337,28 @@ try {
     $script:UploadMode = 'accepted'
     $script:EventData = '{"success":true}'
     $script:CloudReject = $false
+    $script:CloseStream = $false
+    $script:Streams = New-Object 'Collections.Generic.List[object]'
+    $script:RealStream = $null
     function Invoke-Cloud([string]$Path, $Body = @{}, [string]$Method = 'POST') {
         if ($script:CloudReject) { throw 'Mock cloud fence/rejection.' }
         $script:Order.Add('cloud-' + $Body.status)
         return @{ id = ($Path -split '/')[2]; status = $Body.status }
     }
     function New-ImportStream {
-        $mock = [pscustomobject]@{ IsOpen = $true }
+        if ($null -ne $script:RealStream) { return $script:RealStream }
+        $mock = [pscustomobject]@{ IsOpen = $true; Disposed = $false; Polls = 0 }
         $mock | Add-Member ScriptMethod WaitReady { param($ms); $script:Order.Add('ready'); return $script:Ready }
         $mock | Add-Member ScriptMethod Arm { $script:Order.Add('armed') }
         $mock | Add-Member ScriptMethod Take {
             param($ms)
-            if ($null -eq $script:EventData) { $this.IsOpen = $false }
+            Assert ($ms -eq 0) 'Confirmation polling must not wait.'
+            $this.Polls++
+            if ($script:CloseStream) { $this.IsOpen = $false }
             return $script:EventData
         }
-        $mock | Add-Member ScriptMethod Dispose { $script:Order.Add('disposed') }
+        $mock | Add-Member ScriptMethod Dispose { Assert (-not $this.Disposed); $this.Disposed = $true; $script:Order.Add('disposed') }
+        $script:Streams.Add($mock)
         return $mock
     }
     function Send-Upload($Job, [byte[]]$Bytes) {
@@ -366,6 +373,9 @@ try {
     Check 'Durable attempting + cloud ownership + SSE ready before one serialized upload' {
         $script:Journal = @{}
         Invoke-Import (New-TestJob 'job-confirmed') (Fresh-Observation)
+        Assert ($script:Journal['job-confirmed'].status -eq 'accepted' -and $null -ne $script:ActiveImport)
+        Assert ($script:Streams[-1].Polls -eq 0 -and -not $script:Streams[-1].Disposed)
+        Update-Import
         Assert ($script:Journal['job-confirmed'].status -eq 'confirmed')
         Assert (($script:Order -join ',') -eq 'ready,cloud-attempting,armed,upload,cloud-accepted,disposed')
         Assert ($script:Uploads -eq 1)
@@ -397,20 +407,111 @@ try {
     }
     Check 'Uncertain upload, unexpected HTTP status and accepted-without-event never retried' {
         foreach ($mode in @('throw', 'wrong-status', 'accepted')) {
-            $script:UploadMode = $mode; $script:EventData = $null
+            $script:UploadMode = $mode; $script:EventData = $null; $script:CloseStream = $true
             $id = 'job-unknown-' + $mode
             $before = $script:Uploads
             Invoke-Import (New-TestJob $id) (Fresh-Observation)
+            Update-Import
             Assert ($script:Journal[$id].status -eq 'unknown' -and $script:Uploads -eq $before + 1)
             Invoke-Import (New-TestJob $id) (Fresh-Observation)
             Assert ($script:Uploads -eq $before + 1)
         }
         $script:UploadMode = 'accepted'
+        $script:CloseStream = $false
     }
     Check 'Genuine file_imported false is failed, never bool-coerced into success' {
         $script:EventData = '{"success":false,"error":"synthetic remote text not printed"}'
         Invoke-Import (New-TestJob 'job-failed') (Fresh-Observation)
+        Update-Import
         Assert ($script:Journal['job-failed'].status -eq 'failed')
+    }
+    Check 'Pending confirmation holds one serial import, rejects malformed events, and times out without retry' {
+        $script:EventData = $null
+        $before = $script:Uploads
+        Invoke-Import (New-TestJob 'job-timeout') (Fresh-Observation)
+        $stream = $script:ActiveImport.stream
+        Invoke-Import (New-TestJob 'job-next') (Fresh-Observation)
+        Assert ($script:Uploads -eq $before + 1 -and -not $script:Journal.ContainsKey('job-next'))
+        foreach ($data in @('invalid', '{"success":"true"}', '{"success":1}', '{"type":"file_imported"}')) {
+            $script:EventData = $data
+            Update-Import
+            Assert ($script:Journal['job-timeout'].status -eq 'accepted' -and -not $stream.Disposed)
+        }
+        Assert ($script:ActiveImport.deadline -gt $script:Clock.ElapsedMilliseconds)
+        Assert ($script:ActiveImport.deadline -le $script:Clock.ElapsedMilliseconds + 20000)
+        $script:ActiveImport.deadline = $script:Clock.ElapsedMilliseconds
+        $script:EventData = '{"success":true}'
+        Update-Import
+        Assert ($script:Journal['job-timeout'].status -eq 'unknown' -and $stream.Disposed -and $null -eq $script:ActiveImport)
+        Assert ((Read-Protected 'journal.dpapi').'job-timeout'.status -eq 'unknown')
+        Invoke-Import (New-TestJob 'job-timeout') (Fresh-Observation)
+        Assert ($script:Uploads -eq $before + 1)
+        Invoke-Import (New-TestJob 'job-next') (Fresh-Observation)
+        Update-Import
+        Assert ($script:Uploads -eq $before + 2 -and $script:Journal['job-next'].status -eq 'confirmed')
+    }
+    Check 'Cooperative poll validates a genuine event through the real SSE reader' {
+        $fixture = New-Object PathPlotterRapTests.SseFixture(':connected')
+        $script:RealStream = New-Object PathPlotterRap.EventStream($fixture.Url, 'synthetic-test-token')
+        try {
+            Invoke-Import (New-TestJob 'job-real-event') (Fresh-Observation)
+            $fixture.Emit("event: status`ndata: {`"success`":true}`n`nevent: file_imported`ndata: {`"success`":`"true`"}`n`n")
+            for ($i = 0; $i -lt 5; $i++) { Update-Import; Start-Sleep -Milliseconds 20 }
+            Assert ($script:Journal['job-real-event'].status -eq 'accepted')
+            $fixture.Emit("event: file_imported`ndata: {`"success`":true}`n`n")
+            $deadline = $script:Clock.ElapsedMilliseconds + 3000
+            while ($null -ne $script:ActiveImport -and $script:Clock.ElapsedMilliseconds -lt $deadline) {
+                Update-Import
+                Start-Sleep -Milliseconds 10
+            }
+            Assert ($script:Journal['job-real-event'].status -eq 'confirmed' -and $null -eq $script:ActiveImport)
+        } finally {
+            Stop-Import
+            $script:RealStream.Dispose()
+            $script:RealStream = $null
+            $fixture.Dispose()
+        }
+    }
+    Check 'Stop and changed or missing generation fence accepted imports and retain no-retry tombstones' {
+        foreach ($mode in @('stop', 'changed', 'missing')) {
+            $script:Generation = 1; $script:StopRequested = $false; $script:EventData = $null
+            $id = 'job-loss-' + $mode
+            Invoke-Import (New-TestJob $id) (Fresh-Observation)
+            $stream = $script:ActiveImport.stream
+            switch ($mode) {
+                'stop' { $script:StopRequested = $true }
+                'changed' { $script:Generation = 2 }
+                'missing' { $script:Generation = $null }
+            }
+            $script:EventData = '{"success":true}'
+            Update-Import
+            Assert ($script:Journal[$id].status -eq 'unknown' -and $stream.Disposed -and $null -eq $script:ActiveImport)
+            $script:Generation = 1; $script:StopRequested = $false
+            $before = $script:Uploads
+            Load-Journal
+            Invoke-Import (New-TestJob $id) (Fresh-Observation)
+            Assert ($script:Uploads -eq $before)
+        }
+    }
+    Check 'Stop or generation loss during setup aborts before side effect' {
+        foreach ($mode in @('stop', 'generation')) {
+            $script:StopRequested = $false; $script:Generation = 1
+            $script:FreshCount = 0; $script:SetupLoss = $mode
+            function Get-Observation {
+                $script:FreshCount++
+                if ($script:FreshCount -eq 2) {
+                    if ($script:SetupLoss -eq 'stop') { $script:StopRequested = $true }
+                    else { $script:Generation = 2 }
+                }
+                return Fresh-Observation
+            }
+            $before = $script:Uploads
+            Invoke-Import (New-TestJob ('job-setup-' + $mode)) (Fresh-Observation)
+            Assert ($script:Uploads -eq $before -and $null -eq $script:ActiveImport -and $script:Streams[-1].Disposed)
+            Assert ($script:Journal['job-setup-' + $mode].status -eq 'failed')
+        }
+        $script:StopRequested = $false; $script:Generation = 1
+        function Get-Observation { return Fresh-Observation }
     }
     Check 'Restart recovers claimed/attempting/accepted as unknown; terminal tombstones retained' {
         foreach ($status in @('claimed', 'attempting', 'accepted', 'confirmed', 'failed', 'unknown')) {
@@ -427,7 +528,84 @@ try {
         Invoke-Import (New-TestJob 'recovery-attempting') (Fresh-Observation)
         Assert ($script:Uploads -eq $before)
     }
+    $script:PublicationBodies = New-Object 'Collections.Generic.List[object]'
+    $script:ScheduleMode = 'serial'
+    $script:CycleCount = 0
+    $script:ReadCount = 0
+    function Initialize-Config {
+        $script:Config = @{ apiRoot = 'https://relay.example'; relayId = 'synthetic-relay'; credential = 'synthetic-credential'; lightBurnSecret = 'synthetic-secret' }
+    }
+    function Get-Observation { $script:ReadCount++; return Fresh-Observation }
+    function Read-ConsoleCommand {
+        if ($script:ScheduleMode -eq 'fatal' -and $script:CycleCount -ge 1) { throw 'Mock interrupted main loop.' }
+        $limit = 2
+        if ($script:ScheduleMode -eq 'serial') { $limit = 4 }
+        if ($script:CycleCount -ge $limit) { $script:StopRequested = $true }
+    }
+    function Invoke-Cloud([string]$Path, $Body = @{}, [string]$Method = 'POST') {
+        if ($Path -eq '/agent/start') { return @{ generation = 10; serverTime = 1800000000000.0 } }
+        if ($Path -eq '/agent/update') {
+            if (-not $Body.connected) { return @{} }
+            $script:CycleCount++
+            $script:PublicationBodies.Add($Body)
+            if ($script:ScheduleMode -eq 'serial') {
+                if ($script:CycleCount -in @(2, 3)) {
+                    Assert ($script:Journal['schedule-first'].status -eq 'accepted')
+                    Assert ($script:Uploads -eq $script:ScheduleBefore + 1)
+                    Assert (-not $script:ActiveImport.stream.Disposed)
+                }
+                if ($script:CycleCount -eq 3) { $script:EventData = '{"success":true}' }
+                if ($script:CycleCount -eq 4) {
+                    Assert ($script:Journal['schedule-first'].status -eq 'confirmed')
+                    $script:EventData = $null
+                }
+                $id = 'schedule-second'
+                if ($script:CycleCount -eq 1) { $id = 'schedule-first' }
+            } elseif ($script:ScheduleMode -eq 'fence') {
+                if ($script:CycleCount -eq 2) { throw 'Mock lost cloud generation.' }
+                $id = 'schedule-fenced'
+            } elseif ($script:ScheduleMode -eq 'fatal') { $id = 'schedule-interrupted' }
+            else { $id = 'schedule-second' }
+            return @{ serverTime = 1800000000000.0; pairings = @(); job = (New-TestJob $id) }
+        }
+        return @{ id = ($Path -split '/')[2]; status = $Body.status }
+    }
+    Check 'Actual Start-Rap scheduling reads and publishes fresh coordinates while confirmation waits; serial next import and quit cleanup' {
+        $script:Journal = @{}; Save-Journal
+        $script:EventData = $null
+        $script:ScheduleBefore = $script:Uploads
+        Start-Rap
+        Assert ($script:CycleCount -eq 4 -and $script:ReadCount -ge 4)
+        Assert ($script:Uploads -eq $script:ScheduleBefore + 2)
+        foreach ($body in $script:PublicationBodies) {
+            Assert ($body.connected -and $null -ne $body.position -and $null -ne $body.context -and $body.observationAgeMs -le 2000)
+        }
+        Assert ($script:Journal['schedule-first'].status -eq 'confirmed')
+        Assert ($script:Journal['schedule-second'].status -eq 'unknown')
+        Assert ($null -eq $script:ActiveImport -and $script:Streams[-1].Disposed)
+    }
+    Check 'Start-Rap can restart after quit without reuploading an incomplete import' {
+        $script:ScheduleMode = 'restart'; $script:CycleCount = 0
+        $before = $script:Uploads
+        Start-Rap
+        Assert ($script:CycleCount -eq 2 -and $script:Generation -eq 10)
+        Assert ($script:Uploads -eq $before -and $script:Journal['schedule-second'].status -eq 'unknown')
+        Assert ($null -eq $script:ActiveImport)
+    }
+    Check 'Main cloud failure abandons accepted stream under generation fence; unexpected exit also cleans up' {
+        $script:ScheduleMode = 'fence'; $script:CycleCount = 0
+        Start-Rap
+        Assert ($null -eq $script:Generation -and $null -eq $script:ActiveImport -and $script:Streams[-1].Disposed)
+        Assert ($script:Journal['schedule-fenced'].status -eq 'unknown')
+        $script:ScheduleMode = 'fatal'; $script:CycleCount = 0
+        Must-Throw { Start-Rap }
+        Assert ($null -eq $script:ActiveImport -and $script:Streams[-1].Disposed)
+        Assert ((Read-Protected 'journal.dpapi').'schedule-interrupted'.status -eq 'unknown')
+        $lock = New-Object IO.FileStream((Join-Path $statePath 'instance.lock'), 'OpenOrCreate', 'ReadWrite', 'None')
+        $lock.Dispose()
+    }
 } finally {
+    if (Get-Command Stop-Import -ErrorAction SilentlyContinue) { Stop-Import }
     $cleanupDeadline = [DateTime]::UtcNow.AddSeconds(5)
     while ([IO.Directory]::Exists($statePath)) {
         try { Remove-Item -LiteralPath $statePath -Recurse -Force }
