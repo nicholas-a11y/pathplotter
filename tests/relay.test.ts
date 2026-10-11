@@ -1,6 +1,6 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { RelayClient, parseSnapshot, parseJob, relayBaseUrl, sampleAge, pairingInvitation, MAX_SAMPLE_AGE_MS } from '../src/relay.ts'
+import { RelayClient, parseSnapshot, parseJob, relayBaseUrl, sampleAge, pairingInvitation, browserLink, exchangeBrowserLink, MAX_SAMPLE_AGE_MS } from '../src/relay.ts'
 
 const snapshot = {
   generation: 'boot-1', sequence: 1, connected: true, position: { x: 24, y: 18 },
@@ -37,6 +37,118 @@ test('pairing invitation is separate from durable credentials', () => {
   })
   assert.equal(pairingInvitation(''), null)
   assert.throws(() => pairingInvitation('#invite=once'))
+})
+
+  test('desktop links distinguish launch grants from phone invitations and reject ambiguity', () => {
+    assert.deepEqual(browserLink('#relay=https%3A%2F%2Frelay.example&relayId=abc&launch=once'), {
+      baseUrl: 'https://relay.example', relayId: 'abc', token: 'once', kind: 'launch',
+    })
+    assert.equal(browserLink(''), null)
+    assert.throws(() => browserLink('#launch=one&invite=two'))
+    assert.throws(() => browserLink('#launch=one'))
+  })
+
+  test('desktop launch reuses only same-RAP authorization and never saves cancelled exchanges', async () => {
+    const original = globalThis.fetch
+    const bodies: unknown[] = []
+    globalThis.fetch = async (_url, options) => {
+      bodies.push(JSON.parse(String(options?.body)))
+      return Response.json({ credential: 'authorized' })
+    }
+    const link = { baseUrl: 'https://relay.example', relayId: 'test', token: 'one-use', kind: 'launch' as const }
+    try {
+      const existing = { baseUrl: link.baseUrl, relayId: 'test', credential: 'saved' }
+      assert.deepEqual(await exchangeBrowserLink(link, existing, () => {}, () => true), { ...existing, credential: 'authorized' })
+      assert.deepEqual(bodies[0], { launchToken: 'one-use', credential: 'saved' })
+      assert.equal(await exchangeBrowserLink(link, { ...existing, relayId: 'different' }, () => {}, () => false), null)
+      assert.deepEqual(bodies[1], { launchToken: 'one-use' })
+    } finally { globalThis.fetch = original }
+  })
+
+  test('free capture control is automatic once; takeover loss never triggers a stealing loop', async () => {
+    const original = globalThis.fetch
+    let controlled = false, occupied = false, claims = 0
+    let notify: () => void = () => {}
+    const client = new RelayClient({ baseUrl: 'https://relay.example', relayId: 'test', credential: 'test-only' }, () => notify())
+    globalThis.fetch = async url => {
+      if (String(url).endsWith('/control')) {
+        claims++
+        controlled = true
+        occupied = true
+        return Response.json({ ok: true })
+      }
+      return Response.json({ serverTime: 10000, snapshot, activeBrowser: controlled, controlOccupied: occupied })
+    }
+    const next = () => new Promise<void>(resolve => { notify = resolve })
+    try {
+      const first = next()
+      client.start()
+      await first
+      assert.equal(claims, 1)
+      assert.equal(client.canCapture(), true)
+      controlled = false
+      await new Promise<void>(resolve => { notify = () => { if (!client.activeBrowser) resolve() } })
+      assert.match(client.controlError, /another browser/)
+      occupied = false
+      await next()
+      assert.equal(claims, 1)
+      assert.equal(client.canCapture(), false)
+      await client.claimControl(true)
+      assert.equal(client.canCapture(), true)
+      assert.equal(claims, 2)
+    } finally { client.stop(); globalThis.fetch = original }
+  })
+
+  test('occupied control and import-blocked automatic claims stay read-only', async () => {
+    const original = globalThis.fetch
+    let occupied = true, claims = 0
+    let notify: () => void = () => {}
+    const client = new RelayClient({ baseUrl: 'https://relay.example', relayId: 'test', credential: 'test-only' }, () => notify())
+    globalThis.fetch = async url => {
+      if (String(url).endsWith('/control')) {
+        claims++
+        return Response.json({ error: 'Unresolved import prevents capture handover' }, { status: 409 })
+      }
+      return Response.json({ serverTime: 10000, snapshot, activeBrowser: false, controlOccupied: occupied })
+    }
+    try {
+      let changed = new Promise<void>(resolve => { notify = resolve })
+      client.start()
+      await changed
+      assert.equal(claims, 0)
+      client.stop()
+      occupied = false
+      changed = new Promise<void>(resolve => { notify = resolve })
+      client.start()
+      await changed
+      assert.equal(claims, 1)
+      assert.match(client.controlError, /Unresolved import/)
+      assert.equal(client.canCapture(), false)
+    } finally { client.stop(); globalThis.fetch = original }
+  })
+
+test('phone links reuse valid saved authorization and otherwise wait for exact desktop approval', async () => {
+  const original = globalThis.fetch
+  const paths: string[] = [], messages: string[] = []
+  const link = { baseUrl: 'https://relay.example', relayId: 'test', token: 'phone-only', kind: 'phone' as const }
+  const existing = { baseUrl: link.baseUrl, relayId: link.relayId, credential: 'saved' }
+  let revoked = false
+  globalThis.fetch = async url => {
+    const path = String(url).split('/test')[1]!
+    paths.push(path)
+    if (path === '/snapshot') return Response.json(revoked ? { error: 'Revoked' } : {}, { status: revoked ? 403 : 200 })
+    if (path === '/pairing/request') return Response.json({ pairingId: 'exact-request', pendingToken: 'pending-only', phrase: 'compare-this-phrase' })
+    return Response.json({ status: 'approved', credential: 'phone-authorized' })
+  }
+  try {
+    assert.deepEqual(await exchangeBrowserLink(link, existing, text => messages.push(text), () => true), existing)
+    assert.deepEqual(paths, ['/snapshot'])
+    revoked = true
+    const paired = await exchangeBrowserLink(link, existing, text => messages.push(text), () => true)
+    assert.equal(paired?.credential, 'phone-authorized')
+    assert.deepEqual(paths.slice(1), ['/snapshot', '/pairing/request', '/pairing/status'])
+    assert.ok(messages.some(message => message.includes('compare-this-phrase')))
+  } finally { globalThis.fetch = original }
 })
 
 test('import acceptance is not confirmation and invalid job states are rejected', () => {
@@ -84,7 +196,7 @@ test('client fails closed on malformed or failed relay responses', async () => {
       client.start()
       await update
       assert.equal(client.canCapture(), false)
-      assert.equal(client.error, 'Relay access revoked')
+      assert.match(client.error, /authorization is no longer valid/)
     } finally {
       client.stop()
       globalThis.fetch = originalFetch

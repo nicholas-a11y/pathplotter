@@ -8,20 +8,20 @@ The hosted web app stays at https://nicholas-a11y.github.io/pathplotter/. The ne
 
 This is a development prototype, not an already deployed service. Deploy and configure the backend before attempting cloud pairing. Real Windows/phone/LightBurn testing is required before general release.
 
-Backend setup and checks are in [relay/README.md](relay/README.md). Windows startup, consent, console commands and recovery are in [rap/README.md](rap/README.md). The prototype prints a private pairing URL; local QR generation is not implemented yet.
+Backend setup and checks are in [relay/README.md](relay/README.md). Windows startup, consent, tray controls and recovery are in [rap/README.md](rap/README.md).
 
 Budget for usage before leaving RAP running continuously. A 500 ms publication interval alone is approximately 172,800 updates per day; browser polling and coordination add requests and storage operations. This is not a promise of free hosting. Free-tier limits can stop the relay rather than merely slow it down; measure actual use and choose a suitable Workers plan.
 
-### Pair a browser
+### Connect a browser
 
-1. Run the Windows RAP on the LightBurn computer and approve its access in LightBurn.
-2. Generate a pairing invitation in RAP and open its link on the phone or desktop browser. The link contains a short-lived invitation, not the LightBurn secret. Treat it as private until consumed.
-3. Click **Pair with RAP**, compare the verification phrase, and approve the request in the RAP console.
-4. Click **Use this browser**. Only one browser has capture control at a time; another browser must wait for its lease to expire.
+1. Double-click **Start RAP.cmd** on the LightBurn computer. First use requires graphical enrollment, local consent and LightBurn's own approval. Existing protected credentials are reused.
+2. Normal launches open PathPlotter automatically after RAP is ready. This dedicated one-use desktop authorization does not require typing `pair`, `open` or `approve`. Opening again from the tray reuses a valid saved same-RAP browser grant.
+3. For a phone, choose **Pair phone** in RAP and scan its locally generated QR (or open its private link). The browser automatically requests pairing. Compare the phrase and click **Approve** on the desktop; phone requests are never auto-approved.
+4. Capture control is acquired automatically when free. If another browser controls capture, the new browser stays read-only and offers **Take control** with explicit confirmation. Pending and unresolved imports block handover. The previous browser does not automatically steal control back.
 5. Position the head using the usual machine controls. **Capture point** copies the latest reported workpiece sample, rather than taking a fresh reading at tap time.
 6. **Send to LightBurn** creates a bounded, expiring SVG job. The result distinguishes acceptance from confirmed import.
 
-The cloud connection dialog also allows entering the relay URL, ID and invitation manually. The hosted build defaults to cloud mode; localhost development defaults to the existing local proxy.
+The cloud connection dialog also allows entering the relay URL, ID and invitation manually. Connection-link secrets are removed immediately from the address bar. A same-RAP link preserves outstanding live work; switching RAPs is blocked until pending work is reconciled and requires confirmation. The hosted build defaults to cloud mode; localhost development defaults to the existing local proxy.
 
 ### Freshness and workspace protection
 
@@ -37,7 +37,7 @@ The cloud connection dialog also allows entering the relay URL, ID and invitatio
 
 Only one import is active per relay. Jobs expire before starting; uncertain uploads are never automatically repeated. The browser saves a pending job ID before submission so refreshing the page does not silently permit another Send.
 
-If disconnected during submission or confirmation, use **Check last import** in Connection and inspect RAP/LightBurn. **Acknowledge uncertain import** clears the browser's guard only after explicit manual reconciliation; another Send could duplicate artwork.
+If disconnected during submission or confirmation, use **Check last import** in Connection and inspect RAP/LightBurn. **Acknowledge uncertain import** clears the browser's guard and acknowledges an unknown relay job only after explicit manual reconciliation; another Send could duplicate artwork. Still-running imports cannot be acknowledged. Control loss pauses live work; reacquire control explicitly, then check/acknowledge and resume its saved queue.
 
 LightBurn's API does not provide documented import idempotency or reliable per-job event correlation. Even serialized RAP uploads cannot eliminate ambiguity from unrelated concurrent imports. No exactly-once guarantee is made.
 

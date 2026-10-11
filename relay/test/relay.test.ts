@@ -663,6 +663,342 @@ describe("PathPlotter relay HTTP contract", () => {
   });
 });
 
+async function issueLaunch(relay: Relay | Agent, credential = relay.credential): Promise<Response> {
+  return call(`/v1/relays/${relay.relayId}/agent/browser-launch`, { credential, bindings: relay.bindings, body: {} });
+}
+
+async function launchToken(relay: Relay | Agent): Promise<string> {
+  const response = await issueLaunch(relay);
+  expect(response.status).toBe(200);
+  const value = await json<{ launchToken: string; expiresAt: number }>(response);
+  expect(value.launchToken).toMatch(/^[A-Za-z0-9_-]{43}$/u);
+  expect(value.expiresAt).toBeGreaterThan(Date.now());
+  return value.launchToken;
+}
+
+async function redeem(relay: Relay | Agent, token: string, credential?: string, origin?: string | null): Promise<Response> {
+  return call(`/v1/relays/${relay.relayId}/browser/launch`, {
+    body: credential === undefined ? { launchToken: token } : { launchToken: token, credential },
+    bindings: relay.bindings,
+    origin,
+  });
+}
+
+async function launchBrowser(relay: Relay | Agent): Promise<string> {
+  const response = await redeem(relay, await launchToken(relay));
+  expect(response.status).toBe(200);
+  return (await json<{ credential: string }>(response)).credential;
+}
+
+async function control(relay: Relay | Agent, credential: string, body: unknown = {}): Promise<Response> {
+  return call(`/v1/relays/${relay.relayId}/control`, { credential, bindings: relay.bindings, body });
+}
+
+async function snapshotOf(relay: Relay | Agent, credential: string): Promise<{ activeBrowser: boolean; controlOccupied: boolean; job: Record<string, unknown> | null }> {
+  const response = await call(`/v1/relays/${relay.relayId}/snapshot`, { credential, bindings: relay.bindings });
+  expect(response.status).toBe(200);
+  return json(response);
+}
+
+async function queueJob(relay: Relay | Agent, credential: string): Promise<{ response: Response; id: string }> {
+  const payload = jobPayload();
+  payload.checksum = await checksum(SVG);
+  const response = await call(`/v1/relays/${relay.relayId}/jobs`, { credential, bindings: relay.bindings, body: payload });
+  return { response, id: payload.id as string };
+}
+
+describe("desktop launch authorization", () => {
+  afterEach(() => vi.useRealTimers());
+
+  it("requires the agent credential to issue and an allowed origin to redeem", async () => {
+    const relay = await register();
+    const agent = await startAgent(relay);
+    const browser = await pairBrowser(agent);
+    expect((await issueLaunch(relay, browser.credential)).status).toBe(401);
+    expect((await call(`/v1/relays/${relay.relayId}/agent/browser-launch`, { bindings: relay.bindings, body: {} })).status).toBe(401);
+    const other = await register();
+    expect((await issueLaunch(relay, other.credential)).status).toBe(401);
+    const extra = await call(`/v1/relays/${relay.relayId}/agent/browser-launch`, {
+      credential: relay.credential, bindings: relay.bindings, body: { approve: true },
+    });
+    expect(extra.status).toBe(400);
+
+    const token = await launchToken(relay);
+    expect((await redeem(relay, token, undefined, null)).status).toBe(403);
+    expect((await redeem(relay, token, undefined, "https://attacker.example")).status).toBe(403);
+    expect((await redeem(other, token)).status).toBe(404);
+    expect((await redeem(relay, token, "not-a-token")).status).toBe(400);
+    const granted = await redeem(relay, token);
+    expect(granted.status).toBe(200);
+    expect(granted.headers.get("Access-Control-Allow-Origin")).toBe(ORIGIN);
+    const { credential } = await json<{ credential: string }>(granted);
+    expect(Object.keys(await json<Record<string, unknown>>(await redeem(relay, await launchToken(relay))))).toEqual(["credential"]);
+    expect(credential).toMatch(/^[A-Za-z0-9_-]{43}$/u);
+    expect(credential).not.toBe(relay.credential);
+    expect((await snapshotOf(relay, credential)).activeBrowser).toBe(false);
+    expect((await call(`/v1/relays/${relay.relayId}/agent/start`, { credential, bindings: relay.bindings, body: {} })).status).toBe(401);
+    expect((await call(`/v1/relays/${other.relayId}/snapshot`, { credential, bindings: other.bindings })).status).toBe(401);
+  });
+
+  it("is single-use, expires and resists replay", async () => {
+    const relay = await register();
+    const token = await launchToken(relay);
+    expect((await redeem(relay, token)).status).toBe(200);
+    const replay = await redeem(relay, token);
+    expect(replay.status).toBe(409);
+    expect(await json(replay)).toEqual({ error: "launch_token_used" });
+    expect((await redeem(relay, randomTokenForTest())).status).toBe(404);
+
+    const late = await launchToken(relay);
+    vi.useFakeTimers();
+    vi.setSystemTime(Date.now() + 2 * 60_000 + 1);
+    const expired = await redeem(relay, late);
+    expect(expired.status).toBe(410);
+    expect(await json(expired)).toEqual({ error: "launch_token_expired" });
+
+    vi.useRealTimers();
+    const tokens = await Promise.all(Array.from({ length: 3 }, () => launchToken(relay)));
+    const concurrent = await Promise.all(tokens.flatMap((value) => [redeem(relay, value), redeem(relay, value)]));
+    expect(concurrent.filter((response) => response.status === 200)).toHaveLength(3);
+    expect(concurrent.filter((response) => response.status === 409)).toHaveLength(3);
+  });
+
+  it("reuses a valid supplied credential and mints a new one for revoked or foreign credentials", async () => {
+    const relay = await register();
+    const agent = await startAgent(relay);
+    const first = await launchBrowser(relay);
+    const reused = await redeem(relay, await launchToken(relay), first);
+    expect(await json(reused)).toEqual({ credential: first });
+    const paired = await pairBrowser(agent);
+    expect(await json(await redeem(relay, await launchToken(relay), paired.credential))).toEqual({ credential: paired.credential });
+    const listed = await json<{ browsers: Array<{ id: string }> }>(await call(`/v1/relays/${relay.relayId}/browsers`, {
+      credential: relay.credential, bindings: relay.bindings,
+    }));
+    expect(listed.browsers).toHaveLength(2);
+
+    for (const browser of listed.browsers) {
+      expect((await call(`/v1/relays/${relay.relayId}/browsers/revoke`, {
+        credential: relay.credential, bindings: relay.bindings, body: { browserId: browser.id },
+      })).status).toBe(200);
+    }
+    expect((await call(`/v1/relays/${relay.relayId}/snapshot`, { credential: first, bindings: relay.bindings })).status).toBe(401);
+    const replacement = (await json<{ credential: string }>(await redeem(relay, await launchToken(relay), first))).credential;
+    expect(replacement).not.toBe(first);
+    expect((await call(`/v1/relays/${relay.relayId}/snapshot`, { credential: replacement, bindings: relay.bindings })).status).toBe(200);
+    expect((await call(`/v1/relays/${relay.relayId}/snapshot`, { credential: first, bindings: relay.bindings })).status).toBe(401);
+
+    const other = await register();
+    const foreign = await launchBrowser(other);
+    const fresh = (await json<{ credential: string }>(await redeem(relay, await launchToken(relay), foreign))).credential;
+    expect(fresh).not.toBe(foreign);
+    expect((await call(`/v1/relays/${other.relayId}/snapshot`, { credential: fresh, bindings: other.bindings })).status).toBe(401);
+  });
+
+  it("keeps phone pairing approval separate and bounds launch issuance and grants", async () => {
+    const relay = await register();
+    const agent = await startAgent(relay);
+    const tokens = await Promise.all(Array.from({ length: 5 }, () => launchToken(relay)));
+    const outstanding = await issueLaunch(relay);
+    expect(outstanding.status).toBe(429);
+    expect(await json(outstanding)).toEqual({ error: "too_many_launch_tokens" });
+    for (let index = 0; index < 10; index += 1) {
+      const invite = await call(`/v1/relays/${relay.relayId}/pairing/new`, { credential: relay.credential, bindings: relay.bindings, body: {} });
+      expect(invite.status, `phone invitation ${index + 1}`).toBe(200);
+    }
+    for (const token of tokens) expect((await redeem(relay, token)).status).toBe(200);
+    const updated = await json<{ pairings: unknown[] }>(await update(agent, 1));
+    expect(updated.pairings).toEqual([]);
+
+    vi.useFakeTimers();
+    const now = Date.now();
+    vi.setSystemTime(now);
+    for (let index = 5; index < 20; index += 1) {
+      expect((await redeem(relay, await launchToken(relay))).status, `launch ${index + 1}`).toBe(200);
+    }
+    const rate = await issueLaunch(relay);
+    expect(rate.status).toBe(429);
+    expect(await json(rate)).toEqual({ error: "launch_rate_limited" });
+
+    vi.setSystemTime(now + 10 * 60_000 + 1);
+    const capped = await redeem(relay, await launchToken(relay));
+    expect(capped.status).toBe(429);
+    expect(await json(capped)).toEqual({ error: "too_many_launch_browsers" });
+    const listed = await json<{ browsers: Array<{ id: string }> }>(await call(`/v1/relays/${relay.relayId}/browsers`, {
+      credential: relay.credential, bindings: relay.bindings,
+    }));
+    expect(listed.browsers).toHaveLength(20);
+    await call(`/v1/relays/${relay.relayId}/browsers/revoke`, {
+      credential: relay.credential, bindings: relay.bindings, body: { browserId: listed.browsers[0].id },
+    });
+    expect((await redeem(relay, await launchToken(relay))).status).toBe(200);
+  }, 30_000);
+});
+
+describe("browser control acquisition and takeover", () => {
+  afterEach(() => vi.useRealTimers());
+
+  it("claims free control, refuses occupied claims and switches only on explicit takeover", async () => {
+    const relay = await register();
+    const agent = await startAgent(relay);
+    const first = await launchBrowser(relay);
+    const second = await launchBrowser(relay);
+    expect((await snapshotOf(relay, first))).toMatchObject({ activeBrowser: false, controlOccupied: false });
+    expect((await control(relay, first)).status).toBe(200);
+    expect((await control(relay, first)).status).toBe(200);
+    const occupied = await control(relay, second);
+    expect(occupied.status).toBe(409);
+    expect(await json(occupied)).toEqual({ error: "browser_lease_occupied" });
+    expect((await control(relay, second, { takeover: false })).status).toBe(409);
+    expect((await control(relay, second, { takeover: "yes" })).status).toBe(400);
+    expect((await control(relay, second, { takeover: true, extra: 1 })).status).toBe(400);
+    expect(await snapshotOf(relay, second)).toMatchObject({ activeBrowser: false, controlOccupied: true });
+    expect(await snapshotOf(relay, first)).toMatchObject({ activeBrowser: true, controlOccupied: false });
+
+    const takeover = await control(relay, second, { takeover: true });
+    expect(takeover.status).toBe(200);
+    expect(await json(takeover)).toEqual({ activeBrowser: true });
+    expect(await snapshotOf(relay, first)).toMatchObject({ activeBrowser: false, controlOccupied: true });
+    expect(await snapshotOf(relay, second)).toMatchObject({ activeBrowser: true, controlOccupied: false });
+    await update(agent, 1);
+    const fenced = await queueJob(relay, first);
+    expect(fenced.response.status).toBe(409);
+    expect(await json(fenced.response)).toEqual({ error: "active_browser_required" });
+    expect((await control(relay, first)).status).toBe(409);
+  });
+
+  it("blocks takeover and lease-expiry claims while another browser has unresolved imports", async () => {
+    const relay = await register();
+    const agent = await startAgent(relay);
+    const owner = await launchBrowser(relay);
+    const other = await launchBrowser(relay);
+    expect((await control(relay, owner)).status).toBe(200);
+    await update(agent, 1);
+    const queued = await queueJob(relay, owner);
+    expect(queued.response.status).toBe(200);
+    const refused = await control(relay, other, { takeover: true });
+    expect(refused.status).toBe(409);
+    expect(await json(refused)).toEqual({ error: "unresolved_imports" });
+
+    const claimed = await json<{ job: { id: string } | null }>(await update(agent, 2));
+    expect(claimed.job?.id).toBe(queued.id);
+    expect((await control(relay, other, { takeover: true })).status).toBe(409);
+
+    vi.useFakeTimers();
+    vi.setSystemTime(Date.now() + 15_001);
+    expect((await snapshotOf(relay, other)).controlOccupied).toBe(false);
+    const expiredLease = await control(relay, other);
+    expect(expiredLease.status).toBe(409);
+    expect(await json(expiredLease)).toEqual({ error: "unresolved_imports" });
+    vi.useRealTimers();
+
+    const restarted = await startAgent(relay);
+    expect(await json(await call(`/v1/relays/${relay.relayId}/jobs/${queued.id}`, { credential: owner, bindings: relay.bindings })))
+      .toMatchObject({ id: queued.id, status: "unknown" });
+    expect((await control(relay, other, { takeover: true })).status).toBe(409);
+    expect((await control(relay, owner)).status).toBe(200);
+    await update(restarted, 1);
+    const ownerFollowUp = await queueJob(relay, owner);
+    expect(ownerFollowUp.response.status).toBe(200);
+    await update(restarted, 2);
+    expect((await call(`/v1/relays/${relay.relayId}/agent/jobs/${ownerFollowUp.id}/status`, {
+      credential: relay.credential, bindings: relay.bindings, body: { generation: restarted.generation, status: "attempting" },
+    })).status).toBe(200);
+    expect((await call(`/v1/relays/${relay.relayId}/agent/jobs/${ownerFollowUp.id}/status`, {
+      credential: relay.credential, bindings: relay.bindings, body: { generation: restarted.generation, status: "confirmed" },
+    })).status).toBe(200);
+    expect((await control(relay, other, { takeover: true })).status).toBe(409);
+
+    expect((await call(`/v1/relays/${relay.relayId}/jobs/${queued.id}/resolve`, { credential: other, bindings: relay.bindings, body: {} })).status).toBe(404);
+    expect((await call(`/v1/relays/${relay.relayId}/jobs/${ownerFollowUp.id}/resolve`, { credential: owner, bindings: relay.bindings, body: {} })).status).toBe(409);
+    expect((await call(`/v1/relays/${relay.relayId}/jobs/${queued.id}/resolve`, { credential: owner, bindings: relay.bindings, body: { force: true } })).status).toBe(400);
+    expect((await call(`/v1/relays/${relay.relayId}/jobs/${queued.id}/resolve`, { credential: relay.credential, bindings: relay.bindings, body: {} })).status).toBe(401);
+    const resolved = await call(`/v1/relays/${relay.relayId}/jobs/${queued.id}/resolve`, { credential: owner, bindings: relay.bindings, body: {} });
+    expect(resolved.status).toBe(200);
+    expect(await json(resolved)).toEqual({ id: queued.id, status: "unknown", error: "agent_generation_changed", resolved: true });
+    expect((await call(`/v1/relays/${relay.relayId}/jobs/${queued.id}/resolve`, { credential: owner, bindings: relay.bindings, body: {} })).status).toBe(200);
+    expect(await json(await call(`/v1/relays/${relay.relayId}/jobs/${queued.id}`, { credential: owner, bindings: relay.bindings })))
+      .toMatchObject({ status: "unknown", resolved: true });
+
+    expect((await control(relay, other, { takeover: true })).status).toBe(200);
+    expect(await snapshotOf(relay, owner)).toMatchObject({ activeBrowser: false, controlOccupied: true });
+  });
+
+  it("does not let a revoked browser's unknown import block control forever", async () => {
+    const relay = await register();
+    const agent = await startAgent(relay);
+    const owner = await launchBrowser(relay);
+    const other = await launchBrowser(relay);
+    await control(relay, owner);
+    await update(agent, 1);
+    expect((await queueJob(relay, owner)).response.status).toBe(200);
+    await update(agent, 2);
+    await startAgent(relay);
+    expect((await control(relay, other, { takeover: true })).status).toBe(409);
+    const listed = await json<{ browsers: Array<{ id: string }> }>(await call(`/v1/relays/${relay.relayId}/browsers`, {
+      credential: relay.credential, bindings: relay.bindings,
+    }));
+    await call(`/v1/relays/${relay.relayId}/browsers/revoke`, {
+      credential: relay.credential, bindings: relay.bindings, body: { browserId: listed.browsers[0].id },
+    });
+    expect((await control(relay, other)).status).toBe(200);
+  });
+
+  it("serializes takeover against concurrent job admission", async () => {
+    for (let round = 0; round < 5; round += 1) {
+      const relay = await register();
+      const agent = await startAgent(relay);
+      const owner = await launchBrowser(relay);
+      const other = await launchBrowser(relay);
+      expect((await control(relay, owner)).status).toBe(200);
+      await update(agent, 1);
+      const payload = jobPayload();
+      payload.checksum = await checksum(SVG);
+      const [job, takeover] = await Promise.all([
+        call(`/v1/relays/${relay.relayId}/jobs`, { credential: owner, bindings: relay.bindings, body: payload }),
+        control(relay, other, { takeover: true }),
+      ]);
+      const jobBody = await json<{ status?: string; error?: string }>(job);
+      const takeoverBody = await json<{ activeBrowser?: boolean; error?: string }>(takeover);
+      if (job.status === 200) {
+        expect(jobBody.status).toBe("queued");
+        expect(takeover.status).toBe(409);
+        expect(takeoverBody.error).toBe("unresolved_imports");
+        expect((await snapshotOf(relay, owner)).activeBrowser).toBe(true);
+      } else {
+        expect(job.status).toBe(409);
+        expect(jobBody.error).toBe("active_browser_required");
+        expect(takeover.status).toBe(200);
+        expect((await snapshotOf(relay, owner)).activeBrowser).toBe(false);
+        expect((await call(`/v1/relays/${relay.relayId}/jobs/${payload.id}`, { credential: owner, bindings: relay.bindings })).status).toBe(404);
+        expect((await json<{ job: unknown }>(await update(agent, 2))).job).toBeNull();
+      }
+    }
+  });
+
+  it("streams controlOccupied to the previous controller after takeover", async () => {
+    const relay = await register();
+    const agent = await startAgent(relay);
+    const first = await launchBrowser(relay);
+    const second = await launchBrowser(relay);
+    await control(relay, first);
+    await update(agent, 1);
+    const { ticket } = await json<{ ticket: string }>(await call(`/v1/relays/${relay.relayId}/ticket`, {
+      credential: first, bindings: relay.bindings, body: {},
+    }));
+    const stream = await call(`/v1/relays/${relay.relayId}/stream?ticket=${ticket}`, { bindings: relay.bindings, upgrade: true });
+    const socket = stream.webSocket;
+    expect(socket).toBeTruthy();
+    const messages: Array<{ activeBrowser: boolean; controlOccupied: boolean }> = [];
+    socket?.addEventListener("message", (event) => { messages.push(JSON.parse(String(event.data))); });
+    socket?.accept();
+    await vi.waitFor(() => expect(messages.length).toBeGreaterThan(0));
+    expect(messages[0]).toMatchObject({ activeBrowser: true, controlOccupied: false });
+    expect((await control(relay, second, { takeover: true })).status).toBe(200);
+    await vi.waitFor(() => expect(messages.at(-1)).toMatchObject({ activeBrowser: false, controlOccupied: true }));
+    socket?.close();
+  });
+});
+
 function randomTokenForTest(): string {
   return btoa(crypto.randomUUID() + crypto.randomUUID()).replaceAll("+", "-").replaceAll("/", "_").replace(/=+$/u, "").slice(0, 43);
 }

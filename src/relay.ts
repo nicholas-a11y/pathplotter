@@ -19,6 +19,10 @@ export interface RelayJob {
   status: string
   error?: string
 }
+export class RelayRequestError extends Error {
+  readonly status: number
+  constructor(message: string, status: number) { super(message); this.status = status }
+}
 
 export const MAX_SAMPLE_AGE_MS = 2000
 const IDENTITY_KEY = 'pathplotter.relay.v1'
@@ -104,7 +108,7 @@ export async function relayRequest(baseUrl: string, relayId: string, path: strin
     let message = `Relay request failed (${response.status}).`
     const payload: unknown = await response.json().catch(() => null)
     if (record(payload) && typeof payload.error === 'string') message = payload.error
-    throw new Error(message)
+    throw new RelayRequestError(message, response.status)
   }
   return response.json()
 }
@@ -134,11 +138,73 @@ export function pairingInvitation(hash: string): { baseUrl: string; relayId: str
   return { baseUrl: relayBaseUrl(params.get('relay') ?? ''), relayId, invitation }
 }
 
+export interface BrowserLink {
+  baseUrl: string
+  relayId: string
+  token: string
+  kind: 'launch' | 'phone'
+}
+export function browserLink(hash: string): BrowserLink | null {
+  const params = new URLSearchParams(hash.replace(/^#/, ''))
+  if (!params.has('launch') && !params.has('invite')) return null
+  if (params.has('launch') && params.has('invite')) throw new Error('Ambiguous RAP connection link.')
+  const relayId = params.get('relayId'), token = params.get(params.has('launch') ? 'launch' : 'invite')
+  if (!relayId || !token) throw new Error('Incomplete RAP connection link.')
+  return { baseUrl: relayBaseUrl(params.get('relay') ?? ''), relayId, token, kind: params.has('launch') ? 'launch' : 'phone' }
+}
+
+export async function exchangeBrowserLink(link: BrowserLink, existing: RelayIdentity | null,
+  message: (text: string) => void, active: () => boolean): Promise<RelayIdentity | null> {
+  const request = (path: string, body: unknown) => relayRequest(link.baseUrl, link.relayId, path, body)
+  const matching = existing?.baseUrl === link.baseUrl && existing.relayId === link.relayId ? existing : null
+  if (link.kind === 'launch') {
+    message('Connecting this browser to RAP…')
+    const result = await request('/browser/launch', { launchToken: link.token, ...(matching ? { credential: matching.credential } : {}) })
+    if (!active()) return null
+    if (!record(result) || typeof result.credential !== 'string' || !result.credential) throw new Error('Desktop launch returned no browser authorization.')
+    return { baseUrl: link.baseUrl, relayId: link.relayId, credential: result.credential }
+  }
+  if (matching) {
+    try {
+      await relayRequest(link.baseUrl, link.relayId, '/snapshot', undefined, matching.credential)
+      if (!active()) return null
+      message('Using this browser’s saved RAP connection.')
+      return matching
+    } catch (error) {
+      if (!(error instanceof RelayRequestError) || ![401, 403].includes(error.status)) throw error
+    }
+  }
+  message('Requesting phone pairing…')
+  const result = await request('/pairing/request', { invitation: link.token })
+  if (!active()) return null
+  if (!record(result) || typeof result.pairingId !== 'string' || typeof result.pendingToken !== 'string' || typeof result.phrase !== 'string') {
+    throw new Error('Invalid pairing response.')
+  }
+  message(`Compare “${result.phrase}” with RAP, then click Approve on the desktop.`)
+  const deadline = performance.now() + 300000
+  while (active() && performance.now() < deadline) {
+    await new Promise(resolve => setTimeout(resolve, 1000))
+    if (!active()) return null
+    const status = await request('/pairing/status', { pairingId: result.pairingId, pendingToken: result.pendingToken })
+    if (!active()) return null
+    if (!record(status) || typeof status.status !== 'string') throw new Error('Invalid pairing status.')
+    if (status.status === 'approved') {
+      if (typeof status.credential !== 'string' || !status.credential) throw new Error('Browser authorization missing.')
+      return { baseUrl: link.baseUrl, relayId: link.relayId, credential: status.credential }
+    }
+    if (status.status !== 'pending') throw new Error(status.status === 'rejected' ? 'RAP declined or expired this pairing. Use Pair phone to try again.' : 'Pairing is no longer available.')
+  }
+  if (active()) throw new Error('Pairing expired. Use Pair phone in RAP to create a new link.')
+  return null
+}
+
 export class RelayClient {
   readonly identity: RelayIdentity
   private changed: () => void
   snapshot: RelaySnapshot | null = null
   activeBrowser = false
+  controlOccupied = false
+  controlError = ''
   error = ''
   private serverTime = 0
   private roundTripMs = 0
@@ -146,6 +212,9 @@ export class RelayClient {
   private running = false
   private timer: ReturnType<typeof setTimeout> | undefined
   private epoch = 0
+  private autoClaimPending = true
+  private controlLost = false
+  private claimInFlight = false
 
   constructor(identity: RelayIdentity, changed: () => void) {
     this.identity = identity
@@ -165,10 +234,15 @@ export class RelayClient {
     return this.running && !this.error && this.activeBrowser && this.snapshot?.connected === true &&
       this.snapshot.position !== null && this.snapshot.context !== null && this.age() <= MAX_SAMPLE_AGE_MS
   }
+  hasFreshPosition(): boolean {
+    return this.running && !this.error && this.snapshot?.connected === true &&
+      this.snapshot.position !== null && this.snapshot.context !== null && this.age() <= MAX_SAMPLE_AGE_MS
+  }
 
   start(): void {
     if (this.running) return
     this.running = true
+    this.autoClaimPending = !this.controlLost
     const epoch = ++this.epoch
     const poll = async () => {
       if (!this.running || epoch !== this.epoch) return
@@ -179,6 +253,7 @@ export class RelayClient {
         if (!record(value) || !finite(value.serverTime) || typeof value.activeBrowser !== 'boolean') {
           throw new Error('Invalid relay response.')
         }
+        if (value.controlOccupied !== undefined && typeof value.controlOccupied !== 'boolean') throw new Error('Invalid relay control state.')
         const next = parseSnapshot(value.snapshot)
         if (next && this.snapshot && next.generation === this.snapshot.generation &&
             next.sequence < this.snapshot.sequence) throw new Error('Out-of-order relay snapshot.')
@@ -186,13 +261,31 @@ export class RelayClient {
         this.serverTime = value.serverTime
         this.roundTripMs = performance.now() - started
         this.receivedMonotonic = performance.now()
+        if (this.activeBrowser && !value.activeBrowser) {
+          this.controlLost = true
+          this.autoClaimPending = false
+          this.controlError = 'Capture control was released or taken by another browser. Click Take control to continue.'
+        }
         this.activeBrowser = value.activeBrowser
+        this.controlOccupied = value.controlOccupied === true
         this.error = ''
+        if (this.autoClaimPending && this.hasFreshPosition()) {
+          this.autoClaimPending = false
+          if (!this.activeBrowser && !this.controlOccupied) {
+            try { await this.claimControl(false) }
+            catch (error) { this.controlError = error instanceof Error ? error.message : String(error) }
+          }
+        }
+        if (!this.running || epoch !== this.epoch) return
       } catch (error) {
         if (!this.running || epoch !== this.epoch) return
-        this.error = error instanceof Error ? error.message : String(error)
+        const denied = error instanceof RelayRequestError && [401, 403].includes(error.status)
+        this.error = denied ? 'Browser authorization is no longer valid. Open PathPlotter from RAP, or use Pair phone to reconnect.' :
+          error instanceof Error ? error.message : String(error)
+        if (denied) { this.controlLost = true; this.autoClaimPending = false; this.controlError = this.error }
         this.snapshot = null
         this.activeBrowser = false
+        if (!this.controlLost) this.autoClaimPending = true
       }
       this.changed()
       if (this.running && epoch === this.epoch) this.timer = setTimeout(poll, this.error ? 2000 : 500)
@@ -208,9 +301,18 @@ export class RelayClient {
     this.activeBrowser = false
   }
 
-  async claimControl(): Promise<void> {
-    await this.request('/control', {})
-    this.activeBrowser = true
-    this.changed()
+  async claimControl(takeover = false): Promise<void> {
+    if (this.claimInFlight) throw new Error('A capture control request is already pending.')
+    this.claimInFlight = true
+    const epoch = this.epoch
+    try {
+      await this.request('/control', takeover ? { takeover: true } : {})
+      if (!this.running || epoch !== this.epoch) return
+      this.activeBrowser = true
+      this.controlLost = false
+      this.controlError = ''
+      this.autoClaimPending = false
+      this.changed()
+    } finally { this.claimInFlight = false }
   }
 }

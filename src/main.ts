@@ -2,7 +2,7 @@ import './style.css'
 import { captureGroups, allPoints, finishCapture, type Collection, type CaptureGroup, type Point, type ShapeType } from './capture-groups'
 import { layerPalette, isLayerColor } from './layer-palette'
 import { SettledPosition } from './settled-position'
-import { RelayClient, loadIdentity, saveIdentity, pairingInvitation, relayRequest, relayBaseUrl, parseJob } from './relay'
+import { RelayClient, RelayRequestError, loadIdentity, saveIdentity, browserLink, exchangeBrowserLink, relayBaseUrl, parseJob, type BrowserLink } from './relay'
 import { appendCollectionPrimitives, primitiveBounds, hasEnoughPoints, serializeSvg, buildDelta, fmt, type BuiltSvg, type Primitive } from './geometry'
 import { LIVE_QUEUE_LIMIT, emptyLiveQueue, makeUpdate, enqueue, recordOutcome, parseLiveQueue, type LiveUpdate, type ImportTarget, type LiveQueue } from './live-updates'
 import { openImportStream, type ImportResult } from './import-stream'
@@ -45,6 +45,7 @@ app.innerHTML = `
 
   <nav class="toolbar" aria-label="Capture actions">
     <button id="captureBtn" class="primary">Capture point</button>
+    <button id="quickControlBtn" class="primary" hidden>Take control</button>
     <button id="finishBtn">Finish</button>
     <button id="undoBtn" class="secondary">Undo</button>
     <button id="settingsBtn" class="secondary">Capture settings</button>
@@ -86,13 +87,13 @@ app.innerHTML = `
       </select>
     </label>
     <section id="relayConnection">
-      <p class="hint">Run RAP on the LightBurn computer and open its pairing link on this browser. Compare the verification phrase and approve in RAP. Pairing is saved only in this browser.</p>
+      <p class="hint">Double-click RAP to open and connect this computer. For a phone, use Pair phone in RAP, scan its QR and click Approve on the desktop. Capture control is automatic when free.</p>
       <label>Relay API URL<input id="relayUrl" type="url" placeholder="https://pathplotter-relay.example.workers.dev" /></label>
       <label>Relay ID<input id="relayId" /></label>
       <label>Pairing invitation<input id="relayInvitation" type="password" autocomplete="off" /></label>
       <div class="row">
         <button id="pairRelayBtn" class="primary">Pair with RAP</button>
-        <button id="takeControlBtn">Use this browser</button>
+        <button id="takeControlBtn">Take control</button>
         <button id="unlinkRelayBtn">Unlink this browser</button>
         <button id="revalidateBtn">Confirm workspace for existing points</button>
         <button id="checkImportBtn">Check last import</button>
@@ -415,14 +416,21 @@ must<HTMLButtonElement>('liveReconcileBtn').addEventListener('click', async () =
   const head = liveQueue().items[0]
   if (!head || head.phase === 'queued' || liveDispatching || liveRecoveryInFlight) return
   if (!window.confirm(`Inspect RAP/LightBurn for import ${head.id}. Acknowledge its outcome and remove it from the queue WITHOUT resending it? Missing geometry must be corrected manually. Remaining updates stay paused.`)) return
+  liveRecoveryInFlight = true
+  renderControls()
   try {
     await acquireLiveLock()
+    if (head.target.mode === 'relay') {
+      if (!head.target.relayId) throw new Error('Saved update has no original RAP identifier.')
+      await acknowledgeRelayImport(head.id, head.target.relayId, head.target.baseUrl)
+    }
     const next = structuredClone(state)
     next.liveQueue!.items.shift()
     next.liveQueue!.paused = 'Outcome acknowledged without retry. Explicitly resume remaining updates.'
     commitCollection(next)
     if (pendingImport?.id === head.id) clearPendingImport()
   } catch (error) { setStatus(errorToMessage(error)) }
+  finally { liveRecoveryInFlight = false; renderControls() }
 })
 must<HTMLButtonElement>('liveAbandonBtn').addEventListener('click', async () => {
   if (liveRecoveryInFlight || liveDispatching || requestInFlight) return
@@ -477,6 +485,14 @@ function relayChanged(): void {
   if (mode !== 'relay') return
   const snapshot = relay?.snapshot
   const fresh = relay?.canCapture() === true
+  if ((liveEnabled || (liveQueue().items.length > 0 && !liveQueue().paused)) && relay?.controlError && !relay.activeBrowser) {
+    liveEnabled = false
+    const next = structuredClone(state)
+    next.liveQueue ??= emptyLiveQueue()
+    next.liveQueue.paused = 'Capture control was lost. Reacquire it explicitly, then reconcile or resume queued updates.'
+    try { commitCollection(next) }
+    catch (error) { state.liveQueue = next.liveQueue; setStatus(`Live work paused; cannot save: ${errorToMessage(error)}`) }
+  }
   const relayContext = snapshot && relay ? `${relay.identity.relayId}:${snapshot.generation}:${snapshot.context?.revision}` : null
   if (!fresh || relayContext !== settledRelayContext) settledPosition.reset()
   settledRelayContext = relayContext
@@ -485,11 +501,12 @@ function relayChanged(): void {
   }
   livePosition = fresh && snapshot?.position ? { ...snapshot.position, updatedAt: Date.now() } : null
   workspaceSize = snapshot?.context?.size ?? null
-  connectionStateEl.textContent = fresh ? 'RAP connected' : 'Capture unavailable'
+  connectionStateEl.textContent = fresh ? 'Ready to capture' : relay?.hasFreshPosition() ? 'Read-only · Take control' : 'Capture unavailable'
   connectionStateEl.classList.toggle('ok', fresh)
   liveTextEl.textContent = relay?.error ? `Relay: ${relay.error}` :
     snapshot?.position ? `Latest reported: X ${snapshot.position.x.toFixed(3)}, Y ${snapshot.position.y.toFixed(3)} mm · age ${(relay!.age() / 1000).toFixed(1)} s${fresh ? '' : ' · stale, offline or another browser has control'}` :
     'Waiting for a fresh RAP workpiece position.'
+  if (relay?.controlError) must<HTMLElement>('relayMessage').textContent = relay.controlError
   renderControls()
   renderPlot()
 }
@@ -522,55 +539,54 @@ modeInput.addEventListener('change', () => {
   ++pairingEpoch
   updateConnectionMode()
 })
-must<HTMLButtonElement>('pairRelayBtn').addEventListener('click', async () => {
+async function connectBrowserLink(link: BrowserLink): Promise<void> {
   const button = must<HTMLButtonElement>('pairRelayBtn')
   const message = must<HTMLParagraphElement>('relayMessage')
   button.disabled = true
   const epoch = ++pairingEpoch
   try {
-    if (liveOwnsWork()) throw new Error('Finish or reconcile live updates before replacing the pairing.')
-    if (relay && !window.confirm('Replace this browser’s existing relay pairing?')) return
+    const existing = relay?.identity ?? loadIdentity()
+    const matching = existing?.baseUrl === link.baseUrl && existing.relayId === link.relayId
+    if (!matching && (liveOwnsWork() || uploadInFlight || pendingImport)) throw new Error('Reconcile pending work before connecting a different RAP.')
+    if (!matching && existing && !window.confirm('Connect this browser to a different RAP? Existing captured points will not be transformed.')) return
+    if (matching && (liveOwnsWork() || uploadInFlight || pendingImport)) {
+      if (existing && !relay) attachRelay(existing)
+      message.textContent = 'Saved RAP connection retained. Reconcile pending live work before starting new captures.'
+      return
+    }
+    const identity = await exchangeBrowserLink(link, existing, text => { message.textContent = text; setStatus(text) }, () => epoch === pairingEpoch)
+    if (!identity || epoch !== pairingEpoch) return
+    saveIdentity(identity)
+    attachRelay(identity)
+    must<HTMLInputElement>('relayInvitation').value = ''
+    message.textContent = 'Connected. Capture control is acquired automatically when free.'
+    setStatus('Connected to RAP. Capture becomes available automatically when control is free.')
+    must<HTMLDialogElement>('connectionDialog').close()
+  } catch (error) { message.textContent = errorToMessage(error); setStatus(errorToMessage(error)) }
+  finally { button.disabled = false }
+}
+must<HTMLButtonElement>('pairRelayBtn').addEventListener('click', () => {
+  try {
     const baseUrl = relayBaseUrl(must<HTMLInputElement>('relayUrl').value)
     const relayId = must<HTMLInputElement>('relayId').value.trim()
-    if (!relayId) throw new Error('Relay ID is required.')
-    const value = await relayRequest(baseUrl, relayId, '/pairing/request', {
-      invitation: must<HTMLInputElement>('relayInvitation').value.trim(),
-    })
-    if (!isRecord(value) || typeof value.pairingId !== 'string' ||
-        typeof value.pendingToken !== 'string' || typeof value.phrase !== 'string') throw new Error('Invalid pairing response.')
-    message.textContent = `Compare "${value.phrase}" with RAP, then approve on the desktop. Waiting up to 5 minutes.`
-    const deadline = performance.now() + 300000
-    while (epoch === pairingEpoch && performance.now() < deadline) {
-      await new Promise(resolve => window.setTimeout(resolve, 1000))
-      if (epoch !== pairingEpoch) return
-      const result = await relayRequest(baseUrl, relayId, '/pairing/status', {
-        pairingId: value.pairingId, pendingToken: value.pendingToken,
-      })
-      if (!isRecord(result) || typeof result.status !== 'string') throw new Error('Invalid pairing status.')
-      if (result.status === 'rejected') throw new Error('RAP rejected the pairing invitation.')
-      if (result.status === 'approved') {
-        if (typeof result.credential !== 'string') throw new Error('Pairing credential missing.')
-        if (epoch !== pairingEpoch) return
-        const identity = { baseUrl, relayId, credential: result.credential }
-        saveIdentity(identity)
-        attachRelay(identity)
-        must<HTMLInputElement>('relayInvitation').value = ''
-        message.textContent = 'Paired. Click Use this browser to enable capture.'
-        return
-      }
-      if (result.status !== 'pending') throw new Error('Pairing expired or is invalid.')
-    }
-    if (epoch === pairingEpoch) throw new Error('Pairing expired. Generate a new invitation in RAP.')
-  } catch (error) { message.textContent = errorToMessage(error) }
-  finally { button.disabled = false }
+    const token = must<HTMLInputElement>('relayInvitation').value.trim()
+    if (!relayId || !token) throw new Error('Enter a relay ID and invitation, or open the link from RAP.')
+    void connectBrowserLink({ baseUrl, relayId, token, kind: 'phone' })
+  } catch (error) { setStatus(errorToMessage(error)) }
 })
-must<HTMLButtonElement>('takeControlBtn').addEventListener('click', async () => {
+async function takeCaptureControl(): Promise<void> {
   try {
     if (!relay) throw new Error('Pair with RAP first.')
-    await relay.claimControl()
+    if (uploadInFlight || liveDispatching || liveRecoveryInFlight) throw new Error('Wait for the import result before requesting control.')
+    const takeover = relay.controlOccupied
+    if (takeover && !window.confirm('Take capture control from the other browser? Its capture stops; pending or unresolved imports must be reconciled first.')) return
+    await relay.claimControl(takeover)
     must<HTMLParagraphElement>('relayMessage').textContent = 'This browser has capture control.'
-  } catch (error) { must<HTMLParagraphElement>('relayMessage').textContent = errorToMessage(error) }
-})
+    setStatus('Capture control acquired.')
+  } catch (error) { must<HTMLParagraphElement>('relayMessage').textContent = errorToMessage(error); setStatus(errorToMessage(error)) }
+}
+must<HTMLButtonElement>('takeControlBtn').addEventListener('click', () => { void takeCaptureControl() })
+must<HTMLButtonElement>('quickControlBtn').addEventListener('click', () => { void takeCaptureControl() })
 must<HTMLButtonElement>('unlinkRelayBtn').addEventListener('click', async () => {
   if (liveOwnsWork() || uploadInFlight) { setStatus('Finish or reconcile live updates before unlinking.'); return }
   if (!window.confirm('Remove this browser’s local pairing? Revoke its grant in RAP to remove server access.')) return
@@ -604,14 +620,36 @@ must<HTMLButtonElement>('checkImportBtn').addEventListener('click', async () => 
     if (['confirmed', 'failed', 'expired'].includes(job.status)) clearPendingImport()
   } catch (error) { setExportStatus(errorToMessage(error)) }
 })
-must<HTMLButtonElement>('resolveImportBtn').addEventListener('click', () => {
-  if (uploadInFlight || !pendingImport) return
+must<HTMLButtonElement>('resolveImportBtn').addEventListener('click', async () => {
+  if (uploadInFlight || liveRecoveryInFlight || !pendingImport) return
   if (liveQueue().items.length) { must<HTMLButtonElement>('liveReconcileBtn').click(); return }
   if (window.confirm(`Check RAP and LightBurn for job ${pendingImport.id} first. Confirm you have reconciled its outcome and understand another Send may duplicate artwork.`)) {
-    try { clearPendingImport() }
+    liveRecoveryInFlight = true
+    renderControls()
+    try {
+      await acknowledgeRelayImport(pendingImport.id, pendingImport.relayId)
+      clearPendingImport()
+    }
     catch (error) { setExportStatus(errorToMessage(error)) }
+    finally { liveRecoveryInFlight = false; renderControls() }
   }
 })
+
+async function acknowledgeRelayImport(id: string, relayId: string, baseUrl?: string): Promise<void> {
+  const client = relay
+  if (!client || client.identity.relayId !== relayId || (baseUrl && client.identity.baseUrl !== baseUrl)) {
+    throw new Error('Reconnect to the original RAP before acknowledging this import.')
+  }
+  let job: ReturnType<typeof parseJob>
+  try { job = parseJob(await client.request(`/jobs/${encodeURIComponent(id)}`)) }
+  catch (error) {
+    if (error instanceof RelayRequestError && error.status === 404) return
+    throw error
+  }
+  if (job.id !== id) throw new Error('Import result ID does not match the saved journal.')
+  if (['queued', 'claimed', 'attempting', 'accepted'].includes(job.status)) throw new Error('Import is still in progress. Wait for its result before acknowledging it.')
+  if (job.status === 'unknown') await client.request(`/jobs/${encodeURIComponent(id)}/resolve`, {})
+}
 
 function clearPendingImport(): void {
   localStorage.removeItem(PENDING_IMPORT_KEY)
@@ -657,18 +695,19 @@ window.setInterval(() => {
 renderAll()
 updateConnectionMode()
 function consumePairingLink(): boolean {
-  const invitation = pairingInvitation(location.hash)
-  if (invitation) {
-    if (liveOwnsWork() || uploadInFlight) throw new Error('Finish or reconcile live updates before opening another pairing invitation.')
+  const link = browserLink(location.hash)
+  if (link) {
     history.replaceState(null, '', location.pathname + location.search)
+    if (mode !== 'relay' && (liveOwnsWork() || uploadInFlight || pendingImport)) throw new Error('Reconcile existing work before changing connection mode.')
     mode = 'relay'
     modeInput.value = mode
-    must<HTMLInputElement>('relayUrl').value = invitation.baseUrl
-    must<HTMLInputElement>('relayId').value = invitation.relayId
-    must<HTMLInputElement>('relayInvitation').value = invitation.invitation
+    must<HTMLInputElement>('relayUrl').value = link.baseUrl
+    must<HTMLInputElement>('relayId').value = link.relayId
+    must<HTMLInputElement>('relayInvitation').value = link.kind === 'phone' ? link.token : ''
     updateConnectionMode()
     const dialog = must<HTMLDialogElement>('connectionDialog')
     if (!dialog.open) dialog.showModal()
+    void connectBrowserLink(link)
     return true
   }
   return false
@@ -1403,6 +1442,8 @@ function renderControls(): void {
   must<HTMLSpanElement>('collectionSummary').textContent =
     `${state.type} · ${allPoints(state).length} points · ${state.groups.length} finished groups`
   const relayReady = mode !== 'relay' || relay?.canCapture() === true
+  must<HTMLButtonElement>('quickControlBtn').hidden = mode !== 'relay' || !relay || relay.activeBrowser
+  must<HTMLButtonElement>('quickControlBtn').disabled = busy || uploadInFlight || !relay?.hasFreshPosition()
   const contextMatches = mode !== 'relay' || !allPoints(state).length || state.coordinateContext === contextKey()
   must<HTMLButtonElement>('captureBtn').disabled = busy || state.finished || !relayReady || !contextMatches || liveCaptureBlocked()
   must<HTMLButtonElement>('finishBtn').textContent = state.finished ? 'Resume' : 'Finish'

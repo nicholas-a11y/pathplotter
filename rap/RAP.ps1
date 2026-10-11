@@ -32,6 +32,9 @@ $script:CommandBuffer = ''
 $script:StopRequested = $false
 $script:ActiveImport = $null
 $script:LightBurnRoot = 'http://127.0.0.1:19520'
+$script:UiBridge = $null
+
+function Publish-RapHealth([string]$Message, [bool]$Connected) { }
 
 function Get-Field($Object, [string]$Name) {
     if ($null -eq $Object) { return $null }
@@ -483,6 +486,7 @@ function Stop-Import {
 }
 
 function Assert-ImportOwnership {
+    if ($null -ne $script:UiBridge -and $script:UiBridge.StopRequested) { $script:StopRequested = $true }
     if ($script:StopRequested -or $null -eq $script:Generation -or
         $script:ActiveImport.generation -ne $script:Generation) {
         throw 'RAP stopped or lost cloud generation.'
@@ -751,6 +755,9 @@ function Start-Rap {
                 if ($null -ne $job) { Invoke-Import $job $observation }
                 $health = $observation.error + ' Cloud connected.'
                 if ($observation.connected) { $health = 'LightBurn workpiece/context verified; cloud connected.' }
+                $verifiedFresh = $body.connected -and
+                    ($observation.observationAgeMs + $script:Clock.ElapsedMilliseconds - $observation.tick -le 2000)
+                Publish-RapHealth $health ([bool]$verifiedFresh)
                 if ($health -ne $lastHealth) { Write-Host $health; $lastHealth = $health }
                 $backoff = 500
                 $nextRead = [Math]::Max($cycleStart + 500, $script:Clock.ElapsedMilliseconds)
@@ -762,6 +769,7 @@ function Start-Rap {
                 $script:PendingPairings = @{}
                 Stop-Import
                 $health = 'Cloud disconnected, unauthorized, fenced, or invalid response. Fresh samples withheld; reconnecting.'
+                Publish-RapHealth $health $false
                 if ($lastHealth -ne $health) { Write-Host $health; $lastHealth = $health }
                 $nextRead = $script:Clock.ElapsedMilliseconds + $backoff
                 $backoff = [Math]::Min(30000, $backoff * 2)

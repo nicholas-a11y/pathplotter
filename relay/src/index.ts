@@ -17,6 +17,11 @@ const JOB_LIFETIME_MS = 60_000;
 const JOB_RETENTION_MS = 24 * 60 * 60_000;
 const JOB_LIMIT = 1_000;
 const PENDING_JOB_LIMIT = 10;
+const LAUNCH_TOKEN_LIFETIME_MS = 2 * 60_000;
+const LAUNCH_OUTSTANDING_LIMIT = 5;
+const LAUNCH_RATE_WINDOW_MS = 10 * 60_000;
+const LAUNCH_RATE_LIMIT = 20;
+const LAUNCH_BROWSER_LIMIT = 20;
 
 type JsonObject = Record<string, unknown>;
 type Snapshot = {
@@ -29,7 +34,7 @@ type Snapshot = {
   receivedAt: number;
 };
 type JobStatus = "queued" | "claimed" | "attempting" | "accepted" | "confirmed" | "failed" | "unknown" | "expired";
-type JobResult = { id: string; status: JobStatus; error?: string };
+type JobResult = { id: string; status: JobStatus; error?: string; resolved?: true };
 type StoredJob = {
   id: string;
   svg: string | null;
@@ -248,8 +253,15 @@ function currentSnapshot(sql: SqlStorage): Snapshot | null {
   }
 }
 
-function jobResult(job: Pick<StoredJob, "id" | "status" | "error">): JobResult {
-  return job.error ? { id: job.id, status: job.status, error: job.error } : { id: job.id, status: job.status };
+function jobResult(job: Pick<StoredJob, "id" | "status" | "error">, resolved = false): JobResult {
+  const result: JobResult = job.error ? { id: job.id, status: job.status, error: job.error } : { id: job.id, status: job.status };
+  if (resolved && job.status === "unknown") result.resolved = true;
+  return result;
+}
+
+function requireToken(value: unknown): string {
+  if (typeof value !== "string" || fromBase64Url(value)?.byteLength !== 32) throw new HttpError(400, "invalid_request");
+  return value;
 }
 
 function requireUuid(value: unknown): string {
@@ -484,6 +496,21 @@ export class RelayDO extends DurableObject<Env> {
         );
         CREATE INDEX IF NOT EXISTS jobs_status_expiry ON jobs(status, expires_at);
         CREATE INDEX IF NOT EXISTS jobs_browser_created ON jobs(browser_id, created_at DESC);
+        CREATE TABLE IF NOT EXISTS job_resolutions (
+          job_id TEXT PRIMARY KEY,
+          resolved_at INTEGER NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS browser_launches (
+          token_hash TEXT PRIMARY KEY,
+          expires_at INTEGER NOT NULL,
+          created_at INTEGER NOT NULL,
+          used INTEGER NOT NULL DEFAULT 0
+        );
+        CREATE INDEX IF NOT EXISTS browser_launches_created ON browser_launches(created_at);
+        CREATE TABLE IF NOT EXISTS launch_browsers (
+          browser_id TEXT PRIMARY KEY,
+          created_at INTEGER NOT NULL
+        );
       `);
     });
   }
@@ -516,6 +543,7 @@ export class RelayDO extends DurableObject<Env> {
 
       if (request.method === "POST" && route === "/pairing/request") return await this.pairingRequest(request);
       if (request.method === "POST" && route === "/pairing/status") return await this.pairingStatus(request);
+      if (request.method === "POST" && route === "/browser/launch") return await this.browserLaunch(request);
       if (request.method === "GET" && route === "/stream") return await this.stream(request);
 
       const agentStatus = route.match(/^\/(?:agent\/)?jobs\/([0-9a-f-]{36})\/status$/iu);
@@ -524,6 +552,7 @@ export class RelayDO extends DurableObject<Env> {
         const identity = await this.authenticateAgent(request);
         if (request.method === "POST" && route === "/agent/start") return this.agentStart(identity);
         if (request.method === "POST" && route === "/agent/update") return await this.agentUpdate(request, identity);
+        if (request.method === "POST" && route === "/agent/browser-launch") return await this.browserLaunchNew(request);
         if (request.method === "POST" && (route === "/pairing/new" || route === "/agent/pairing/new")) return await this.pairingNew(request);
         if (request.method === "POST" && (route === "/pairing/decide" || route === "/agent/pairing/decide")) return await this.pairingDecide(request);
         if (request.method === "GET" && route === "/browsers") return this.listBrowsers();
@@ -547,6 +576,11 @@ export class RelayDO extends DurableObject<Env> {
       if (route === "/jobs" && request.method === "POST") {
         const browser = await this.authenticateBrowser(request);
         return await this.createJob(request, browser);
+      }
+      const resolveJob = route.match(/^\/jobs\/([0-9a-f-]{36})\/resolve$/iu);
+      if (request.method === "POST" && resolveJob) {
+        const browser = await this.authenticateBrowser(request);
+        return await this.resolveJob(request, resolveJob[1].toLowerCase(), browser);
       }
       const browserJob = route.match(/^\/jobs\/([0-9a-f-]{36})$/iu);
       if (request.method === "GET" && browserJob) {
@@ -915,6 +949,91 @@ export class RelayDO extends DurableObject<Env> {
     return jsonResponse({});
   }
 
+  private async browserLaunchNew(request: Request): Promise<Response> {
+    this.requireMethod(request, "POST");
+    const body = requiredObject(await readJson(request));
+    jsonBody(body, []);
+    const launchToken = randomToken();
+    const tokenHash = await hashToken(launchToken);
+    const now = Date.now();
+    const expiresAt = now + LAUNCH_TOKEN_LIFETIME_MS;
+    this.ctx.storage.transactionSync(() => {
+      this.reapLaunches(now);
+      const outstanding = this.ctx.storage.sql.exec<{ count: number }>(
+        "SELECT COUNT(*) AS count FROM browser_launches WHERE used = 0 AND expires_at > ?",
+        now,
+      ).one().count;
+      if (outstanding >= LAUNCH_OUTSTANDING_LIMIT) throw new HttpError(429, "too_many_launch_tokens");
+      const recent = this.ctx.storage.sql.exec<{ count: number }>(
+        "SELECT COUNT(*) AS count FROM browser_launches WHERE created_at > ?",
+        now - LAUNCH_RATE_WINDOW_MS,
+      ).one().count;
+      if (recent >= LAUNCH_RATE_LIMIT) throw new HttpError(429, "launch_rate_limited");
+      this.ctx.storage.sql.exec(
+        "INSERT INTO browser_launches (token_hash, expires_at, created_at, used) VALUES (?, ?, ?, 0)",
+        tokenHash,
+        expiresAt,
+        now,
+      );
+    });
+    return jsonResponse({ launchToken, expiresAt });
+  }
+
+  private async browserLaunch(request: Request): Promise<Response> {
+    this.requireMethod(request, "POST");
+    requireAllowedOrigin(request);
+    const body = requiredObject(await readJson(request));
+    jsonBody(body, ["launchToken", "credential"]);
+    const launchToken = requireToken(body.launchToken);
+    const supplied = body.credential === undefined ? null : requireToken(body.credential);
+    const tokenHash = await hashToken(launchToken);
+    const suppliedHash = supplied === null ? null : await hashToken(supplied);
+    const minted = randomToken();
+    const mintedHash = await hashToken(minted);
+    const mintedId = crypto.randomUUID();
+    const now = Date.now();
+    const reused = this.ctx.storage.transactionSync((): boolean => {
+      const launch = this.ctx.storage.sql.exec<{ expires_at: number; used: number }>(
+        "SELECT expires_at, used FROM browser_launches WHERE token_hash = ?",
+        tokenHash,
+      ).toArray()[0];
+      if (!launch) throw new HttpError(404, "launch_token_not_found");
+      if (launch.used) throw new HttpError(409, "launch_token_used");
+      if (launch.expires_at <= now) throw new HttpError(410, "launch_token_expired");
+      this.ctx.storage.sql.exec("UPDATE browser_launches SET used = 1 WHERE token_hash = ? AND used = 0", tokenHash);
+      if (suppliedHash !== null) {
+        const rows = this.ctx.storage.sql.exec<{ credential_hash: string }>(
+          "SELECT credential_hash FROM browsers WHERE revoked = 0",
+        ).toArray();
+        let valid = false;
+        for (const row of rows) valid = constantTimeEqual(suppliedHash, row.credential_hash) || valid;
+        if (valid) return true;
+      }
+      const launchBrowsers = this.ctx.storage.sql.exec<{ count: number }>(
+        `SELECT COUNT(*) AS count FROM launch_browsers
+         JOIN browsers ON browsers.id = launch_browsers.browser_id WHERE browsers.revoked = 0`,
+      ).one().count;
+      if (launchBrowsers >= LAUNCH_BROWSER_LIMIT) throw new HttpError(429, "too_many_launch_browsers");
+      this.ctx.storage.sql.exec(
+        "INSERT INTO browsers (id, credential_hash, created_at, revoked) VALUES (?, ?, ?, 0)",
+        mintedId,
+        mintedHash,
+        now,
+      );
+      this.ctx.storage.sql.exec("INSERT INTO launch_browsers (browser_id, created_at) VALUES (?, ?)", mintedId, now);
+      return false;
+    });
+    return jsonResponse({ credential: reused ? supplied : minted });
+  }
+
+  private reapLaunches(now: number): void {
+    this.ctx.storage.sql.exec(
+      "DELETE FROM browser_launches WHERE expires_at <= ? AND created_at <= ?",
+      now,
+      now - LAUNCH_RATE_WINDOW_MS,
+    );
+  }
+
   private listBrowsers(): Response {
     const browsers = this.ctx.storage.sql.exec<{ id: string }>(
       "SELECT id FROM browsers WHERE revoked = 0 ORDER BY created_at",
@@ -935,6 +1054,7 @@ export class RelayDO extends DurableObject<Env> {
       if (!row) return false;
       this.ctx.storage.sql.exec("UPDATE browsers SET revoked = 1 WHERE id = ?", browserId);
       this.ctx.storage.sql.exec("DELETE FROM tickets WHERE browser_id = ?", browserId);
+      this.ctx.storage.sql.exec("DELETE FROM launch_browsers WHERE browser_id = ?", browserId);
       this.ctx.storage.sql.exec(
         "UPDATE relay_meta SET lease_browser_id = NULL, lease_expires_at = NULL WHERE lease_browser_id = ?",
         browserId,
@@ -946,6 +1066,7 @@ export class RelayDO extends DurableObject<Env> {
       const attachment: unknown = socket.deserializeAttachment();
       if (isObject(attachment) && attachment.browserId === browserId) socket.close(1008, "revoked");
     }
+    this.broadcast();
     return jsonResponse({});
   }
 
@@ -958,6 +1079,7 @@ export class RelayDO extends DurableObject<Env> {
     serverTime: number;
     snapshot: Snapshot | null;
     activeBrowser: boolean;
+    controlOccupied: boolean;
     job: JobResult | null;
   } {
     return this.ctx.storage.transactionSync(() => {
@@ -981,33 +1103,88 @@ export class RelayDO extends DurableObject<Env> {
         "SELECT * FROM jobs WHERE browser_id = ? ORDER BY created_at DESC LIMIT 1",
         browserId,
       ).toArray()[0];
+      const controlOccupied = !ownsLiveLease && meta.lease_browser_id !== null && meta.lease_browser_id !== browserId &&
+        (meta.lease_expires_at ?? 0) > serverTime;
       return {
         serverTime,
         snapshot: currentSnapshot(this.ctx.storage.sql),
         activeBrowser: ownsLiveLease,
-        job: latest ? jobResult(latest) : null,
+        controlOccupied,
+        job: latest ? jobResult(latest, this.isResolved(latest.id)) : null,
       };
     });
+  }
+
+  private isResolved(jobId: string): boolean {
+    return this.ctx.storage.sql.exec<{ job_id: string }>(
+      "SELECT job_id FROM job_resolutions WHERE job_id = ?",
+      jobId,
+    ).toArray().length > 0;
+  }
+
+  // Jobs of other browsers that must finish or be acknowledged before control can move.
+  private hasBlockingJobs(browserId: string): boolean {
+    return this.ctx.storage.sql.exec<{ id: string }>(
+      `SELECT jobs.id FROM jobs
+       LEFT JOIN job_resolutions ON job_resolutions.job_id = jobs.id
+       LEFT JOIN browsers ON browsers.id = jobs.browser_id
+       WHERE jobs.browser_id != ? AND (
+         jobs.status IN ('queued', 'claimed', 'attempting', 'accepted') OR
+         (jobs.status = 'unknown' AND job_resolutions.job_id IS NULL AND COALESCE(browsers.revoked, 1) = 0)
+       ) LIMIT 1`,
+      browserId,
+    ).toArray().length > 0;
   }
 
   private async browserControl(request: Request, browser: BrowserIdentity): Promise<Response> {
     this.requireMethod(request, "POST");
     const body = requiredObject(await readJson(request));
-    jsonBody(body, []);
+    jsonBody(body, ["takeover"]);
+    if (body.takeover !== undefined && typeof body.takeover !== "boolean") throw new HttpError(400, "invalid_request");
+    const takeover = body.takeover === true;
     const now = Date.now();
-    this.ctx.storage.transactionSync(() => {
+    const changed = this.ctx.storage.transactionSync((): boolean => {
+      this.reapJobs(now);
       const meta = this.meta();
       if (!meta) throw new HttpError(404, "not_found");
-      if (meta.lease_browser_id && meta.lease_browser_id !== browser.id && (meta.lease_expires_at ?? 0) > now) {
-        throw new HttpError(409, "browser_lease_occupied");
-      }
+      const ownsLiveLease = meta.lease_browser_id === browser.id && (meta.lease_expires_at ?? 0) > now;
+      const occupied = !ownsLiveLease && meta.lease_browser_id !== null && (meta.lease_expires_at ?? 0) > now;
+      if (occupied && !takeover) throw new HttpError(409, "browser_lease_occupied");
+      if (!ownsLiveLease && this.hasBlockingJobs(browser.id)) throw new HttpError(409, "unresolved_imports");
       this.ctx.storage.sql.exec(
         "UPDATE relay_meta SET lease_browser_id = ?, lease_expires_at = ? WHERE singleton = 1",
         browser.id,
         now + BROWSER_LEASE_MS,
       );
+      return !ownsLiveLease;
     });
+    if (changed) this.broadcast();
     return jsonResponse({ activeBrowser: true });
+  }
+
+  private async resolveJob(request: Request, id: string, browser: BrowserIdentity): Promise<Response> {
+    this.requireMethod(request, "POST");
+    const body = requiredObject(await readJson(request));
+    jsonBody(body, []);
+    const now = Date.now();
+    const result = this.ctx.storage.transactionSync((): JobResult => {
+      this.reapJobs(now);
+      const job = this.ctx.storage.sql.exec<StoredJob>(
+        "SELECT * FROM jobs WHERE id = ? AND browser_id = ?",
+        id,
+        browser.id,
+      ).toArray()[0];
+      if (!job) throw new HttpError(404, "not_found");
+      if (job.status !== "unknown") throw new HttpError(409, "job_not_unknown");
+      this.ctx.storage.sql.exec(
+        "INSERT INTO job_resolutions (job_id, resolved_at) VALUES (?, ?) ON CONFLICT(job_id) DO NOTHING",
+        id,
+        now,
+      );
+      return jobResult(job, true);
+    });
+    this.broadcast();
+    return jsonResponse(result);
   }
 
   private releaseControl(browser: BrowserIdentity): Response {
@@ -1045,7 +1222,7 @@ export class RelayDO extends DurableObject<Env> {
       if (existing) {
         if (existing.browser_id !== browser.id) throw new HttpError(404, "not_found");
         if (!constantTimeEqual(existing.checksum, checksum)) throw new HttpError(409, "job_id_conflict");
-        return jobResult(existing);
+        return jobResult(existing, this.isResolved(existing.id));
       }
       const meta = this.meta();
       if (!meta || meta.lease_browser_id !== browser.id || (meta.lease_expires_at ?? 0) <= now) {
@@ -1101,7 +1278,7 @@ export class RelayDO extends DurableObject<Env> {
       ).toArray()[0] ?? null;
     });
     if (!job) throw new HttpError(404, "not_found");
-    return jsonResponse(jobResult(job));
+    return jsonResponse(jobResult(job, this.isResolved(job.id)));
   }
 
   private async agentJobStatus(request: Request, id: string, identity: AgentIdentity): Promise<Response> {
@@ -1163,6 +1340,7 @@ export class RelayDO extends DurableObject<Env> {
       now,
     );
     this.ctx.storage.sql.exec("DELETE FROM jobs WHERE created_at <= ?", now - JOB_RETENTION_MS);
+    this.ctx.storage.sql.exec("DELETE FROM job_resolutions WHERE job_id NOT IN (SELECT id FROM jobs)");
     this.ctx.storage.sql.exec("DELETE FROM tickets WHERE expires_at <= ?", now);
   }
 

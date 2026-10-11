@@ -32,8 +32,12 @@ try {
             Assert ($parseErrors.Count -eq 0) ('Parse error in ' + $file.Name)
         }
         $launcher = [IO.File]::ReadAllText((Join-Path $PSScriptRoot 'Start RAP.cmd'))
-        Assert ($launcher -match 'WindowsPowerShell\\v1.0\\powershell.exe')
+        $guiLauncher = [IO.File]::ReadAllText((Join-Path $PSScriptRoot 'Start RAP.vbs'))
+        Assert ($launcher -match 'wscript.exe')
+        Assert ($guiLauncher -match 'WindowsPowerShell\\v1.0\\powershell.exe')
+        Assert ($guiLauncher -match '-STA')
         Assert ($launcher -notmatch '(?i)ExecutionPolicy|Bypass|Unrestricted')
+        Assert ($guiLauncher -notmatch '(?i)ExecutionPolicy|Bypass|Unrestricted')
     }
     . (Join-Path $PSScriptRoot 'RAP.ps1') -LibraryOnly -DataDirectory $statePath
     $script:OriginalHttp = ${function:Invoke-Http}

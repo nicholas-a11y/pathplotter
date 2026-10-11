@@ -1,4 +1,4 @@
-# PathPlotter RAP (Windows prototype)
+# PathPlotter RAP (portable Windows tray app)
 
 RAP relays **workpiece** observations from local LightBurn to an authenticated
 HTTPS relay, and imports SVGs explicitly sent by a paired browser into the
@@ -10,25 +10,57 @@ and the Windows .NET Framework are used.
 ## Start and consent
 
 1. Extract the complete `rap` folder somewhere writable. Double-click
-   **Start RAP.cmd**. Keep the console open.
-2. Enter the operator-supplied HTTPS relay origin, a computer name, and a
-   single-use bootstrap registration token (hidden input).
+   **Start RAP.cmd** (or **Start RAP.vbs** to avoid even a brief command-window
+   flash). RAP starts a small Windows Forms status window and tray icon, with no
+   everyday console. A second launch activates the existing status window.
+2. On first use, enter the operator-supplied HTTPS relay origin, a computer name,
+   and a single-use registration invitation in the graphical setup. Invitation
+   input is masked and cleared after submission.
 3. Open LightBurn, enable its REST API in Settings > Extensions, and keep
-   **Allow API Access From Network disabled**. Type `PAIR` in RAP to consent
-   to requesting the `state`, `project`, and `upload` capabilities. Bring
+   **Allow API Access From Network disabled**. Click **Request local LightBurn
+   permission** to consent to `state`, `project`, and `upload`. Bring
    LightBurn to the foreground and approve its dialog within 30 seconds.
-4. Type `pair`. Open the displayed private URL on your phone, or type `open`
-   to open it on this computer. Compare the browser's verification phrase
-   with RAP's phrase. Type `approve ID` only for a matching request; otherwise
-   `reject ID`. Browser pairing is never automatically approved.
-5. Browser **Send** is authorization to import that SVG. Inspect the project
+4. Once a fresh verified LightBurn workpiece/context has been published
+   successfully, RAP automatically opens hosted PathPlotter **once per launch**.
+   Saved current-user DPAPI credentials are reused on subsequent launches.
+   **Open PathPlotter** creates a fresh, short-lived desktop authorization each
+   time you explicitly click it. It does not consume a phone invitation.
+   The updated relay and browser handle single-use authorization, reuse valid
+   browser identity and claim capture control if free; occupied control requires
+   the browser's explicit Take control confirmation.
+5. To pair another browser/phone, select **Pair phone**. Scan the locally
+   generated expiring QR or copy its private link. Compare the exact browser
+   phrase with its approval card in RAP, then click **Approve matching phrase**
+   or **Reject**. Ordinary phone requests are never automatically approved.
+6. Browser **Send** is authorization to import that SVG. Inspect the project
    and placement before independently deciding to operate the laser.
 
-Do not record the console, enable PowerShell transcripts, or share pairing URL
+Do not record diagnostic sessions, enable PowerShell transcripts, or share pairing URL
 screenshots: the URL intentionally displays a short-lived invitation. Durable
 credentials, raw response errors, SVGs and coordinates are not printed.
-QR generation is deliberately omitted in this prototype; no external QR
-service receives invitation material.
+QR generation uses the bundled MIT-licensed Net.Codecrete QR encoder v1.6.1
+(a Project Nayuki port; source/license in `Vendor\QrCodeGenerator`). No external
+QR service receives invitation material. The phone QR/link is cleared on expiry
+or close; RAP clears its copied link only if the clipboard still contains that
+exact link. Desktop launch URLs are never displayed, copied or QR encoded.
+
+Closing the status window keeps RAP running in the tray. Tray actions are
+**Open PathPlotter**, **Pair phone**, **Connected browsers**, **Status**, explicit
+local permission resets, and **Quit**. Connected browsers provides revocation
+buttons. Local resets preserve the journal and are not remote revocation:
+also use LightBurn **Manage API Security** and ask the relay operator to revoke
+old agent credentials. Invalid/unreadable saved registration requires explicit
+graphical replacement consent; an unreadable journal remains a blocking error.
+For cloud authorization failures, use the explicit local-registration reset
+after consulting the operator; no automatic enrollment or import retry occurs.
+
+The STA UI only handles controls and messages. One controlled MTA PowerShell
+runspace owns all protocol operations and serialized imports; synchronous
+network calls never run on the form/tray thread. First-time LightBurn's own
+consent dialog and bounded HTTP requests can delay worker actions, not the UI.
+Quit waits for worker cleanup, fences incomplete imports, disposes retained
+streams, publishes disconnected when possible, and removes the tray icon.
+It does not force-kill an upload or erase uncertain outcomes.
 
 The launcher does **not** use an execution-policy bypass. If Windows policy
 blocks the script, use an organization-approved signed distribution and consult
@@ -37,6 +69,11 @@ and follow your organization's file-unblocking procedure. RAP does not set
 execution policy, unblock files, install certificates, or modify global policy.
 
 ## Console commands and revocation
+
+Use **Start RAP diagnostics.cmd** for the original typed console workflow.
+Quit the tray instance before starting diagnostics (both retain the same durable
+instance lock and protected state). Diagnostics intentionally keeps manual
+`pair`/`open`/approval commands; it is not the everyday auto-launch workflow.
 
 Commands run between serialized observations. Import setup still performs
 bounded synchronous HTTP requests and SSE readiness checks; commands can be
@@ -64,7 +101,10 @@ automatically repeated; inspect the browser list/status before trying again.
 Current-user DPAPI encrypts credentials and the durable import journal in
 `%LOCALAPPDATA%\PathPlotter\RAP`. The directory grants access only to the current
 Windows user and disables inherited ACLs. A file lock excludes duplicate RAP
-instances. These protections do not defend against software running as your
+protocol workers. The desktop additionally uses a current-user mutex and
+ACL-restricted named pipe with a single fixed **show status** action, excluding
+network logons. No arbitrary command, URL or credential is accepted via IPC.
+These protections do not defend against software running as your
 Windows user or an administrator.
 
 RAP targets a **500 ms cycle**, without overlapping status/project/position
@@ -142,8 +182,14 @@ LightBurn applying the upload; undocumented origin changes cannot be promised
 detectable. These are protocol limitations, not an exactly-once guarantee.
 
 Cloud timestamps accept epoch milliseconds or ISO-8601 UTC strings; numeric
-generation and increasing sequence implement the v1 contract. No extra relay
-endpoints are required. The local SVG allowlist is intentionally narrow and
+generation and increasing sequence implement the v1 contract. The tray's
+desktop launch requires the updated authenticated
+`POST /v1/relays/{relayId}/agent/browser-launch` endpoint: `{}` returns
+`{launchToken, expiresAt}`. RAP opens `#relay=...&relayId=...&launch=TOKEN`
+only in the default browser. The grant expires after two minutes and is
+single-use; it is a bearer grant, not proof of physical locality.
+Ordinary phones continue using `/pairing/new` and explicit `/pairing/decide`.
+The local SVG allowlist is intentionally narrow and
 matches the current app exporter; unsupported future SVG variants are rejected,
 not silently imported.
 
@@ -153,6 +199,7 @@ From the project root, run:
 
 ```powershell
 & "$env:SystemRoot\System32\WindowsPowerShell\v1.0\powershell.exe" -NoLogo -NoProfile -File ".\rap\Test-RAP.ps1"
+& "$env:SystemRoot\System32\WindowsPowerShell\v1.0\powershell.exe" -NoLogo -NoProfile -STA -File ".\rap\Test-GUI.ps1"
 ```
 
 The standalone script returns a nonzero exit code on failure and requires
@@ -168,12 +215,24 @@ pairing, uploads to hardware, or changes the user's real RAP state. Its isolated
 test state and compilation scratch files stay within `rap` and are removed.
 No test framework or runtime installation is needed.
 
+`Test-GUI.ps1` compiles the bundled local QR encoder, rejects desktop-grant QR
+generation, verifies fixed-action duplicate activation, and runs a real STA
+form/tray with a mocked protocol runspace. It exercises graphical enrollment,
+denied and then explicitly retried local consent, healthy auto-open once,
+phone QR/link expiry, exact-phrase targeting (mismatches cannot approve),
+explicit rejection, responsive worker/UI scheduling, and graceful disconnected
+shutdown with lock/IPC release. All test state stays under `rap` and is removed;
+no real browser opens, networking, user credentials or hardware are used.
+Real-phone scanning, default-browser launch, actual LightBurn consent/hardware
+and policy-restricted distribution still require an operator-led smoke test.
+
 ### Live update rollout
 
-This RAP change enables coordinate publication during pending imports only.
-It does not enable browser Live update, alter relay admission limits, or accept
-additional SVG vocabulary. Deploy it alongside the separately tested browser
-queue and relay changes, with Live update default off. Before enabling live
+The tray keeps the existing coordinate-publication and import protocol; it does
+not itself enable browser Live update, alter relay admission limits, or accept
+additional SVG vocabulary. Deploy it alongside the updated desktop-launch,
+browser pairing/control, browser queue and relay changes, with Live update
+default off. Before enabling live
 drawing on hardware, verify fresh coordinates during delayed confirmation,
 ordered imports, timeout/stop/restart recovery, and unchanged existing LightBurn
 objects. Inspect uncertain outcomes manually; never replay an attempted job.

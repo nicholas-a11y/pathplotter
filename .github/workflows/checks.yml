@@ -45,7 +45,10 @@ jobs:
       - name: Validate built-in Windows PowerShell RAP
         shell: powershell
         run: .\rap\Test-RAP.ps1
-      - name: Package script prototype
+      - name: Validate portable RAP tray workflow
+        shell: powershell
+        run: '& "$env:SystemRoot\System32\WindowsPowerShell\v1.0\powershell.exe" -NoProfile -STA -File ".\rap\Test-GUI.ps1"'
+      - name: Package portable tray app
         shell: powershell
         run: Compress-Archive -Path .\rap\* -DestinationPath .\PathPlotter-RAP-Windows.zip
       - uses: actions/upload-artifact@v4
