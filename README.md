@@ -21,7 +21,7 @@ Budget for usage before leaving RAP running continuously. A 500 ms publication i
 5. Position the head using the usual machine controls. **Capture point** copies the latest reported workpiece sample, rather than taking a fresh reading at tap time.
 6. **Send to LightBurn** creates a bounded, expiring SVG job. The result distinguishes acceptance from confirmed import.
 
-The cloud connection dialog also allows entering the relay URL, ID and invitation manually. Connection-link secrets are removed immediately from the address bar. A same-RAP link preserves outstanding live work; switching RAPs is blocked until pending work is reconciled and requires confirmation. The hosted build defaults to cloud mode; localhost development defaults to the existing local proxy.
+The cloud connection dialog also allows entering the relay URL, ID and invitation manually. Its single **Pair** button connects and requests capture control; for an already paired browser it requests control without requiring another invitation. Taking control from another browser still requires confirmation. Workspace confirmation, import checks/acknowledgment and unlinking are tucked into a collapsed **Advanced / recovery** section. Connection-link secrets are removed immediately from the address bar. A same-RAP link preserves outstanding live work; switching RAPs is blocked until pending work is reconciled and requires confirmation. The hosted build defaults to cloud mode; localhost development defaults to the existing local proxy.
 
 ### Freshness and workspace protection
 

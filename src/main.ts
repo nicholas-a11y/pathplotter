@@ -92,14 +92,19 @@ app.innerHTML = `
       <label>Relay ID<input id="relayId" /></label>
       <label>Pairing invitation<input id="relayInvitation" type="password" autocomplete="off" /></label>
       <div class="row">
-        <button id="pairRelayBtn" class="primary">Pair with RAP</button>
-        <button id="takeControlBtn">Take control</button>
+        <button id="pairRelayBtn" class="primary">Pair</button>
+      </div>
+      <p id="relayMessage" role="status"></p>
+      <details>
+        <summary>Advanced / recovery</summary>
+        <p class="hint">Only needed when changing workspace, recovering an interrupted import, or removing this browser's connection. These actions never move points or resend artwork.</p>
+        <div class="row">
         <button id="unlinkRelayBtn">Unlink this browser</button>
         <button id="revalidateBtn">Confirm workspace for existing points</button>
         <button id="checkImportBtn">Check last import</button>
         <button id="resolveImportBtn">Acknowledge uncertain import</button>
       </div>
-      <p id="relayMessage" role="status"></p>
+      </details>
     </section>
     <section id="localConnection">
     <div class="form-grid">
@@ -539,7 +544,7 @@ modeInput.addEventListener('change', () => {
   ++pairingEpoch
   updateConnectionMode()
 })
-async function connectBrowserLink(link: BrowserLink): Promise<void> {
+async function connectBrowserLink(link: BrowserLink, requestControl = false): Promise<void> {
   const button = must<HTMLButtonElement>('pairRelayBtn')
   const message = must<HTMLParagraphElement>('relayMessage')
   button.disabled = true
@@ -552,6 +557,7 @@ async function connectBrowserLink(link: BrowserLink): Promise<void> {
     if (matching && (liveOwnsWork() || uploadInFlight || pendingImport)) {
       if (existing && !relay) attachRelay(existing)
       message.textContent = 'Saved RAP connection retained. Reconcile pending live work before starting new captures.'
+      if (requestControl) await takeCaptureControl()
       return
     }
     const identity = await exchangeBrowserLink(link, existing, text => { message.textContent = text; setStatus(text) }, () => epoch === pairingEpoch)
@@ -561,31 +567,50 @@ async function connectBrowserLink(link: BrowserLink): Promise<void> {
     must<HTMLInputElement>('relayInvitation').value = ''
     message.textContent = 'Connected. Capture control is acquired automatically when free.'
     setStatus('Connected to RAP. Capture becomes available automatically when control is free.')
+    if (requestControl) {
+      const client = relay
+      const deadline = performance.now() + 10000
+      while (client === relay && !client?.hasFreshPosition() && performance.now() < deadline) {
+        await new Promise(resolve => window.setTimeout(resolve, 100))
+      }
+      if (epoch !== pairingEpoch || client !== relay) return
+      if (!client?.hasFreshPosition()) throw new Error('Paired, but RAP has no fresh position. Check LightBurn and RAP, then click Pair again.')
+      if (!client.activeBrowser && !await takeCaptureControl()) return
+    }
     must<HTMLDialogElement>('connectionDialog').close()
   } catch (error) { message.textContent = errorToMessage(error); setStatus(errorToMessage(error)) }
   finally { button.disabled = false }
 }
-must<HTMLButtonElement>('pairRelayBtn').addEventListener('click', () => {
+must<HTMLButtonElement>('pairRelayBtn').addEventListener('click', async () => {
+  const button = must<HTMLButtonElement>('pairRelayBtn')
   try {
     const baseUrl = relayBaseUrl(must<HTMLInputElement>('relayUrl').value)
     const relayId = must<HTMLInputElement>('relayId').value.trim()
     const token = must<HTMLInputElement>('relayInvitation').value.trim()
+    if (relay && relay.identity.baseUrl === baseUrl && relay.identity.relayId === relayId && !token) {
+      button.disabled = true
+      await takeCaptureControl()
+      return
+    }
     if (!relayId || !token) throw new Error('Enter a relay ID and invitation, or open the link from RAP.')
-    void connectBrowserLink({ baseUrl, relayId, token, kind: 'phone' })
+    await connectBrowserLink({ baseUrl, relayId, token, kind: 'phone' }, true)
   } catch (error) { setStatus(errorToMessage(error)) }
+  finally { button.disabled = false }
 })
-async function takeCaptureControl(): Promise<void> {
+async function takeCaptureControl(): Promise<boolean> {
   try {
     if (!relay) throw new Error('Pair with RAP first.')
+    if (relay.activeBrowser && relay.canCapture()) { setStatus('Already paired and ready to capture.'); return true }
+    if (!relay.hasFreshPosition()) throw new Error('RAP has no fresh position. Check LightBurn and RAP, then click Pair again.')
     if (uploadInFlight || liveDispatching || liveRecoveryInFlight) throw new Error('Wait for the import result before requesting control.')
     const takeover = relay.controlOccupied
-    if (takeover && !window.confirm('Take capture control from the other browser? Its capture stops; pending or unresolved imports must be reconciled first.')) return
+    if (takeover && !window.confirm('Take capture control from the other browser? Its capture stops; pending or unresolved imports must be reconciled first.')) return false
     await relay.claimControl(takeover)
     must<HTMLParagraphElement>('relayMessage').textContent = 'This browser has capture control.'
     setStatus('Capture control acquired.')
-  } catch (error) { must<HTMLParagraphElement>('relayMessage').textContent = errorToMessage(error); setStatus(errorToMessage(error)) }
+    return true
+  } catch (error) { must<HTMLParagraphElement>('relayMessage').textContent = errorToMessage(error); setStatus(errorToMessage(error)); return false }
 }
-must<HTMLButtonElement>('takeControlBtn').addEventListener('click', () => { void takeCaptureControl() })
 must<HTMLButtonElement>('quickControlBtn').addEventListener('click', () => { void takeCaptureControl() })
 must<HTMLButtonElement>('unlinkRelayBtn').addEventListener('click', async () => {
   if (liveOwnsWork() || uploadInFlight) { setStatus('Finish or reconcile live updates before unlinking.'); return }
