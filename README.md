@@ -1,217 +1,239 @@
 # PathPlotter
 
-PathPlotter is a static web tool for collecting LightBurn workpiece coordinates and turning them into SVG geometry that can be imported back into LightBurn.
+**Capture positions from LightBurn, plot them in your browser, and turn them into circles, open paths or closed outlines.**
 
-## Cloud relay prototype
+PathPlotter is useful for recording positions around a workpiece, tracing an outline, or marking a series of locations. Move the head using your usual machine controls, then capture each reported **workpiece coordinate** from a computer or smartphone. Combine several capture groups, add point labels, and download an SVG or import it into the current LightBurn project.
 
-The hosted web app stays at https://nicholas-a11y.github.io/pathplotter/. The new cloud transport uses a Cloudflare Worker and one private Durable Object per Windows RAP installation. RAP runs beside LightBurn and makes outbound HTTPS requests; the phone never calls LightBurn directly. No port forwarding, public LightBurn API, Firebase or per-user Cloudflare account is needed.
+**Open the web app:** https://nicholas-a11y.github.io/pathplotter/
 
-This is a development prototype, not an already deployed service. Deploy and configure the backend before attempting cloud pairing. Real Windows/phone/LightBurn testing is required before general release.
+PathPlotter does **not** move the machine, fire the laser or start a job. Sending artwork only imports it. Always inspect placement, layers and machine settings in LightBurn before operating the laser.
 
-Backend setup and checks are in [relay/README.md](relay/README.md). Windows startup, consent, tray controls and recovery are in [rap/README.md](rap/README.md).
+## What you need
 
-Budget for usage before leaving RAP running continuously. A 500 ms publication interval alone is approximately 172,800 updates per day; browser polling and coordination add requests and storage operations. This is not a promise of free hosting. Free-tier limits can stop the relay rather than merely slow it down; measure actual use and choose a suitable Workers plan.
+- A Windows computer running LightBurn with its REST API available and enabled.
+- A connected machine for which LightBurn reports valid workpiece X/Y coordinates and workspace context. PathPlotter uses the API rather than a controller-specific connection; this does not guarantee support for every controller or LightBurn version.
+- The portable **RAP** connector running on that computer.
+- An internet connection on both the LightBurn computer and the browser device. A phone does not need to be on the same Wi-Fi.
+- For first-time RAP setup, an HTTPS relay address and a single-use registration invitation supplied by the relay operator.
 
-### Connect a browser
+This is a private development prototype, not an unrestricted public service. Opening the web app alone does not connect it to a laser. Real-machine placement and responsiveness must be checked with your setup; automated tests do not certify hardware behavior.
 
-1. Double-click **Start RAP.cmd** on the LightBurn computer. First use requires graphical enrollment, local consent and LightBurn's own approval. Existing protected credentials are reused.
-2. Normal launches open PathPlotter automatically after RAP is ready. This dedicated one-use desktop authorization does not require typing `pair`, `open` or `approve`. Opening again from the tray reuses a valid saved same-RAP browser grant.
-3. For a phone, choose **Pair phone** in RAP and scan its locally generated QR (or open its private link). The browser automatically requests pairing. Compare the phrase and click **Approve** on the desktop; phone requests are never auto-approved.
-4. Capture control is acquired automatically when free. If another browser controls capture, the new browser stays read-only and offers **Take control** with explicit confirmation. Pending and unresolved imports block handover. The previous browser does not automatically steal control back.
-5. Position the head using the usual machine controls. **Capture point** copies the latest reported workpiece sample, rather than taking a fresh reading at tap time.
-6. **Send to LightBurn** creates a bounded, expiring SVG job. The result distinguishes acceptance from confirmed import.
+### How the connection works
 
-The cloud connection dialog also allows entering the relay URL, ID and invitation manually. Its single **Pair** button connects and requests capture control; for an already paired browser it requests control without requiring another invitation. Taking control from another browser still requires confirmation. Workspace confirmation, import checks/acknowledgment and unlinking are tucked into a collapsed **Advanced / recovery** section. Connection-link secrets are removed immediately from the address bar. A same-RAP link preserves outstanding live work and closes Connection immediately, showing any pending-work reminder in the main status area; switching RAPs is blocked until pending work is reconciled and requires confirmation. The hosted build defaults to cloud mode; localhost development defaults to the existing local proxy.
+```text
+Browser (computer or phone)
+          |
+       HTTPS
+          |
+Cloudflare relay
+          |
+  outbound HTTPS from RAP
+          |
+RAP on the Windows computer
+          |
+   local LightBurn REST API
+```
 
-### Taking Live update over from another tab
+The web interface is hosted on GitHub Pages. RAP reads LightBurn locally and passes observations through the authenticated relay; it also imports SVGs explicitly sent by an authorized browser. The phone never connects directly to LightBurn and never receives its API secret.
 
-In the same browser profile and site, click **Pair** or enable **Live update** in the tab you want to use. The owning tab immediately stops accepting new captures and starting subsequent imports. It finishes tracking its current operation, saves the remaining queue, and releases its exclusive live lock. The requester reloads that saved state under the lock and checks the original connection/workspace before continuing queued unsent updates. Live capture continues if it was enabled in the old tab.
+Keep **Allow API Access From Network disabled** in LightBurn. RAP uses the local API, so no port forwarding or public LightBurn API is needed. Users do not need their own Cloudflare account.
 
-The old tab stays open but read-only with Live update off; browsers cannot reliably close another tab automatically. Opening a tab or switching focus does not request a transfer, avoiding control-stealing loops. A failed/unknown import or an existing manual pause stays paused for reconciliation, and no submitted import is automatically resent. If the old tab is unresponsive, the request times out rather than stealing its lock: close the old tab, inspect LightBurn and recover saved work explicitly. This cooperative transfer uses Web Locks and BroadcastChannel and does not transfer between different devices/browser profiles; relay control safeguards still apply there.
+## Connect for the first time
 
-### Freshness and workspace protection
+### On the LightBurn computer
 
-- RAP targets a successful read every 500 ms without overlapping requests. Actual frequency depends on LightBurn and network latency.
-- Capture requires a connected machine, browser control, a valid context and a sample no more than **2 seconds** old. The browser includes observation duration, server residence, round-trip time and elapsed time in its conservative age estimate.
-- The age indicates a successful API observation, not proof that the controller just measured the physical position.
-- The live crosshair turns black after three consecutive distinct fresh readings have exactly the same X/Y. It turns red on a coordinate change; stale/disconnected data clears this indication. Repeated receipt of the same relay sequence does not count. Black means stable reported coordinates, not proof that the machine has physically stopped.
-- Errors, browser background/resume and disconnected relays disable capture until fresh data arrives.
-- Existing/imported points from an unknown or different relay workspace cannot be mixed or sent silently. Clear them or use **Confirm workspace for existing points** after checking the machine and workpiece origin.
-- Capture status reflects saved-work and workspace guards as well as relay readiness. A disabled Capture point button shows its blocking reason and next step; successful pairing does not bypass workspace confirmation.
-- SVG download remains available without a relay connection.
+1. Obtain the complete RAP folder from the project/operator, or download the **PathPlotter-RAP-Windows** artifact from a successful [Check PathPlotter and RAP workflow](https://github.com/nicholas-a11y/pathplotter/actions/workflows/checks.yml). Extract it somewhere writable; do not run it from inside the ZIP.
+2. Open LightBurn and enable its REST API in **Settings > Extensions**. Leave network API access off.
+3. Double-click **Start RAP.cmd**. **Start RAP.vbs** is an alternative that avoids the brief command-window flash.
+4. In RAP's first-use setup, enter the operator-supplied relay address, a computer name and the registration invitation.
+5. Click **Request local LightBurn permission**. Bring LightBurn to the foreground and approve its permission dialog within 30 seconds.
+6. Once RAP has published a fresh, verified workpiece position, it opens PathPlotter automatically. Desktop authorization and capture control are automatic when control is free.
 
-### Import uncertainty
+Subsequent RAP launches reuse protected credentials and open PathPlotter automatically. Use **Open PathPlotter** in RAP to open it again. Closing the RAP status window leaves it running in the tray; choose **Quit** to stop it. Launching RAP a second time shows the existing instance rather than starting another connector.
 
-Only one import is active per relay. Jobs expire before starting; uncertain uploads are never automatically repeated. The browser saves a pending job ID before submission so refreshing the page does not silently permit another Send.
+RAP is portable and uses Windows PowerShell 5.1 and .NET Framework; everyday use does not require Node, Python or administrator access. If Windows policy blocks its scripts, follow your organization's approved procedure rather than disabling security protections.
 
-If disconnected during submission or confirmation, use **Check last import** in Connection and inspect RAP/LightBurn. **Acknowledge uncertain import** clears the browser's guard and acknowledges an unknown relay job only after explicit manual reconciliation; another Send could duplicate artwork. Still-running imports cannot be acknowledged. Control loss pauses live work; reacquire control explicitly, then check/acknowledge and resume its saved queue.
+### On a phone or another browser
 
-LightBurn's API does not provide documented import idempotency or reliable per-job event correlation. Even serialized RAP uploads cannot eliminate ambiguity from unrelated concurrent imports. No exactly-once guarantee is made.
+1. In RAP, choose **Pair phone**.
+2. Scan the QR code or open its private, expiring link.
+3. The browser requests pairing automatically. Compare its phrase with the approval card in RAP.
+4. Click **Approve matching phrase** on the computer.
+5. Wait for fresh coordinates and capture control. If another browser has control, use **Take control** and confirm the switch.
 
-### Privacy and credentials
+Phone requests always require desktop approval. Do not share pairing links or screenshots of the QR code.
 
-Only the latest coordinates are retained, not movement history. SVG jobs and bounded result metadata are temporary. The LightBurn secret stays on the desktop; local RAP credentials use current-user Windows protection. Browser pairing credentials are separate, stored in browser storage and excluded from collection/session JSON.
+The browser's **Connection** dialog also supports manual entry of the relay URL, relay ID and invitation. Its single **Pair** button pairs and requests capture control. An already paired browser can use **Pair** without another invitation. Saved same-RAP authorization is reused; reopening a same-RAP link closes Connection immediately and puts any outstanding-work reminder in the main status area.
 
-Clear browser data or **Unlink this browser** to remove local pairing. Revoke the browser in RAP to remove its server authorization. Account-free pairing means a new phone or cleared browser must pair again. Scripts served by the same GitHub Pages origin are part of the browser credential trust boundary.
+For detailed startup, tray controls and credential recovery, see [RAP instructions](rap/README.md).
 
-The Cloudflare backend must enforce authorization on every operation; relay IDs and storage paths are not access controls. The private prototype uses operator-issued enrollment invitations instead of unrestricted public registration. Do not put Cloudflare account tokens, enrollment secrets or LightBurn secrets into Pages build variables or frontend source.
+## Capture your first shape
 
-## What this first version does
+1. Open **Capture settings**, choose a shape and its colours, then click **Apply settings**.
+2. Position the head with the machine's normal controls. Watch the live crosshair and coordinate readout.
+3. Click **Capture point** for each position. On a keyboard, press **Space** when no dialog, text field or button has focus.
+4. Click **Finish** when the current shape has enough points. **Enter** performs the same action outside dialogs and controls.
+5. To collect another shape, change settings if needed and click **Resume**. Capture the next group and finish it.
+6. Use **Edit points** to adjust names, coordinates or label offsets.
+7. Click **Download SVG**, or **Send to LightBurn** to import the whole collection into the current project.
 
-- Reads live position from LightBurn `GET /api/position` (workpiece X/Y in mm).
-- Captures points into one collection containing consecutive capture groups, without a collection Name field.
-- A single **Capture settings** modal controls the current capture:
-  - Circles (one circle per point)
-  - Polyline (open path)
-  - Polygon (closed path)
-- Lets you edit point names and numeric coordinates.
-- Geometry and label colours use compact expandable pickers containing the exact 32 RGB entries from the LightBurn Layers palette (00–29, T1 and T2), arranged as four rows of eight touching numbered swatches. Selecting a colour closes its picker. New collections default to black/00 geometry and red/02 labels. Existing custom colours are preserved, but applying capture settings requires choosing palette colours for both.
-- The plot uses Cartesian orientation: increasing X goes right and increasing Y goes up. Stored workpiece coordinates remain unchanged. SVG export converts Y-up to SVG's Y-down direction using the complete geometry bounds, including circles and upright labels. Import placement still needs verification in LightBurn.
-- Optional point numbering and point-name labels.
-- Labels are exported as single-line vector strokes (no installed font dependency).
-- Labels use uppercase letters with a quarter-glyph gap between characters. Number/name separators are short line strokes, not zero-length paths, so they survive SVG import.
-- The workspace has numbered X rulers along the top/bottom and Y rulers on the left/right. Grid spacing adapts to screen size, with equal X/Y scale. Available LightBurn workpiece dimensions show a bed outline; incoming positions and captured geometry automatically expand the visible range.
-- Downloads the collection as SVG.
-- Sends the collection to LightBurn using `POST /api/file/upload`, preserving its workpiece placement. Downloaded SVGs imported manually use LightBurn's normal placement instead.
+| Shape | What it creates | Minimum points to finish/export |
+| --- | --- | --- |
+| Circles | One circle centered on each captured position, using the chosen diameter | 1 |
+| Polyline | An open path joining points in capture order | 2 |
+| Polygon | A closed path joining the last point back to the first | 3 |
 
-## Compact workspace workflow
+No separate set needs to be created before capturing. **Finish** saves the current group's points and settings; **Resume** starts the next group. Groups can have different shapes, colours, circle diameters and label settings. Numbering restarts at 1 in each group.
 
-1. Open **Connection** and click **Connect**. It uses an entered secret, or pairs locally when the field is blank. For pairing, bring LightBurn to the foreground (click its window or use Alt+Tab) and approve within 30 seconds. Live preview starts automatically and the dialog closes after two seconds on success. Errors leave it open; clear an invalid secret to pair again. There are no separate Test or preview controls.
-2. Open **Capture settings** to choose circles, polyline, or polygon, colours and labels.
-3. Click **Capture point** (or Space outside controls/dialogs) at each desired position. No set needs to be created first.
-4. Click **Finish** (or Enter) to save the current group with its own shape, geometry colour, diameter and label settings; a polygon closes its last-to-first edge. Change settings if needed, then click **Resume** to start a new group. Finished groups do not change when current settings change. Numbering restarts within each group.
-5. Open **Edit points** for numeric coordinates, point names and label-offset edits in any group, including finished groups. The Group column identifies their shapes. Undo affects only the current unfinished capture. Deleting too many points for a group's shape blocks export until the incomplete group is removed.
-6. Download SVG or **Send to LightBurn** to export all groups together, retaining each group's style and a shared placement anchor. **Clear points** clears all groups while preserving current settings.
-7. Use **Session** for version 3 JSON backups/import. Existing version 2 single collections and browser autosaves load without losing points; a previously finished collection becomes a finished group. Older multi-set sessions remain unsupported.
+A full SVG export includes valid current geometry as well as finished groups; a valid polygon is exported closed even before Finish. In **Live update**, its closing edge is sent only on Finish.
 
-Settings dialogs apply on **Apply settings**; Cancel/Escape leaves the collection unchanged. Coordinates and labels remain editable after finishing. The connection secret stays in memory only and is not part of browser autosave or session backups.
+### Settings and editing
 
-## Live update (append-only drawing)
+- Geometry and labels have separate colour pickers using LightBurn's exact 32-colour Layers palette: 00-29, T1 and T2. New collections default to black/00 geometry and red/02 labels.
+- Enable **Numbers**, **Point names**, or both. Set label height and group-wide X/Y offsets in Capture settings; Edit points provides additional per-point offsets.
+- Labels are single-line vector strokes, not font-dependent text. Letters render uppercase; supported characters are A-Z, 0-9, spaces and `- _ . : /`. Unsupported characters are reported and omitted from full exports; live updates reject unsupported labels.
+- **Edit points** includes finished groups and stays disabled when the entire collection has zero points. Edits are applied as values change; they never move the machine.
+- **Undo** removes the last point in the current unfinished capture, not a point from an older finished group.
+- **Clear points** clears all groups after confirmation and keeps your current capture settings. It does not delete anything already imported into LightBurn.
+- Capture settings apply only on **Apply settings**; Cancel or Escape leaves them unchanged. Changing current settings does not restyle finished groups.
+- If deletion leaves a nonempty group below its shape's minimum point count, full export is blocked. Restore enough points or delete its remaining points.
 
-**Live update to LightBurn** is off by default. At a new/empty group, choose your
-shape, colours and labels, then enable it and approve the warning. In cloud mode,
-RAP must be connected with fresh coordinates and this browser must have control.
-Local development mode also requires a verified LightBurn workspace.
+### Reading the plot
 
-- Each circle capture imports one new circle. Each polyline/polygon capture
-  after the first imports only the edge from the preceding point. A first path
-  point has no edge, but imports its label if enabled. Coincident points do not
-  create phantom edges.
-- Numbers/names are sent once with each new point, using that group's numbering
-  and label settings. **Finish** sends only a valid polygon's closing edge,
-  without resending its earlier edges or labels.
-- The browser saves immutable updates with the captured points before sending.
-  At most **20 updates**, including the in-flight update, can be pending.
-  Imports are serial; capture can continue while confirmation is pending.
-  The status shows pending and confirmed counts. A full queue blocks further
-  live captures until capacity becomes available.
-- Live groups' existing points, Undo and settings are locked while live mode is
-  active or its queue is unresolved. Finish a group to choose settings for the
-  next one. Unrelated older groups stay editable. Clear/session replacement and
-  destination changes are blocked until live work is resolved.
-- Switching the toggle off drains already queued work; subsequent captures stay
-  local. Editing/deleting points afterwards changes **PathPlotter only**.
-  LightBurn's existing imported objects are not updated or removed.
-- Only one tab can own live drawing at a time, using the browser's Web Locks
-  support. Other tabs cannot edit the same saved work while that owner is active.
-- **Send to LightBurn** remains a full-collection import, not a synchronization
-  operation. It is unavailable during live work and warns about duplicates after
-  live imports. **Download SVG** still exports the complete collection.
+Coordinates are in **millimetres**, with **+X right and +Y up**. The plot has numbered rulers, an adaptive grid and equal X/Y scale. A bed outline is shown when workpiece dimensions are available; the visible range expands to include positions and captured geometry.
 
-### Recovery and limitations
+The crosshair turns black after **three distinct, fresh readings with exactly the same X/Y**. It turns red when the coordinates change; stale or disconnected data clears the stable indication. Black means the *reported coordinates* are stable, not proof that the head has physically stopped.
 
-On reload, Live update stays off and saved updates are paused; nothing is
-automatically resent. In cloud mode, use **Check live import** to query RAP.
-For a failed, expired, uncertain or interrupted import, inspect LightBurn/RAP and
-use **Acknowledge import outcome** to remove that update without retrying it.
-Then explicitly **Resume queued updates**, or **Abandon unsent updates**.
-Abandoning preserves captured points and does not remove any LightBurn artwork.
-Local imports have no queryable historical confirmation; inspect LightBurn
-before acknowledging them. Missing geometry must be corrected manually.
+In cloud mode, Capture point copies the latest reported sample, rather than requesting a new measurement at the instant you tap. Samples must be no more than **2 seconds old**. RAP targets a 500 ms observation cycle, but network and API latency can make updates slower. A successful API observation is not proof of a newly measured physical position.
 
-The queue is bound to the original destination and coordinate context. A
-different machine/workspace cannot silently inherit it. Storage errors prevent
-new captures/updates from being committed and sent. Preserve browser storage or
-export a backup before clearing anything; session-file import rejects backups
-containing unresolved live work rather than replaying them on another machine.
+## Send once, or draw with Live update
 
-This is **append-only drawing**, not bidirectional synchronization. Each imported
-edge is a separate LightBurn object; a visually closed outline is not necessarily
-one joined shape suitable for fills/offsets. Join objects manually in LightBurn
-when needed. The REST API does not expose selective vector removal or replacement.
-Its `file_imported` event has no job ID, so avoid unrelated imports while drawing.
-HTTP 202 is acceptance, not success. Unknown outcomes stop dispatch and never
-trigger automatic re-upload.
+### Download SVG / Send to LightBurn
 
-The relay allows **1,000 imports per rolling 24 hours per RAP** with separate
-bounded pending SVG storage. Each nonempty delta counts as an import. Quota errors
-pause the queue explicitly; this is not a promise of free hosting. Actual visible
-latency includes browser/RAP polling, network, LightBurn import time and backlog.
+**Download SVG** exports the full collection and does not require a connection. Manually importing that file uses LightBurn's normal placement behavior.
 
-### Rollout and hardware check
+**Send to LightBurn** imports the full collection with a workpiece placement anchor. It does not replace earlier artwork, save the LightBurn project or start a laser job. Sending the same collection again can add duplicates. SVG export converts Y-up coordinates to SVG's Y-down orientation while keeping labels upright; verify the actual imported placement in LightBurn.
 
-Use the updated frontend, Worker and RAP together. Restart RAP with the updated
-files; deploy the updated Worker before cloud testing (GitHub Pages alone does
-not deploy it). CI packages the RAP sources into its downloadable artifact.
-No API capability changes or additional Cloudflare services are required.
+An accepted upload is not yet a confirmed import. Wait for the reported outcome and inspect the project. Avoid unrelated imports while PathPlotter is sending: LightBurn's import event does not carry a job ID, so concurrent external imports can make confirmation ambiguous.
 
-Test in a disposable LightBurn project without running the laser:
+### Live update to LightBurn
 
-1. Capture three circles; verify each appears once at its workpiece coordinates.
-2. Finish, change colour/type and capture horizontal and vertical segments with
-   numbering. Verify placement, colour and upright labels without earlier duplicates.
-3. Capture a non-collinear polygon; verify the last-to-first edge appears only
-   after Finish. Inspect the separate objects and manually join if needed.
-4. Capture rapidly while imports are pending; confirm fresh coordinates continue
-   and the ordered queue drains. Turn the toggle off and verify queued work drains.
-5. Verify reload pauses queued work and recovery does not repeat an attempted import.
-6. Observe selection/zoom changes and capture-to-visible latency in LightBurn.
-   Mocked tests cannot certify hardware placement, responsiveness or import UX.
+Live update is **off by default**. Use it when you want new geometry to appear in LightBurn as you capture, rather than sending the entire collection at the end.
 
-## Important constraints
+1. Start at a new/empty group. Finish an existing capture first if necessary.
+2. Choose the shape, colours and labels.
+3. Enable **Live update to LightBurn** and approve the append-only warning. A verified workspace and capture control are required.
+4. Capture normally. Finish each group; for a polygon, Finish sends its last-to-first edge.
+5. Turn Live update off when done. Already queued updates continue draining; subsequent captures remain local.
 
-- This app does not jog/move the machine and does not start jobs.
-- Capture is blocked if `workpiece.x`/`workpiece.y` are unavailable.
-- LightBurn pairing (`POST /api/connect`) is localhost-only. Cloud-mode pairing is performed by RAP; the phone never receives the LightBurn secret.
-- LightBurn owns the pairing consent dialog. In the tested setup it may not appear until its window receives focus; the browser cannot activate that desktop window. If consent times out, foreground LightBurn and retry pairing.
-- Direct hosted-browser access to LightBurn remains blocked by its missing CORS support in the tested setup. Use RAP/cloud mode for phone access.
+Each circle sends one new circle. Each path point after the first sends only the next segment. The first path point sends no edge, but can send its label. Labels are sent once per point; coincident points do not create phantom edges.
 
-## Run locally
+Imports are serial, with at most **20 pending updates including the in-flight update**. Capture can continue while confirmations are pending, until the queue is full. The status shows on/off, pending and confirmed counts; `Off · 0/20 pending · 0 confirmed` is normal when live mode has not been used.
 
-```bash
-npm install
+**This is append-only drawing, not synchronization.** Sent edges are separate LightBurn objects; a visually closed outline may need manual joining before fills or offsets. Editing or deleting points later changes PathPlotter only, not imported artwork.
+
+While live mode or unresolved live work locks a group, its existing points, Undo and settings cannot be changed. Finish it to choose settings for the next group; unrelated older groups remain editable. Clear points, session replacement, destination changes and full Send are blocked during live work. After live imports, a full Send warns that it will add duplicates; Download SVG still exports the complete collection when other operation/tab guards permit it.
+
+The relay allows **1,000 imports per rolling 24 hours per RAP**. Each nonempty live delta counts as an import. Quota errors pause work explicitly. Visible latency includes network, polling, LightBurn import time and any queue backlog.
+
+## Saved points, control and recovery
+
+### Browser autosave and session backups
+
+Finished groups, the current capture and live-work records are saved in this browser. They are not automatically shared between a phone and a computer, or between different browser profiles.
+
+Use **Session > Export session JSON** for a portable backup. **Import collection JSON** replaces the current collection after confirmation when points already exist. Version 3 group backups and version 2 single-collection backups are supported; older multi-set formats are not.
+
+Session files contain points and settings, **not pairing credentials or the LightBurn API secret**. Backups containing unresolved live work cannot be imported through Session, to prevent replaying queued imports at another destination. Export a backup before clearing browser storage; do not use clearing storage as an import-recovery shortcut.
+
+### Why a button is disabled
+
+The capture status and hint show the actual blocking reason; pairing successfully is not enough to bypass saved-work safeguards.
+
+| Situation | What to do |
+| --- | --- |
+| Waiting for fresh coordinates | Check RAP, LightBurn and the machine connection; return the browser to the foreground and wait for fresh data. |
+| Another browser has capture control | Use **Take control**, or **Connection > Pair**, and confirm. Another browser's unresolved imports must be reconciled first. |
+| Workspace confirmation needed | If saved points truly belong to this machine and workpiece origin, use **Connection > Advanced / recovery > Confirm workspace for existing points**. Otherwise export a session backup and clear the old points. |
+| Capture finished | Click **Resume** to start the next group. |
+| Finish disabled, but the summary shows points | The summary counts all groups. Finish needs enough points in the **current** group; older finished groups do not count. |
+| Edit points disabled | There are no points, or an operation/tab handover prevents editing. Finished-group points count toward enabling it. |
+| Live queue full or paused | Wait for space, or follow the live recovery steps below. |
+
+Workspace confirmation associates saved coordinates with the current context; it does **not** move, translate or remeasure them. Context checks use API workspace/device information, not a guaranteed physical workpiece identity. Manually check the origin and workpiece even when no warning appears.
+
+### Switching tabs or devices
+
+Only one browser holds relay capture control at a time. An explicit takeover stops the previous browser from capturing; it does not automatically take control back.
+
+For Live update tabs in the **same browser profile and site**, click **Pair** or enable Live update in the tab you want to use. The old owner stops new captures and subsequent imports, settles its current operation, saves the queue and releases its exclusive lock. The new tab checks the original destination/workspace before continuing safe unsent work; live capture continues if it was enabled.
+
+The old tab stays open but read-only with Live update off. Simply opening a tab or switching focus does not request takeover. Paused/unknown work stays paused and submitted artwork is never automatically resent. If transfer times out, inspect LightBurn before closing the old tab and recovering saved work. This cooperative handover needs Web Locks and BroadcastChannel; it does not transfer collections or queues between devices or profiles.
+
+### Interrupted full imports
+
+In **Connection > Advanced / recovery**:
+
+- **Check last import** asks for the saved job's outcome. It does not resend artwork.
+- **Acknowledge uncertain import** clears an uncertain-import guard only after you inspect LightBurn and explicitly reconcile the outcome. It neither retries the import nor deletes artwork. A still-running import cannot be acknowledged.
+
+The browser saves the pending job ID so a reload does not silently permit another Send. Another Send after acknowledgment can duplicate artwork; missing geometry must be corrected manually.
+
+### Interrupted Live update
+
+On reload, Live update is off and saved queued work is paused.
+
+1. Inspect LightBurn and RAP. Use **Check live import** when available to query a cloud import.
+2. For failed, expired, uncertain or interrupted work, use **Acknowledge import outcome** after checking what appeared. This removes the update without retrying it.
+3. Choose **Resume queued updates** to continue safe unsent work at its original workspace, or **Abandon unsent updates**.
+
+Abandoning preserves captured points and never removes LightBurn artwork. Local development imports have no queryable historical confirmation, so manual inspection is required. No exactly-once import guarantee is made; unknown outcomes stop dispatch instead of automatically re-uploading.
+
+## Privacy and operational limits
+
+- RAP's LightBurn secret remains on the computer. RAP credentials and its import journal use current-user Windows protection.
+- Browser authorization is stored separately in browser storage. **Unlink this browser** removes the local pairing; use RAP's **Connected browsers** controls to revoke server authorization.
+- Relay snapshots overwrite the latest coordinates rather than retaining movement history. Captured collections remain in the browser and SVGs travel through the relay for import.
+- Terminal jobs discard their SVG payloads. Temporary records expire, but storage cleanup is request-driven; shutdown does not delete the whole Durable Object. Registration and browser authorization persist until revoked/reset as applicable.
+- Pairing links are private grants. Scripts served from the same GitHub Pages origin are within the browser credential trust boundary.
+- The operator must budget for hosting. A 500 ms publication interval alone is about 172,800 updates/day, before browser polling and coordination. Free-tier limits can stop service; free hosting is not guaranteed.
+
+## Development and deployment
+
+### Frontend
+
+Use Node.js 24 and run from the project root:
+
+```powershell
+npm ci
 npm run dev
 ```
 
-Build:
+Local development defaults to **Local development connection**, using the loopback Vite `/lightburn` API proxy to `http://127.0.0.1:19520`. In Connection, click **Connect** with an existing secret, or leave it blank to request local pairing. Bring LightBurn to the foreground and approve within 30 seconds. The local secret stays in memory and is excluded from autosave/backups.
 
-```bash
-npm run build
-```
+Keep the development server bound to loopback. Its proxy is not included in the static build and is not a phone/LAN solution. Hosted browsers use RAP because direct browser-to-LightBurn access is restricted by CORS in the tested setup.
 
-Focused frontend transport tests (Node.js 24):
-
-```bash
+```powershell
 npm test
-```
-
-Preview build:
-
-```bash
+npm run build
 npm run preview
 ```
 
-## Deploy to GitHub Pages
+### Deployment components
 
-1. Build with `npm run build`.
-2. Publish the `dist/` folder with your preferred Pages flow (Actions, `gh-pages`, or manual upload).
-3. Deploy the relay separately and use its HTTPS origin in RAP/pairing. Pages contains no backend or LightBurn credentials.
-4. Verify pairing, capture and correct SVG placement from a real phone before releasing.
+- **Web app:** [pages.yml](.github/workflows/pages.yml) builds and deploys `dist/` to GitHub Pages on pushes to `main`, or by manual workflow dispatch. GitHub Pages must be configured for Actions.
+- **Relay:** deployed separately; a Pages push does not redeploy it. See [relay setup and API contract](relay/README.md) for operator configuration and checks.
+- **RAP:** use the matching updated RAP files and restart the connector. [checks.yml](.github/workflows/checks.yml) tests all three components and packages the Windows RAP artifact.
 
-## Connection notes
+No backend credentials belong in frontend source or Pages variables. Registration is operator-controlled, not public self-enrollment.
 
-- Default API URL: `http://localhost:19520`.
-- Local development defaults to a same-origin `/lightburn` proxy forwarding only API requests to `127.0.0.1:19520`. This avoids LightBurn's missing CORS support during desktop testing without disabling browser protections. Keep the development server bound to loopback.
-- The development proxy is not included in the static production build. It remains a loopback desktop testing option, not a phone/LAN server.
-- Keep LightBurn loopback-only with RAP. Both RAP and the phone need internet for cloud mode; they do not need the same Wi-Fi.
-- Keep your secret private; session JSON export intentionally excludes it.
+### Real-machine check
+
+Use a disposable LightBurn project without running the laser. Check circle positions and diameter, horizontal/vertical segments, polygon closure, colours, upright labels and multiple groups. For Live update, verify no earlier geometry is duplicated, queued work drains, and reload/connection-loss recovery never repeats an attempted import. Confirm placement and latency on each intended controller/setup before relying on it.
+
+## Further reading
+
+- [Portable RAP startup, permissions, tray controls and diagnostics](rap/README.md)
+- [Relay development, enrollment and API behavior](relay/README.md)
+- [LightBurn REST API](https://github.com/LightBurnSoftware/LightBurn-REST)
+- [Original marking-mode discussion](https://forum.lightburnsoftware.com/t/marking-mode-like-found-in-xtool-studio/193060)
