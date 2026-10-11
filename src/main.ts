@@ -1,4 +1,6 @@
 import './style.css'
+import { SettledPosition } from './settled-position'
+import { RelayClient, loadIdentity, saveIdentity, pairingInvitation, relayRequest, relayBaseUrl, parseJob } from './relay'
 
 type ShapeType = 'circles' | 'polyline' | 'polygon'
 
@@ -12,6 +14,7 @@ interface Point {
 }
 
 interface Collection {
+  coordinateContext?: string
   name: string
   type: ShapeType
   points: Point[]
@@ -136,9 +139,31 @@ app.innerHTML = `
 
   <dialog id="connectionDialog" aria-labelledby="connectionTitle">
     <header class="dialog-header">
-      <h2 id="connectionTitle">LightBurn connection</h2>
+      <h2 id="connectionTitle">Connection</h2>
       <button data-close="connectionDialog" aria-label="Close connection">Close</button>
     </header>
+    <label>Connection type
+      <select id="connectionMode">
+        <option value="relay">Cloud relay (RAP)</option>
+        <option value="local">Local development connection</option>
+      </select>
+    </label>
+    <section id="relayConnection">
+      <p class="hint">Run RAP on the LightBurn computer and open its pairing link on this browser. Compare the verification phrase and approve in RAP. Pairing is saved only in this browser.</p>
+      <label>Relay API URL<input id="relayUrl" type="url" placeholder="https://pathplotter-relay.example.workers.dev" /></label>
+      <label>Relay ID<input id="relayId" /></label>
+      <label>Pairing invitation<input id="relayInvitation" type="password" autocomplete="off" /></label>
+      <div class="row">
+        <button id="pairRelayBtn" class="primary">Pair with RAP</button>
+        <button id="takeControlBtn">Use this browser</button>
+        <button id="unlinkRelayBtn">Unlink this browser</button>
+        <button id="revalidateBtn">Confirm workspace for existing points</button>
+        <button id="checkImportBtn">Check last import</button>
+        <button id="resolveImportBtn">Acknowledge uncertain import</button>
+      </div>
+      <p id="relayMessage" role="status"></p>
+    </section>
+    <section id="localConnection">
     <div class="form-grid">
       <label>LightBurn base URL
         <input id="baseUrl" type="url" value="http://localhost:19520" />
@@ -156,6 +181,7 @@ app.innerHTML = `
       <button id="connectBtn" class="primary">Connect</button>
     </div>
     <p id="connectionMessage" role="status"></p>
+    </section>
   </dialog>
 
   <dialog id="settingsDialog" aria-labelledby="settingsTitle">
@@ -249,11 +275,203 @@ const exportStatusEl = must<HTMLParagraphElement>('exportStatus')
 
 let state: Collection = loadState()
 let livePosition: LivePosition | null = null
+const settledPosition = new SettledPosition()
+let localObservationSequence = 0
+let settledRelayContext: string | null = null
 let pollHandle: number | null = null
 let requestInFlight = false
 let uploadInFlight = false
+let connectionInFlight = false
 let workspaceSize: { x: number; y: number } | null = null
 let connectionCloseTimer: number | null = null
+let relay: RelayClient | null = null
+let mode: 'relay' | 'local' = import.meta.env.DEV ? 'local' : 'relay'
+let pairingEpoch = 0
+const PENDING_IMPORT_KEY = 'pathplotter.relay.pending-import.v1'
+let pendingImport: { id: string; relayId: string } | null = null
+try {
+  const raw = localStorage.getItem(PENDING_IMPORT_KEY)
+  if (raw) {
+    const saved: unknown = JSON.parse(raw)
+    if (!isRecord(saved) || typeof saved.id !== 'string' || typeof saved.relayId !== 'string') {
+      throw new Error('Saved relay import journal is invalid. Do not send until you verify the last import in RAP.')
+    }
+    pendingImport = { id: saved.id, relayId: saved.relayId }
+  }
+} catch (error) {
+  pendingImport = { id: 'unreadable-journal', relayId: '' }
+  setExportStatus(errorToMessage(error))
+}
+const modeInput = must<HTMLSelectElement>('connectionMode')
+modeInput.value = mode
+
+function updateConnectionMode(): void {
+  must<HTMLElement>('relayConnection').hidden = mode !== 'relay'
+  must<HTMLElement>('localConnection').hidden = mode !== 'local'
+  if (pollHandle !== null) {
+    window.clearInterval(pollHandle)
+    pollHandle = null
+  }
+  relay?.stop()
+  livePosition = null
+  settledPosition.reset()
+  settledRelayContext = null
+  workspaceSize = null
+  connectionStateEl.textContent = 'Disconnected'
+  connectionStateEl.classList.remove('ok')
+  if (mode === 'relay') relay?.start()
+  renderAll()
+}
+
+function relayChanged(): void {
+  if (mode !== 'relay') return
+  const snapshot = relay?.snapshot
+  const fresh = relay?.canCapture() === true
+  const relayContext = snapshot && relay ? `${relay.identity.relayId}:${snapshot.generation}:${snapshot.context?.revision}` : null
+  if (!fresh || relayContext !== settledRelayContext) settledPosition.reset()
+  settledRelayContext = relayContext
+  if (fresh && snapshot?.position) {
+    settledPosition.observe(`${snapshot.generation}:${snapshot.sequence}`, snapshot.position.x, snapshot.position.y)
+  }
+  livePosition = fresh && snapshot?.position ? { ...snapshot.position, updatedAt: Date.now() } : null
+  workspaceSize = snapshot?.context?.size ?? null
+  connectionStateEl.textContent = fresh ? 'RAP connected' : 'Capture unavailable'
+  connectionStateEl.classList.toggle('ok', fresh)
+  liveTextEl.textContent = relay?.error ? `Relay: ${relay.error}` :
+    snapshot?.position ? `Latest reported: X ${snapshot.position.x.toFixed(3)}, Y ${snapshot.position.y.toFixed(3)} mm · age ${(relay!.age() / 1000).toFixed(1)} s${fresh ? '' : ' · stale, offline or another browser has control'}` :
+    'Waiting for a fresh RAP workpiece position.'
+  renderControls()
+  renderPlot()
+}
+
+function contextKey(): string | null {
+  return relay?.snapshot?.context ? `${relay.identity.relayId}:${relay.snapshot.context.revision}` : null
+}
+
+function requireRelayContext(): string {
+  if (!relay?.canCapture()) throw new Error('Cannot capture/send: RAP is offline, the sample is over 2 seconds old, or this browser has no control.')
+  const key = contextKey()
+  if (!key) throw new Error('Workspace context is unavailable.')
+  if (state.points.length && state.coordinateContext !== key) {
+    throw new Error('Existing points belong to an unknown or different workspace. Clear them, or explicitly confirm the workspace in Connection.')
+  }
+  return key
+}
+
+function attachRelay(identity: NonNullable<ReturnType<typeof loadIdentity>>): void {
+  relay?.stop()
+  relay = new RelayClient(identity, relayChanged)
+  must<HTMLInputElement>('relayUrl').value = identity.baseUrl
+  must<HTMLInputElement>('relayId').value = identity.relayId
+  if (mode === 'relay') relay.start()
+}
+
+modeInput.addEventListener('change', () => {
+  if (uploadInFlight || requestInFlight || connectionInFlight) { modeInput.value = mode; setStatus('Wait for the current request before changing connection.'); return }
+  mode = modeInput.value === 'local' ? 'local' : 'relay'
+  ++pairingEpoch
+  updateConnectionMode()
+})
+must<HTMLButtonElement>('pairRelayBtn').addEventListener('click', async () => {
+  const button = must<HTMLButtonElement>('pairRelayBtn')
+  const message = must<HTMLParagraphElement>('relayMessage')
+  button.disabled = true
+  const epoch = ++pairingEpoch
+  try {
+    if (relay && !window.confirm('Replace this browser’s existing relay pairing?')) return
+    const baseUrl = relayBaseUrl(must<HTMLInputElement>('relayUrl').value)
+    const relayId = must<HTMLInputElement>('relayId').value.trim()
+    if (!relayId) throw new Error('Relay ID is required.')
+    const value = await relayRequest(baseUrl, relayId, '/pairing/request', {
+      invitation: must<HTMLInputElement>('relayInvitation').value.trim(),
+    })
+    if (!isRecord(value) || typeof value.pairingId !== 'string' ||
+        typeof value.pendingToken !== 'string' || typeof value.phrase !== 'string') throw new Error('Invalid pairing response.')
+    message.textContent = `Compare "${value.phrase}" with RAP, then approve on the desktop. Waiting up to 5 minutes.`
+    const deadline = performance.now() + 300000
+    while (epoch === pairingEpoch && performance.now() < deadline) {
+      await new Promise(resolve => window.setTimeout(resolve, 1000))
+      if (epoch !== pairingEpoch) return
+      const result = await relayRequest(baseUrl, relayId, '/pairing/status', {
+        pairingId: value.pairingId, pendingToken: value.pendingToken,
+      })
+      if (!isRecord(result) || typeof result.status !== 'string') throw new Error('Invalid pairing status.')
+      if (result.status === 'rejected') throw new Error('RAP rejected the pairing invitation.')
+      if (result.status === 'approved') {
+        if (typeof result.credential !== 'string') throw new Error('Pairing credential missing.')
+        if (epoch !== pairingEpoch) return
+        const identity = { baseUrl, relayId, credential: result.credential }
+        saveIdentity(identity)
+        attachRelay(identity)
+        must<HTMLInputElement>('relayInvitation').value = ''
+        message.textContent = 'Paired. Click Use this browser to enable capture.'
+        return
+      }
+      if (result.status !== 'pending') throw new Error('Pairing expired or is invalid.')
+    }
+    if (epoch === pairingEpoch) throw new Error('Pairing expired. Generate a new invitation in RAP.')
+  } catch (error) { message.textContent = errorToMessage(error) }
+  finally { button.disabled = false }
+})
+must<HTMLButtonElement>('takeControlBtn').addEventListener('click', async () => {
+  try {
+    if (!relay) throw new Error('Pair with RAP first.')
+    await relay.claimControl()
+    must<HTMLParagraphElement>('relayMessage').textContent = 'This browser has capture control.'
+  } catch (error) { must<HTMLParagraphElement>('relayMessage').textContent = errorToMessage(error) }
+})
+must<HTMLButtonElement>('unlinkRelayBtn').addEventListener('click', async () => {
+  if (uploadInFlight) { setStatus('Wait for the import result before unlinking.'); return }
+  if (!window.confirm('Remove this browser’s local pairing? Revoke its grant in RAP to remove server access.')) return
+  ++pairingEpoch
+  try {
+    saveIdentity(null)
+    relay?.stop()
+    relay = null
+    updateConnectionMode()
+    must<HTMLParagraphElement>('relayMessage').textContent = 'Unlinked locally. Pair again to reconnect.'
+  } catch (error) { setStatus(errorToMessage(error)) }
+})
+must<HTMLButtonElement>('revalidateBtn').addEventListener('click', () => {
+  if (uploadInFlight || requestInFlight) return
+  const key = contextKey()
+  if (!key || !relay?.canCapture()) { setStatus('A fresh RAP workspace and capture control are required.'); return }
+  if (window.confirm('Confirm all existing point coordinates belong to the currently connected machine and workpiece origin? This does not move or transform any points.')) {
+    state.coordinateContext = key
+    persistAndRender()
+    setStatus('Existing points explicitly associated with this workspace.')
+  }
+})
+must<HTMLButtonElement>('checkImportBtn').addEventListener('click', async () => {
+  if (uploadInFlight) return
+  try {
+    if (!pendingImport) throw new Error('No pending relay import is saved in this browser.')
+    if (!relay || relay.identity.relayId !== pendingImport.relayId) throw new Error('Reconnect to the relay used for the pending import.')
+    const job = parseJob(await relay.request(`/jobs/${encodeURIComponent(pendingImport.id)}`))
+    setExportStatus(`RAP import ${job.id}: ${job.status}${job.error ? ` — ${job.error}` : ''}.`)
+    if (['confirmed', 'failed', 'expired'].includes(job.status)) clearPendingImport()
+  } catch (error) { setExportStatus(errorToMessage(error)) }
+})
+must<HTMLButtonElement>('resolveImportBtn').addEventListener('click', () => {
+  if (uploadInFlight || !pendingImport) return
+  if (window.confirm(`Check RAP and LightBurn for job ${pendingImport.id} first. Confirm you have reconciled its outcome and understand another Send may duplicate artwork.`)) {
+    try { clearPendingImport() }
+    catch (error) { setExportStatus(errorToMessage(error)) }
+  }
+})
+
+function clearPendingImport(): void {
+  localStorage.removeItem(PENDING_IMPORT_KEY)
+  pendingImport = null
+  renderControls()
+}
+document.addEventListener('visibilitychange', () => {
+  if (mode !== 'relay') return
+  relay?.stop()
+  if (!document.hidden) relay?.start()
+  relayChanged()
+})
+window.setInterval(() => { if (mode === 'relay') relayChanged() }, 200)
 
 function cancelConnectionClose(): void {
   if (connectionCloseTimer !== null) {
@@ -267,6 +485,37 @@ for (const input of [baseUrlInput, secretInput, appNameInput]) {
 }
 
 renderAll()
+updateConnectionMode()
+function consumePairingLink(): boolean {
+  const invitation = pairingInvitation(location.hash)
+  if (invitation) {
+    if (uploadInFlight) throw new Error('Wait for the import outcome before opening a different pairing invitation.')
+    history.replaceState(null, '', location.pathname + location.search)
+    mode = 'relay'
+    modeInput.value = mode
+    must<HTMLInputElement>('relayUrl').value = invitation.baseUrl
+    must<HTMLInputElement>('relayId').value = invitation.relayId
+    must<HTMLInputElement>('relayInvitation').value = invitation.invitation
+    updateConnectionMode()
+    const dialog = must<HTMLDialogElement>('connectionDialog')
+    if (!dialog.open) dialog.showModal()
+    return true
+  }
+  return false
+}
+window.addEventListener('hashchange', () => {
+  try { consumePairingLink() }
+  catch (error) { history.replaceState(null, '', location.pathname + location.search); setStatus(errorToMessage(error)) }
+})
+try {
+  if (!consumePairingLink()) {
+    const identity = loadIdentity()
+    if (identity) attachRelay(identity)
+  }
+} catch (error) {
+  history.replaceState(null, '', location.pathname + location.search)
+  setStatus(errorToMessage(error))
+}
 new ResizeObserver(() => renderPlot()).observe(plotEl)
 
 for (const [button, dialog] of [
@@ -336,6 +585,7 @@ must<HTMLButtonElement>('connectBtn').addEventListener('click', async () => {
   const appName = appNameInput.value.trim() || 'PathPlotter'
   const connectButton = must<HTMLButtonElement>('connectBtn')
   connectButton.disabled = true
+  connectionInFlight = true
   cancelConnectionClose()
   try {
     if (!secretInput.value.trim()) {
@@ -371,6 +621,7 @@ must<HTMLButtonElement>('connectBtn').addEventListener('click', async () => {
     connectionStateEl.classList.remove('ok')
   } finally {
     connectButton.disabled = false
+    connectionInFlight = false
   }
 })
 
@@ -378,6 +629,7 @@ must<HTMLButtonElement>('clearBtn').addEventListener('click', () => {
   if (requestInFlight || uploadInFlight) return
   if (state.points.length > 0 && !window.confirm('Clear all captured points? Capture settings will be kept.')) return
   state.points = []
+  delete state.coordinateContext
   state.finished = false
   persistAndRender()
   setStatus('Points cleared.')
@@ -537,24 +789,32 @@ async function fetchStatus(): Promise<void> {
 }
 
 async function refreshLivePosition(): Promise<void> {
+  if (mode !== 'local') return
   try {
     const response = await authorizedFetch('/api/position')
     if (!response.ok) {
       throw new Error(`Position request failed (${response.status})`)
     }
     const payload = (await response.json()) as { workpiece?: { x?: number; y?: number } }
+    if (mode !== 'local') return
     const x = payload.workpiece?.x
     const y = payload.workpiece?.y
     if (typeof x !== 'number' || typeof y !== 'number' || !Number.isFinite(x) || !Number.isFinite(y)) {
       livePosition = null
+      settledPosition.reset()
       liveTextEl.textContent = 'Workpiece X/Y are unavailable for the current device.'
       renderPlot()
       return
     }
     livePosition = { x, y, updatedAt: Date.now() }
+    settledPosition.observe(`local:${++localObservationSequence}`, x, y)
     liveTextEl.textContent = `Live workpiece position: X ${x.toFixed(3)} mm, Y ${y.toFixed(3)} mm`
     renderPlot()
   } catch (error) {
+    if (mode !== 'local') return
+    settledPosition.reset()
+    livePosition = null
+    renderPlot()
     liveTextEl.textContent = `Live preview error: ${errorToMessage(error)}`
   }
 }
@@ -583,6 +843,16 @@ async function capturePoint(): Promise<void> {
   requestInFlight = true
   renderControls()
   try {
+    if (mode === 'relay') {
+      const key = requireRelayContext()
+      const position = relay?.snapshot?.position
+      if (!position) throw new Error('No fresh workpiece coordinates.')
+      state.points.push({ id: makeId('pt'), name: '', x: position.x, y: position.y, labelOffsetX: 0, labelOffsetY: 0 })
+      state.coordinateContext = key
+      persistAndRender()
+      setStatus(`Captured point ${state.points.length} from latest RAP sample.`)
+      return
+    }
     const response = await authorizedFetch('/api/position')
     if (!response.ok) {
       throw new Error(`Position request failed (${response.status})`)
@@ -602,7 +872,9 @@ async function capturePoint(): Promise<void> {
       labelOffsetY: 0,
     }
     state.points.push(point)
+    delete state.coordinateContext
     livePosition = { x, y, updatedAt: Date.now() }
+    settledPosition.observe(`local:${++localObservationSequence}`, x, y)
     persistAndRender()
     setStatus(`Captured point ${state.points.length}.`)
   } catch (error) {
@@ -649,6 +921,38 @@ async function sendToLightBurn(): Promise<void> {
   uploadInFlight = true
   renderControls()
   try {
+    if (built.unsupportedCharacters.length && !window.confirm(`Unsupported label characters will be omitted: ${[...new Set(built.unsupportedCharacters)].join(', ')}. Send anyway?`)) return
+    if (mode === 'relay') {
+      if (pendingImport) throw new Error(`Previous import ${pendingImport.id} is unresolved. Use Check last import in Connection before sending again.`)
+      const key = requireRelayContext()
+      const client = relay
+      if (!client) throw new Error('Pair with RAP first.')
+      const bytes = new TextEncoder().encode(built.svg)
+      if (bytes.byteLength > 512 * 1024) throw new Error('SVG exceeds the 512 KiB relay limit. Download it for manual import.')
+      const checksum = [...new Uint8Array(await crypto.subtle.digest('SHA-256', bytes))]
+        .map(value => value.toString(16).padStart(2, '0')).join('')
+      requireRelayContext()
+      const id = crypto.randomUUID()
+      const revision = client.snapshot?.context?.revision
+      if (!revision || contextKey() !== key) throw new Error('Workspace changed while preparing SVG.')
+      pendingImport = { id, relayId: client.identity.relayId }
+      try { localStorage.setItem(PENDING_IMPORT_KEY, JSON.stringify(pendingImport)) }
+      catch (error) {
+        pendingImport = null
+        throw new Error(`Cannot save import journal; no job was sent: ${errorToMessage(error)}`)
+      }
+      setExportStatus(`Submitting relay job ${id}.`)
+      let result: ReturnType<typeof parseJob>
+      try {
+        result = parseJob(await client.request('/jobs', {
+          id, svg: built.svg, checksum, filename: `pathplotter-${Date.now()}.svg`, anchor: built.anchor, contextRevision: revision,
+        }))
+      } catch (error) {
+        throw new Error(`Job ${id} submission outcome is unresolved: ${errorToMessage(error)}. Use Check last import; do not resubmit blindly.`)
+      }
+      await followRelayJob(client, result)
+      return
+    }
     await fetchStatus()
     setExportStatus('Uploading SVG to LightBurn...')
     const confirmation = waitForFileImported(20000)
@@ -666,6 +970,25 @@ async function sendToLightBurn(): Promise<void> {
     if (response.status !== 202) {
       setExportStatus(`Upload was rejected (${response.status}).`)
       return
+    }
+
+    async function followRelayJob(client: RelayClient, initial: ReturnType<typeof parseJob>): Promise<void> {
+      let job = initial
+      const deadline = performance.now() + 90000
+      while (true) {
+        setExportStatus(`RAP import ${job.id}: ${job.status}${job.error ? ` — ${job.error}` : ''}.`)
+        if (['confirmed', 'failed', 'expired', 'unknown'].includes(job.status)) {
+          if (job.status !== 'unknown') clearPendingImport()
+          return
+        }
+        if (performance.now() > deadline) {
+          setExportStatus(`RAP job ${job.id}: outcome not yet known. Check RAP before submitting another import; do not retry blindly.`)
+          return
+        }
+        await new Promise(resolve => window.setTimeout(resolve, 1000))
+        try { job = parseJob(await client.request(`/jobs/${encodeURIComponent(job.id)}`)) }
+        catch (error) { throw new Error(`Cannot determine outcome of RAP job ${job.id}: ${errorToMessage(error)}. Check RAP; do not retry blindly.`) }
+      }
     }
     const imported = await confirmation
     if (imported.status === 'confirmed') {
@@ -999,6 +1322,7 @@ function validateCollection(value: unknown): Collection {
     }
   })
   return {
+    ...(typeof value.coordinateContext === 'string' ? { coordinateContext: value.coordinateContext } : {}),
     name: value.name, type: value.type as ShapeType, points, finished: value.finished,
     strokeColor: value.strokeColor, circleDiameterMm: value.circleDiameterMm,
     showNumbers: value.showNumbers, showNames: value.showNames,
@@ -1021,14 +1345,17 @@ function renderControls(): void {
   const busy = requestInFlight || uploadInFlight
   must<HTMLSpanElement>('collectionSummary').textContent =
     `${state.name ? `${state.name} · ` : ''}${state.type} · ${state.points.length} points`
-  must<HTMLButtonElement>('captureBtn').disabled = busy || state.finished
+  const relayReady = mode !== 'relay' || relay?.canCapture() === true
+  const contextMatches = mode !== 'relay' || !state.points.length || state.coordinateContext === contextKey()
+  must<HTMLButtonElement>('captureBtn').disabled = busy || state.finished || !relayReady || !contextMatches
   must<HTMLButtonElement>('finishBtn').textContent = state.finished ? 'Resume' : 'Finish'
   must<HTMLButtonElement>('finishBtn').disabled = busy || (!state.finished && !hasEnoughPoints(state))
   must<HTMLButtonElement>('undoBtn').disabled = busy || state.points.length === 0
   must<HTMLButtonElement>('clearBtn').disabled = busy || state.points.length === 0
   must<HTMLButtonElement>('settingsBtn').disabled = busy
   must<HTMLButtonElement>('pointsBtn').disabled = busy
-  must<HTMLButtonElement>('sendBtn').disabled = busy || !hasEnoughPoints(state)
+  must<HTMLButtonElement>('sendBtn').disabled = busy || !hasEnoughPoints(state) || !relayReady || !contextMatches ||
+    (mode === 'relay' && pendingImport !== null)
   must<HTMLButtonElement>('downloadSvgBtn').disabled = busy || !hasEnoughPoints(state)
 }
 
@@ -1177,7 +1504,7 @@ function renderPlot(): void {
     `<circle class="point-dot" cx="${screenX(point.x)}" cy="${screenY(point.y)}" r="3" fill="${state.strokeColor}"><title>Point ${index + 1}${point.name ? `: ${escapeXml(point.name)}` : ''} · X ${point.x}, Y ${point.y}</title></circle>`
   ).join('')
   const head = livePosition
-    ? `<g class="head-marker" transform="translate(${screenX(livePosition.x)} ${screenY(livePosition.y)})"><circle r="5" /><path d="M -9 0 H 9 M 0 -9 V 9" /></g>` : ''
+    ? `<g class="head-marker${settledPosition.settled ? ' settled' : ''}" transform="translate(${screenX(livePosition.x)} ${screenY(livePosition.y)})"><title>${settledPosition.settled ? 'Reported position unchanged for three readings' : 'Reported position not yet settled'}</title><circle r="5" /><path d="M -9 0 H 9 M 0 -9 V 9" /></g>` : ''
   const workspace = workspaceSize
     ? `<rect class="bed-outline" x="${screenX(0)}" y="${screenY(workspaceSize.y)}" width="${workspaceSize.x * scale}" height="${workspaceSize.y * scale}" />` : ''
   plotEl.innerHTML = `

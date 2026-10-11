@@ -1,0 +1,54 @@
+name: Check PathPlotter and RAP
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  web:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+      - run: npm ci
+      - run: npm test
+      - run: npm run build
+
+  relay:
+    runs-on: ubuntu-24.04
+    defaults:
+      run:
+        working-directory: relay
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: relay/package-lock.json
+      - run: npm ci
+      - run: npm run check
+      - run: npm test
+
+  rap:
+    runs-on: windows-2025
+    steps:
+      - uses: actions/checkout@v4
+      - name: Validate built-in Windows PowerShell RAP
+        shell: powershell
+        run: .\rap\Test-RAP.ps1
+      - name: Package script prototype
+        shell: powershell
+        run: Compress-Archive -Path .\rap\* -DestinationPath .\PathPlotter-RAP-Windows.zip
+      - uses: actions/upload-artifact@v4
+        with:
+          name: PathPlotter-RAP-Windows
+          path: PathPlotter-RAP-Windows.zip

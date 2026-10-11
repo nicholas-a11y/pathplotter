@@ -1,0 +1,24 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "pathplotter-relay",
+  "main": "src/index.ts",
+  "compatibility_date": "2026-10-11",
+  "observability": {
+    "enabled": true,
+    "traces": {
+      "enabled": true,
+    },
+  },
+  "durable_objects": {
+    "bindings": [
+      { "name": "RELAYS", "class_name": "RelayDO" },
+      { "name": "CONTROL_PLANE", "class_name": "ControlPlaneDO" },
+    ],
+  },
+  "migrations": [
+    {
+      "tag": "v1",
+      "new_sqlite_classes": ["RelayDO", "ControlPlaneDO"],
+    },
+  ],
+}

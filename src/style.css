@@ -77,6 +77,7 @@ button:disabled { opacity: 0.45; cursor: not-allowed; }
 #plot .geometry { fill: none; }
 #plot .geometry * { vector-effect: non-scaling-stroke; stroke-width: 1.4; }
 #plot .head-marker { fill: none; stroke: #db4242; stroke-width: 1.5; }
+#plot .head-marker.settled { stroke: #000; }
 #plot .rulers { font-size: 11px; fill: #647285; font-variant-numeric: tabular-nums; }
 .export-bar { padding: 0 2px; }
 .export-bar > .hint { margin-right: auto; }

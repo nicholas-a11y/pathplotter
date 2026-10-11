@@ -1,0 +1,18 @@
+{
+  "name": "pathplotter-relay",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "scripts": {
+    "types": "wrangler types",
+    "check": "wrangler types && tsc --noEmit",
+    "test": "vitest run",
+    "dev": "wrangler dev --local"
+  },
+  "devDependencies": {
+    "@cloudflare/vitest-plugin": "latest",
+    "typescript": "latest",
+    "vitest": "latest",
+    "wrangler": "latest"
+  }
+}
