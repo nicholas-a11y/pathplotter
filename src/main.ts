@@ -6,6 +6,7 @@ import { RelayClient, RelayRequestError, loadIdentity, saveIdentity, browserLink
 import { appendCollectionPrimitives, primitiveBounds, hasEnoughPoints, serializeSvg, buildDelta, fmt, type BuiltSvg, type Primitive } from './geometry'
 import { LIVE_QUEUE_LIMIT, emptyLiveQueue, makeUpdate, enqueue, recordOutcome, parseLiveQueue, type LiveUpdate, type ImportTarget, type LiveQueue } from './live-updates'
 import { openImportStream, type ImportResult } from './import-stream'
+import { LiveHandover, HANDOVER_TIMEOUT_MS, type LiveHandoverState } from './live-handover'
 
 interface LivePosition {
   x: number
@@ -221,6 +222,10 @@ let liveTarget: ImportTarget | null = null
 let liveDispatching = false
 let liveRecoveryInFlight = false
 let releaseLiveLock: (() => void) | null = null
+let liveLockReleased: Promise<void> = Promise.resolve()
+let handoverStopping = false
+let handoverPending = false
+let liveTransferred = false
 let otherTabOwnsLive = captureGroups(state).some(group => group.liveLocked) || !!state.liveQueue?.items.length
 let localContextRevision: string | null = null
 if (state.liveQueue?.items.length) state.liveQueue.paused = 'Saved updates found. Check the last import, then explicitly resume or abandon.'
@@ -241,14 +246,7 @@ let pairingEpoch = 0
 const PENDING_IMPORT_KEY = 'pathplotter.relay.pending-import.v1'
 let pendingImport: { id: string; relayId: string } | null = null
 try {
-  const raw = localStorage.getItem(PENDING_IMPORT_KEY)
-  if (raw) {
-    const saved: unknown = JSON.parse(raw)
-    if (!isRecord(saved) || typeof saved.id !== 'string' || typeof saved.relayId !== 'string') {
-      throw new Error('Saved relay import journal is invalid. Do not send until you verify the last import in RAP.')
-    }
-    pendingImport = { id: saved.id, relayId: saved.relayId }
-  }
+  reloadPendingImport()
 } catch (error) {
   pendingImport = { id: 'unreadable-journal', relayId: '' }
   setExportStatus(errorToMessage(error))
@@ -263,19 +261,128 @@ async function acquireLiveLock(): Promise<void> {
   if (releaseLiveLock) return
   if (!navigator.locks) throw new Error('This browser cannot safely lock live updates across tabs. Use a browser with Web Locks support.')
   await new Promise<void>((resolve, reject) => {
-    void navigator.locks.request('pathplotter-live-update', { ifAvailable: true }, async lock => {
+    liveLockReleased = navigator.locks.request('pathplotter-live-update', { ifAvailable: true }, async lock => {
       if (!lock) { reject(new Error('Another PathPlotter tab owns Live update. Close or reconcile it first.')); return }
       await new Promise<void>(release => { releaseLiveLock = release; resolve() })
       releaseLiveLock = null
     }).catch(reject)
   })
 }
+const liveHandover = typeof BroadcastChannel === 'undefined' ? null :
+  new LiveHandover(new BroadcastChannel('pathplotter-live-handover'), crypto.randomUUID(),
+    () => releaseLiveLock !== null, relinquishLiveOwnership)
+window.addEventListener('pagehide', () => { liveHandover?.close(); releaseLiveLock?.() })
+window.addEventListener('pageshow', event => {
+  // A cached document's channel and lock were released; rebuild from the saved journal.
+  if (event.persisted) location.reload()
+})
+
+async function relinquishLiveOwnership(): Promise<LiveHandoverState | null> {
+  if (!releaseLiveLock) return null
+  handoverStopping = true
+  const enabled = liveEnabled
+  setStatus('Another tab requested Live update. Finishing the current operation before transferring.')
+  renderControls()
+  try {
+    const deadline = performance.now() + HANDOVER_TIMEOUT_MS - 2000
+    while (requestInFlight || uploadInFlight || liveDispatching || liveRecoveryInFlight) {
+      if (performance.now() >= deadline) throw new Error('Current operation has not settled. Live update remains stopped; inspect LightBurn before trying again.')
+      await new Promise(resolve => window.setTimeout(resolve, 100))
+    }
+    if (savedStateError) throw new Error(savedStateError)
+    const target = liveTarget ?? liveQueue().items[0]?.target ?? null
+    if (enabled && !target) throw new Error('Live destination is missing. Reconcile this tab before transferring.')
+    const next = structuredClone(state)
+    liveEnabled = false
+    commitCollection(next)
+    liveTransferred = true
+    otherTabOwnsLive = true
+    releaseLiveLock?.()
+    await liveLockReleased
+    setStatus('Live update transferred to another tab. This tab is read-only; use Pair to take ownership back.')
+    return { enabled, target }
+  } catch (error) {
+    liveEnabled = false
+    const next = structuredClone(state)
+    next.liveQueue ??= emptyLiveQueue()
+    next.liveQueue.paused ||= errorToMessage(error)
+    try { commitCollection(next) }
+    catch (saveError) { setStatus(`Cannot save stopped live work: ${errorToMessage(saveError)}`) }
+    throw error
+  } finally { handoverStopping = false; renderControls() }
+}
+
+function reloadPendingImport(): void {
+  const raw = localStorage.getItem(PENDING_IMPORT_KEY)
+  if (!raw) { pendingImport = null; return }
+  const value: unknown = JSON.parse(raw)
+  if (!isRecord(value) || typeof value.id !== 'string' || typeof value.relayId !== 'string') {
+    throw new Error('Saved relay import journal is invalid. Inspect LightBurn before continuing.')
+  }
+  pendingImport = { id: value.id, relayId: value.relayId }
+}
+
+async function takeLiveOwnership(): Promise<boolean> {
+  if (handoverPending || handoverStopping) throw new Error('A live ownership transfer is already pending.')
+  if (releaseLiveLock) return false
+  if (!navigator.locks) throw new Error('Web Locks support is required for safe live ownership.')
+  const locks = await navigator.locks.query()
+  const occupied = locks.held?.some(lock => lock.name === 'pathplotter-live-update') ?? false
+  if (!occupied && !liveTransferred) return false
+  if (occupied) otherTabOwnsLive = true
+  handoverPending = true
+  renderControls()
+  try {
+    let transferred: LiveHandoverState | null = null
+    if (occupied) {
+      if (!liveHandover) throw new Error('This browser cannot request a safe handover. Close the old tab and reconcile saved work.')
+      setStatus('Requesting Live update ownership; waiting for the other tab’s current import.')
+      transferred = await liveHandover.request()
+    }
+    await acquireLiveLock()
+    state = loadState()
+    if (savedStateError) throw new Error(savedStateError)
+    reloadPendingImport()
+    otherTabOwnsLive = false
+    liveTransferred = false
+    const target = transferred?.target ?? liveQueue().items[0]?.target ?? null
+    if (target) {
+      if (mode === 'relay') {
+        if (!await takeCaptureControl()) throw new Error('Live ownership acquired, but capture control is unavailable. Saved updates remain paused.')
+      }
+      await verifyImportTarget(target)
+    }
+    liveTarget = target
+    const queue = liveQueue()
+    if (pendingImport || queue.paused || queue.items.some(item => item.phase !== 'queued')) {
+      liveEnabled = false
+      state.liveQueue ??= emptyLiveQueue()
+      state.liveQueue.paused ||= 'Ownership transferred. Check or acknowledge the previous import before resuming.'
+      commitCollection(structuredClone(state))
+      setStatus('Live ownership transferred. Saved work needs reconciliation before sending can continue.')
+    } else {
+      liveEnabled = transferred?.enabled === true
+      commitCollection(structuredClone(state))
+      setStatus(liveEnabled ? 'Live update transferred and continuing in this tab.' : 'Live ownership transferred to this tab.')
+    }
+    return true
+  } catch (error) {
+    if (releaseLiveLock) {
+      liveEnabled = false
+      const next = structuredClone(state)
+      next.liveQueue ??= emptyLiveQueue()
+      next.liveQueue.paused ||= errorToMessage(error)
+      commitCollection(next)
+    }
+    throw error
+  } finally { handoverPending = false; renderAll(); void drainLiveQueue() }
+}
 function liveOwnsWork(): boolean { return otherTabOwnsLive || liveEnabled || liveQueue().items.length > 0 || !!liveQueue().paused }
 function liveCaptureBlocked(): boolean {
-  return otherTabOwnsLive || liveRecoveryInFlight || !!liveQueue().paused || (liveEnabled && liveQueue().items.length >= LIVE_QUEUE_LIMIT)
+  return otherTabOwnsLive || handoverStopping || handoverPending || liveRecoveryInFlight || !!liveQueue().paused || (liveEnabled && liveQueue().items.length >= LIVE_QUEUE_LIMIT)
 }
 function liveFinishBlocked(): boolean {
-  if (otherTabOwnsLive || liveRecoveryInFlight || liveQueue().paused) return true
+  if (otherTabOwnsLive || handoverStopping || handoverPending || liveRecoveryInFlight || liveQueue().paused) return true
   return liveEnabled && liveQueue().items.length >= LIVE_QUEUE_LIMIT && !state.finished && !!buildDelta(state, 'finish')
 }
 function unlockLiveGroups(next: Collection): void {
@@ -313,6 +420,11 @@ async function verifyImportTarget(target: ImportTarget): Promise<void> {
 
 must<HTMLInputElement>('liveUpdateToggle').addEventListener('change', async event => {
   const toggle = event.currentTarget as HTMLInputElement
+  if (toggle.checked) {
+    try {
+      if (await takeLiveOwnership()) return
+    } catch (error) { setStatus(errorToMessage(error)); toggle.checked = liveEnabled; return }
+  }
   if (!toggle.checked) {
     liveEnabled = false
     const next = structuredClone(state)
@@ -341,13 +453,13 @@ must<HTMLInputElement>('liveUpdateToggle').addEventListener('change', async even
 })
 
 async function drainLiveQueue(): Promise<void> {
-  if (liveRecoveryInFlight || liveDispatching || uploadInFlight || liveQueue().paused || !liveQueue().items.length) return
+  if (otherTabOwnsLive || handoverStopping || handoverPending || liveRecoveryInFlight || liveDispatching || uploadInFlight || liveQueue().paused || !liveQueue().items.length) return
   liveDispatching = true
   uploadInFlight = true
   renderControls()
   try {
     await acquireLiveLock()
-    while (liveQueue().items.length && !liveQueue().paused) {
+    while (liveQueue().items.length && !liveQueue().paused && !handoverStopping && !otherTabOwnsLive) {
       const update = liveQueue().items[0]!
       if (update.phase !== 'queued') throw new Error('Check and reconcile the submitted live import before continuing.')
       const result = await submitImport(update, () => {
@@ -364,6 +476,11 @@ async function drainLiveQueue(): Promise<void> {
       commitCollection(next)
     }
   } catch (error) {
+    if (!releaseLiveLock) {
+      otherTabOwnsLive = true
+      setStatus(`Live update stopped: ${errorToMessage(error)}`)
+      return
+    }
     const next = structuredClone(state)
     next.liveQueue ??= emptyLiveQueue()
     next.liveQueue.paused = errorToMessage(error)
@@ -454,16 +571,17 @@ must<HTMLButtonElement>('liveAbandonBtn').addEventListener('click', async () => 
 })
 window.addEventListener('storage', async event => {
   if (event.key !== STORAGE_KEY) return
+  if (releaseLiveLock || handoverPending) return
   liveEnabled = false
   otherTabOwnsLive = true
   renderControls()
   try {
     if (liveDispatching) throw new Error('Saved live state changed in another tab during import. Inspect LightBurn; do not resend.')
     const locks = await navigator.locks?.query()
-    otherTabOwnsLive = locks?.held?.some(lock => lock.name === 'pathplotter-live-update') ?? false
+    otherTabOwnsLive = liveTransferred || (locks?.held?.some(lock => lock.name === 'pathplotter-live-update') ?? false)
     state = loadState()
     if (state.liveQueue?.items.length) state.liveQueue.paused = 'Saved state changed in another tab. Check the import before resuming.'
-    if (otherTabOwnsLive) setStatus('Another tab owns Live update. Use that tab until it finishes or closes.')
+    if (otherTabOwnsLive) setStatus('Another tab owns Live update. Use Pair or enable Live update here to request a safe transfer.')
     renderAll()
   } catch (error) { setStatus(errorToMessage(error)) }
 })
@@ -490,7 +608,7 @@ function relayChanged(): void {
   if (mode !== 'relay') return
   const snapshot = relay?.snapshot
   const fresh = relay?.canCapture() === true
-  if ((liveEnabled || (liveQueue().items.length > 0 && !liveQueue().paused)) && relay?.controlError && !relay.activeBrowser) {
+  if (!otherTabOwnsLive && !handoverPending && (liveEnabled || (liveQueue().items.length > 0 && !liveQueue().paused)) && relay?.controlError && !relay.activeBrowser) {
     liveEnabled = false
     const next = structuredClone(state)
     next.liveQueue ??= emptyLiveQueue()
@@ -557,7 +675,9 @@ async function connectBrowserLink(link: BrowserLink, requestControl = false): Pr
     if (matching && (liveOwnsWork() || uploadInFlight || pendingImport)) {
       if (existing && !relay) attachRelay(existing)
       message.textContent = 'Saved RAP connection retained. Reconcile pending live work before starting new captures.'
-      if (requestControl) await takeCaptureControl()
+      setStatus(message.textContent)
+      must<HTMLDialogElement>('connectionDialog').close()
+      if (requestControl && !await takeLiveOwnership()) await takeCaptureControl()
       return
     }
     const identity = await exchangeBrowserLink(link, existing, text => { message.textContent = text; setStatus(text) }, () => epoch === pairingEpoch)
@@ -589,7 +709,8 @@ must<HTMLButtonElement>('pairRelayBtn').addEventListener('click', async () => {
     const token = must<HTMLInputElement>('relayInvitation').value.trim()
     if (relay && relay.identity.baseUrl === baseUrl && relay.identity.relayId === relayId && !token) {
       button.disabled = true
-      await takeCaptureControl()
+      must<HTMLDialogElement>('connectionDialog').close()
+      if (!await takeLiveOwnership()) await takeCaptureControl()
       return
     }
     if (!relayId || !token) throw new Error('Enter a relay ID and invitation, or open the link from RAP.')
@@ -702,13 +823,13 @@ for (const input of [baseUrlInput, secretInput, appNameInput]) {
 
 if (navigator.locks) {
   void navigator.locks.query().then(locks => {
-    otherTabOwnsLive = locks.held?.some(lock => lock.name === 'pathplotter-live-update') ?? false
+    otherTabOwnsLive = liveTransferred || (locks.held?.some(lock => lock.name === 'pathplotter-live-update') ?? false)
     if (!otherTabOwnsLive) unlockLiveGroups(state)
     renderAll()
   }).catch(error => { otherTabOwnsLive = true; setStatus(`Cannot determine Live update ownership: ${errorToMessage(error)}`); renderControls() })
 }
 window.setInterval(() => {
-  if (!otherTabOwnsLive || !navigator.locks) return
+  if (!otherTabOwnsLive || liveTransferred || handoverPending || !navigator.locks) return
   void navigator.locks.query().then(locks => {
     if (!locks.held?.some(lock => lock.name === 'pathplotter-live-update')) {
       otherTabOwnsLive = false
@@ -723,7 +844,13 @@ function consumePairingLink(): boolean {
   const link = browserLink(location.hash)
   if (link) {
     history.replaceState(null, '', location.pathname + location.search)
-    if (mode !== 'relay' && (liveOwnsWork() || uploadInFlight || pendingImport)) throw new Error('Reconcile existing work before changing connection mode.')
+    const saved = loadIdentity()
+    const sameSavedWorkspace = otherTabOwnsLive && !releaseLiveLock &&
+      saved?.baseUrl === link.baseUrl && saved.relayId === link.relayId &&
+      state.coordinateContext?.startsWith(`${link.relayId}:`) === true
+    if (mode !== 'relay' && !sameSavedWorkspace && (liveOwnsWork() || uploadInFlight || pendingImport)) {
+      throw new Error('Reconcile existing work before changing connection mode.')
+    }
     mode = 'relay'
     modeInput.value = mode
     must<HTMLInputElement>('relayUrl').value = link.baseUrl
@@ -1463,7 +1590,7 @@ function renderAll(): void {
 }
 
 function renderControls(): void {
-  const busy = otherTabOwnsLive || requestInFlight || (uploadInFlight && !liveDispatching)
+  const busy = otherTabOwnsLive || handoverStopping || handoverPending || requestInFlight || (uploadInFlight && !liveDispatching)
   must<HTMLSpanElement>('collectionSummary').textContent =
     `${state.type} · ${allPoints(state).length} points · ${state.groups.length} finished groups`
   const relayReady = mode !== 'relay' || relay?.canCapture() === true
@@ -1482,15 +1609,15 @@ function renderControls(): void {
   must<HTMLButtonElement>('downloadSvgBtn').disabled = busy || !hasExportGeometry()
   const queue = liveQueue()
   if (!requestInFlight) must<HTMLInputElement>('liveUpdateToggle').checked = liveEnabled
-  must<HTMLInputElement>('liveUpdateToggle').disabled = requestInFlight || (!liveEnabled && (uploadInFlight || !!queue.items.length || !!queue.paused))
-  must<HTMLElement>('liveUpdateStatus').textContent = otherTabOwnsLive ? 'Another tab owns Live update. Use that tab or wait for it to close.' : queue.paused ? `Paused: ${queue.paused} · ${queue.items.length} pending` :
+  must<HTMLInputElement>('liveUpdateToggle').disabled = handoverPending || handoverStopping || requestInFlight || (!otherTabOwnsLive && !liveEnabled && (uploadInFlight || !!queue.items.length || !!queue.paused))
+  must<HTMLElement>('liveUpdateStatus').textContent = handoverPending ? 'Waiting for safe Live update transfer…' : handoverStopping ? 'Stopping for safe transfer…' : otherTabOwnsLive ? 'Another tab owns Live update. Use Pair or enable Live update here to take over safely.' : queue.paused ? `Paused: ${queue.paused} · ${queue.items.length} pending` :
     `${liveEnabled ? 'On' : queue.items.length ? 'Off · draining' : 'Off'} · ${queue.items.length}/${LIVE_QUEUE_LIMIT} pending · ${queue.confirmed} confirmed${queue.items.length >= LIVE_QUEUE_LIMIT ? ' · Queue full; wait for imports' : ''}`
   const head = queue.items[0]
   must<HTMLButtonElement>('liveCheckBtn').hidden = !queue.paused || !head || head.phase === 'queued'
   must<HTMLButtonElement>('liveReconcileBtn').hidden = !queue.paused || !head || head.phase === 'queued'
   must<HTMLButtonElement>('liveResumeBtn').hidden = !queue.paused || !!(head && head.phase !== 'queued') || !!savedStateError
   must<HTMLButtonElement>('liveAbandonBtn').hidden = !queue.paused && !queue.items.length
-  for (const id of ['liveCheckBtn', 'liveReconcileBtn', 'liveResumeBtn', 'liveAbandonBtn']) must<HTMLButtonElement>(id).disabled = liveRecoveryInFlight || liveDispatching || requestInFlight
+  for (const id of ['liveCheckBtn', 'liveReconcileBtn', 'liveResumeBtn', 'liveAbandonBtn']) must<HTMLButtonElement>(id).disabled = otherTabOwnsLive || handoverPending || handoverStopping || liveRecoveryInFlight || liveDispatching || requestInFlight
   must<HTMLInputElement>('loadSessionInput').disabled = busy || liveOwnsWork()
   baseUrlInput.disabled = liveEnabled || liveDispatching
   secretInput.disabled = liveEnabled || liveDispatching
