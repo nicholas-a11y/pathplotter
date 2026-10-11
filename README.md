@@ -37,6 +37,7 @@ The old tab stays open but read-only with Live update off; browsers cannot relia
 - The live crosshair turns black after three consecutive distinct fresh readings have exactly the same X/Y. It turns red on a coordinate change; stale/disconnected data clears this indication. Repeated receipt of the same relay sequence does not count. Black means stable reported coordinates, not proof that the machine has physically stopped.
 - Errors, browser background/resume and disconnected relays disable capture until fresh data arrives.
 - Existing/imported points from an unknown or different relay workspace cannot be mixed or sent silently. Clear them or use **Confirm workspace for existing points** after checking the machine and workpiece origin.
+- Capture status reflects saved-work and workspace guards as well as relay readiness. A disabled Capture point button shows its blocking reason and next step; successful pairing does not bypass workspace confirmation.
 - SVG download remains available without a relay connection.
 
 ### Import uncertainty

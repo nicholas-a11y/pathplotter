@@ -63,6 +63,7 @@ app.innerHTML = `
   </section>
   <div class="workspace-status">
     <p id="statusText" role="status">Ready. Connect to LightBurn to capture.</p>
+    <p id="captureBlockHint" role="status" hidden></p>
     <p id="liveText">No head position available.</p>
   </div>
   <section class="plot-shell" aria-label="Workpiece workspace">
@@ -685,8 +686,8 @@ async function connectBrowserLink(link: BrowserLink, requestControl = false): Pr
     saveIdentity(identity)
     attachRelay(identity)
     must<HTMLInputElement>('relayInvitation').value = ''
-    message.textContent = 'Connected. Capture control is acquired automatically when free.'
-    setStatus('Connected to RAP. Capture becomes available automatically when control is free.')
+    message.textContent = 'Connected to RAP. See the capture status for any remaining steps.'
+    setStatus('Connected to RAP.')
     if (requestControl) {
       const client = relay
       const deadline = performance.now() + 10000
@@ -1589,6 +1590,24 @@ function renderAll(): void {
   renderPlot()
 }
 
+function captureBlockReason(): { label: string; hint: string } | null {
+  if (handoverPending || handoverStopping) return { label: 'Transferring live control', hint: 'Wait for the current operation and safe tab handover to finish.' }
+  if (otherTabOwnsLive) return { label: 'Another tab owns Live update', hint: 'Click Pair or enable Live update here to request a safe transfer.' }
+  if (requestInFlight || (uploadInFlight && !liveDispatching) || liveRecoveryInFlight) return { label: 'Operation in progress', hint: 'Wait for the current capture, import or recovery operation to finish.' }
+  if (liveQueue().paused) return { label: 'Live update paused', hint: liveQueue().paused }
+  if (mode === 'relay' && !relay?.canCapture()) return {
+    label: relay?.hasFreshPosition() ? 'Read-only · Take control' : 'Capture unavailable',
+    hint: relay?.error || relay?.controlError || (relay?.hasFreshPosition() ? 'Click Pair in Connection to request capture control.' : 'Waiting for a fresh RAP workpiece position and capture control.'),
+  }
+  if (mode === 'relay' && allPoints(state).length && state.coordinateContext !== contextKey()) return {
+    label: 'Workspace confirmation needed',
+    hint: 'Saved points belong to an unknown or different workspace. If they belong to this machine and workpiece origin, open Connection > Advanced / recovery > Confirm workspace for existing points. Otherwise save your session, then clear the old points.',
+  }
+  if (state.finished) return { label: 'Capture finished', hint: 'Click Resume to start the next capture group.' }
+  if (liveEnabled && liveQueue().items.length >= LIVE_QUEUE_LIMIT) return { label: 'Live queue full', hint: 'Wait for pending imports before capturing another point.' }
+  return null
+}
+
 function renderControls(): void {
   const busy = otherTabOwnsLive || handoverStopping || handoverPending || requestInFlight || (uploadInFlight && !liveDispatching)
   must<HTMLSpanElement>('collectionSummary').textContent =
@@ -1597,13 +1616,21 @@ function renderControls(): void {
   must<HTMLButtonElement>('quickControlBtn').hidden = mode !== 'relay' || !relay || relay.activeBrowser
   must<HTMLButtonElement>('quickControlBtn').disabled = busy || uploadInFlight || !relay?.hasFreshPosition()
   const contextMatches = mode !== 'relay' || !allPoints(state).length || state.coordinateContext === contextKey()
-  must<HTMLButtonElement>('captureBtn').disabled = busy || state.finished || !relayReady || !contextMatches || liveCaptureBlocked()
+  const captureBlock = captureBlockReason()
+  must<HTMLButtonElement>('captureBtn').disabled = captureBlock !== null
+  const captureHint = must<HTMLParagraphElement>('captureBlockHint')
+  captureHint.hidden = !captureBlock
+  captureHint.textContent = captureBlock?.hint ?? ''
+  if (mode === 'relay') {
+    connectionStateEl.textContent = captureBlock?.label ?? 'Ready to capture'
+    connectionStateEl.classList.toggle('ok', !captureBlock)
+  }
   must<HTMLButtonElement>('finishBtn').textContent = state.finished ? 'Resume' : 'Finish'
   must<HTMLButtonElement>('finishBtn').disabled = busy || liveFinishBlocked() || (!state.finished && !hasEnoughPoints(state))
   must<HTMLButtonElement>('undoBtn').disabled = busy || !!state.liveLocked || state.points.length === 0
   must<HTMLButtonElement>('clearBtn').disabled = busy || liveOwnsWork() || allPoints(state).length === 0
   must<HTMLButtonElement>('settingsBtn').disabled = busy || !!savedStateError || !!(state.liveLocked && state.points.length)
-  must<HTMLButtonElement>('pointsBtn').disabled = busy
+  must<HTMLButtonElement>('pointsBtn').disabled = busy || allPoints(state).length === 0
   must<HTMLButtonElement>('sendBtn').disabled = busy || uploadInFlight || liveOwnsWork() || !hasExportGeometry() || !relayReady || !contextMatches ||
     (mode === 'relay' && pendingImport !== null)
   must<HTMLButtonElement>('downloadSvgBtn').disabled = busy || !hasExportGeometry()
