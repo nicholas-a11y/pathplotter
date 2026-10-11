@@ -1,33 +1,8 @@
 import './style.css'
+import { captureGroups, allPoints, finishCapture, type Collection, type CaptureGroup, type Point, type ShapeType } from './capture-groups'
+import { layerPalette, isLayerColor } from './layer-palette'
 import { SettledPosition } from './settled-position'
 import { RelayClient, loadIdentity, saveIdentity, pairingInvitation, relayRequest, relayBaseUrl, parseJob } from './relay'
-
-type ShapeType = 'circles' | 'polyline' | 'polygon'
-
-interface Point {
-  id: string
-  name: string
-  x: number
-  y: number
-  labelOffsetX: number
-  labelOffsetY: number
-}
-
-interface Collection {
-  coordinateContext?: string
-  name: string
-  type: ShapeType
-  points: Point[]
-  finished: boolean
-  strokeColor: string
-  circleDiameterMm: number
-  showNumbers: boolean
-  showNames: boolean
-  labelColor: string
-  labelHeightMm: number
-  labelOffsetX: number
-  labelOffsetY: number
-}
 
 interface LivePosition {
   x: number
@@ -53,8 +28,22 @@ interface CirclePrimitive {
 type Primitive = PolylinePrimitive | CirclePrimitive
 
 const CAPABILITIES = ['state', 'project', 'upload']
-const STORAGE_KEY = 'pathplotter.collection.v2'
+const STORAGE_KEY = 'pathplotter.collection.v3'
 const STROKE_WIDTH_MM = 0.2
+
+function colorPicker(inputId: string, label: string): string {
+  return `<div class="color-picker-field">
+    <span>${label}</span>
+    <input id="${inputId}" type="hidden" />
+    <details class="color-picker" data-color-input="${inputId}">
+      <summary aria-label="${label} picker"><span class="selected-color-swatch"></span><span class="selected-color-label"></span></summary>
+      <div class="layer-palette" role="group" aria-label="${label} LightBurn colours">
+        ${layerPalette.map(entry => `<button type="button" data-layer-color="${entry.color}" aria-label="Layer ${entry.label}, ${entry.color}" aria-pressed="false" title="Layer ${entry.label} · ${entry.color}" style="background:${entry.color};color:${entry.textColor}">${entry.label}</button>`).join('')}
+      </div>
+    </details>
+    <p class="color-picker-message hint" role="status"></p>
+  </div>`
+}
 
 const glyphStrokes: Record<string, string[]> = {
   A: ['0,1 0.5,0 1,1', '0.2,0.6 0.8,0.6'],
@@ -191,9 +180,6 @@ app.innerHTML = `
         <button type="button" data-close="settingsDialog">Cancel</button>
       </header>
       <div class="form-grid">
-      <label>Name (optional)
-        <input id="collectionName" type="text" placeholder="Leave blank for an unnamed collection" />
-      </label>
       <label>Shape
         <select id="shapeType">
           <option value="circles">Circles (one circle per point)</option>
@@ -201,7 +187,7 @@ app.innerHTML = `
           <option value="polygon">Polygon (closed path)</option>
         </select>
       </label>
-      <label>Geometry colour<input id="strokeColor" type="color" /></label>
+      ${colorPicker('strokeColor', 'Geometry colour')}
       <label id="diameterField">Circle diameter (mm)<input id="circleDiameterMm" type="number" min="0.01" step="any" required /></label>
       </div>
       <fieldset>
@@ -211,13 +197,13 @@ app.innerHTML = `
           <label class="check"><input id="showNames" type="checkbox" /> Point names</label>
         </div>
         <div class="form-grid">
-          <label>Label colour<input id="labelColor" type="color" /></label>
+          ${colorPicker('labelColor', 'Label colour')}
           <label>Label height (mm)<input id="labelHeightMm" type="number" min="0.2" step="any" required /></label>
           <label>Label offset X (mm)<input id="labelOffsetX" type="number" step="any" required /></label>
           <label>Label offset Y (mm)<input id="labelOffsetY" type="number" step="any" required /></label>
         </div>
       </fieldset>
-      <p class="hint">Space captures; Enter finishes. Shortcuts only work outside dialogs and text fields. Finishing a polygon joins the last point to the first.</p>
+      <p class="hint">Finish locks the current group's shape and settings. Resume starts a new group using these settings. Finished points remain editable. Space captures; Enter finishes outside dialogs and text fields.</p>
       <button type="submit" class="primary">Apply settings</button>
     </form>
   </dialog>
@@ -231,6 +217,7 @@ app.innerHTML = `
       <table>
         <thead>
           <tr>
+            <th>Group</th>
             <th>#</th>
             <th>Name</th>
             <th>X (mm)</th>
@@ -251,7 +238,7 @@ app.innerHTML = `
       <h2 id="sessionTitle">Session backup</h2>
       <button data-close="sessionDialog">Close</button>
     </header>
-    <p class="hint">This collection is saved in this browser. Session files contain points and settings, never the API secret. Old multi-set session files are not supported.</p>
+    <p class="hint">All finished groups and the current capture are saved in this browser. Session files contain points and settings, never pairing credentials. Version 2 single-collection backups can also be imported.</p>
     <div class="row">
       <button id="saveSessionBtn" class="secondary">Export session JSON</button>
       <label>Import collection JSON<input id="loadSessionInput" type="file" accept="application/json" /></label>
@@ -352,7 +339,7 @@ function requireRelayContext(): string {
   if (!relay?.canCapture()) throw new Error('Cannot capture/send: RAP is offline, the sample is over 2 seconds old, or this browser has no control.')
   const key = contextKey()
   if (!key) throw new Error('Workspace context is unavailable.')
-  if (state.points.length && state.coordinateContext !== key) {
+  if (allPoints(state).length && state.coordinateContext !== key) {
     throw new Error('Existing points belong to an unknown or different workspace. Clear them, or explicitly confirm the workspace in Connection.')
   }
   return key
@@ -535,20 +522,52 @@ document.querySelectorAll<HTMLButtonElement>('[data-close]').forEach(button => {
   button.addEventListener('click', () => must<HTMLDialogElement>(button.dataset.close!).close())
 })
 must<HTMLSelectElement>('shapeType').addEventListener('change', updateDiameterVisibility)
+document.querySelectorAll<HTMLDetailsElement>('.color-picker').forEach(picker => {
+  picker.addEventListener('click', event => {
+    const target = event.target
+    if (!(target instanceof HTMLButtonElement) || !target.dataset.layerColor || !picker.dataset.colorInput) return
+    must<HTMLInputElement>(picker.dataset.colorInput).value = target.dataset.layerColor
+    renderPaletteSelection()
+    picker.open = false
+    picker.querySelector('summary')?.focus()
+  })
+  picker.addEventListener('toggle', () => {
+    if (picker.open) document.querySelectorAll<HTMLDetailsElement>('.color-picker').forEach(other => {
+      if (other !== picker) other.open = false
+    })
+  })
+})
+
+function renderPaletteSelection(): void {
+  document.querySelectorAll<HTMLDetailsElement>('.color-picker').forEach(picker => {
+    const color = must<HTMLInputElement>(picker.dataset.colorInput!).value.toLowerCase()
+    picker.querySelectorAll<HTMLButtonElement>('button').forEach(button => {
+      button.setAttribute('aria-pressed', String(button.dataset.layerColor === color))
+    })
+    const entry = layerPalette.find(layer => layer.color === color)
+    picker.querySelector<HTMLElement>('.selected-color-swatch')!.style.background = color
+    picker.querySelector<HTMLElement>('.selected-color-label')!.textContent = entry ? `Layer ${entry.label}` : color
+    picker.parentElement!.querySelector<HTMLElement>('.color-picker-message')!.textContent = entry ? '' :
+      'Existing custom colour. Choose a LightBurn colour before applying settings.'
+  })
+}
 must<HTMLFormElement>('settingsForm').addEventListener('submit', event => {
   event.preventDefault()
-  const name = must<HTMLInputElement>('collectionName').value.trim()
   const type = must<HTMLSelectElement>('shapeType').value as ShapeType
   const diameter = must<HTMLInputElement>('circleDiameterMm').valueAsNumber
   const height = must<HTMLInputElement>('labelHeightMm').valueAsNumber
   const offsetX = must<HTMLInputElement>('labelOffsetX').valueAsNumber
   const offsetY = must<HTMLInputElement>('labelOffsetY').valueAsNumber
+  if (!isLayerColor(must<HTMLInputElement>('strokeColor').value) || !isLayerColor(must<HTMLInputElement>('labelColor').value)) {
+    setStatus('Choose Geometry and Label colours from the LightBurn layer palette before applying settings.')
+    return
+  }
   if (![diameter, height, offsetX, offsetY].every(Number.isFinite) || diameter <= 0 || height < 0.2) {
     setStatus('Enter valid numeric capture settings.')
     return
   }
   Object.assign(state, {
-    name, type,
+    type,
     strokeColor: must<HTMLInputElement>('strokeColor').value,
     circleDiameterMm: diameter,
     showNumbers: must<HTMLInputElement>('showNumbers').checked,
@@ -558,21 +577,19 @@ must<HTMLFormElement>('settingsForm').addEventListener('submit', event => {
     labelOffsetX: offsetX,
     labelOffsetY: offsetY,
   })
-  if (!hasEnoughPoints(state)) {
-    state.finished = false
-  }
   persistAndRender()
   must<HTMLDialogElement>('settingsDialog').close()
 })
 
 function populateSettings(): void {
-  must<HTMLInputElement>('collectionName').value = state.name
   must<HTMLSelectElement>('shapeType').value = state.type
   for (const key of ['strokeColor', 'circleDiameterMm', 'labelColor', 'labelHeightMm', 'labelOffsetX', 'labelOffsetY'] as const) {
     must<HTMLInputElement>(key).value = String(state[key])
   }
   must<HTMLInputElement>('showNumbers').checked = state.showNumbers
   must<HTMLInputElement>('showNames').checked = state.showNames
+  renderPaletteSelection()
+  document.querySelectorAll<HTMLDetailsElement>('.color-picker').forEach(picker => { picker.open = false })
   updateDiameterVisibility()
 }
 
@@ -627,8 +644,9 @@ must<HTMLButtonElement>('connectBtn').addEventListener('click', async () => {
 
 must<HTMLButtonElement>('clearBtn').addEventListener('click', () => {
   if (requestInFlight || uploadInFlight) return
-  if (state.points.length > 0 && !window.confirm('Clear all captured points? Capture settings will be kept.')) return
+  if (allPoints(state).length > 0 && !window.confirm('Clear all captured groups and points? Capture settings will be kept.')) return
   state.points = []
+  state.groups = []
   delete state.coordinateContext
   state.finished = false
   persistAndRender()
@@ -654,9 +672,9 @@ must<HTMLButtonElement>('finishBtn').addEventListener('click', () => {
     setStatus(`Not enough points to finish ${state.type}.`)
     return
   }
-  state.finished = true
+  finishCapture(state)
   persistAndRender()
-  setStatus('Capture finished.')
+  setStatus('Group finished. Change settings if needed, then Resume to capture a new group.')
 })
 
 must<HTMLButtonElement>('undoBtn').addEventListener('click', () => {
@@ -695,7 +713,7 @@ must<HTMLButtonElement>('sendBtn').addEventListener('click', () => {
 
 must<HTMLButtonElement>('saveSessionBtn').addEventListener('click', () => {
   const payload = {
-    version: 2,
+    version: 3,
     exportedAt: new Date().toISOString(),
     state,
   }
@@ -715,9 +733,9 @@ must<HTMLInputElement>('loadSessionInput').addEventListener('change', async even
     const text = await file.text()
     if (requestInFlight || uploadInFlight) throw new Error('Wait for the current request before importing.')
     const parsed = JSON.parse(text) as { version?: unknown; state?: unknown }
-    if (parsed.version !== 2) throw new Error('Only single-collection version 2 session files are supported.')
+    if (parsed.version !== 2 && parsed.version !== 3) throw new Error('Only version 2 or 3 session files are supported.')
     const imported = validateCollection(parsed.state)
-    if (state.points.length > 0 && !window.confirm('Replace the current collection with this session?')) return
+    if (allPoints(state).length > 0 && !window.confirm('Replace all current groups with this session?')) return
     state = imported
     persistAndRender()
     setExportStatus('Session imported.')
@@ -1080,12 +1098,12 @@ function safeJson(text: string): any {
 }
 
 function buildSvgForCollection(): { svg: string; anchor: { x: number; y: number }; unsupportedCharacters: string[] } | null {
-  if (!hasEnoughPoints(state)) {
+  if (!hasExportGeometry()) {
     return null
   }
   const primitives: Primitive[] = []
   const unsupportedCharacters: string[] = []
-  appendCollectionPrimitives(state, primitives, unsupportedCharacters)
+  for (const group of captureGroups(state)) appendCollectionPrimitives(group, primitives, unsupportedCharacters)
   if (primitives.length === 0) {
     return null
   }
@@ -1109,7 +1127,7 @@ function buildSvgForCollection(): { svg: string; anchor: { x: number; y: number 
   return { svg, anchor, unsupportedCharacters }
 }
 
-function appendCollectionPrimitives(set: Collection, primitives: Primitive[], unsupportedCharacters: string[]): void {
+function appendCollectionPrimitives(set: CaptureGroup, primitives: Primitive[], unsupportedCharacters: string[]): void {
   if (!hasEnoughPoints(set)) {
     return
   }
@@ -1218,7 +1236,7 @@ function primitiveBounds(primitives: Primitive[]): { minX: number; minY: number;
   return { minX, minY, maxX, maxY }
 }
 
-function hasEnoughPoints(set: Collection): boolean {
+function hasEnoughPoints(set: CaptureGroup): boolean {
   if (set.type === 'circles') {
     return set.points.length >= 1
   }
@@ -1272,7 +1290,7 @@ function persistAndRender(): void {
 
 function loadState(): Collection {
   try {
-    const raw = window.localStorage.getItem(STORAGE_KEY)
+    const raw = window.localStorage.getItem(STORAGE_KEY) ?? window.localStorage.getItem('pathplotter.collection.v2')
     return raw ? validateCollection(JSON.parse(raw)) : emptyCollection()
   } catch (error) {
     setStatus(`Saved collection could not be loaded: ${errorToMessage(error)}`)
@@ -1282,9 +1300,9 @@ function loadState(): Collection {
 
 function emptyCollection(): Collection {
   return {
-    name: '', type: 'circles', points: [], finished: false,
-    strokeColor: '#2e7dd7', circleDiameterMm: 2,
-    showNumbers: false, showNames: false, labelColor: '#c0392b',
+    name: '', type: 'circles', points: [], groups: [], finished: false,
+    strokeColor: '#000000', circleDiameterMm: 2,
+    showNumbers: false, showNames: false, labelColor: '#ff0000',
     labelHeightMm: 2, labelOffsetX: 1.5, labelOffsetY: -1.5,
   }
 }
@@ -1297,7 +1315,7 @@ function finiteNumber(value: unknown): value is number {
   return typeof value === 'number' && Number.isFinite(value)
 }
 
-function validateCollection(value: unknown): Collection {
+function validateCaptureGroup(value: unknown): CaptureGroup {
   if (!isRecord(value) || !Array.isArray(value.points) ||
       typeof value.name !== 'string' || typeof value.finished !== 'boolean' ||
       !['circles', 'polyline', 'polygon'].includes(String(value.type)) ||
@@ -1322,7 +1340,6 @@ function validateCollection(value: unknown): Collection {
     }
   })
   return {
-    ...(typeof value.coordinateContext === 'string' ? { coordinateContext: value.coordinateContext } : {}),
     name: value.name, type: value.type as ShapeType, points, finished: value.finished,
     strokeColor: value.strokeColor, circleDiameterMm: value.circleDiameterMm,
     showNumbers: value.showNumbers, showNames: value.showNames,
@@ -1331,6 +1348,33 @@ function validateCollection(value: unknown): Collection {
   }
 }
 
+function validateCollection(value: unknown): Collection {
+    const active = validateCaptureGroup(value)
+    if (!isRecord(value) || (value.groups !== undefined && !Array.isArray(value.groups)) ||
+        (value.coordinateContext !== undefined && typeof value.coordinateContext !== 'string')) {
+      throw new Error('Invalid collection groups or coordinate context.')
+    }
+    const groups = Array.isArray(value.groups) ? value.groups.map(validateCaptureGroup) : []
+    if (groups.some(group => !group.finished) || (groups.length > 0 && active.finished && active.points.length > 0)) {
+      throw new Error('Invalid finished capture groups.')
+    }
+    const result: Collection = { ...active, groups,
+      ...(typeof value.coordinateContext === 'string' ? { coordinateContext: value.coordinateContext } : {}) }
+    const ids = new Set<string>()
+    for (const group of captureGroups(result)) {
+      for (const point of group.points) {
+        if (ids.has(point.id)) throw new Error('Duplicate point ID across capture groups.')
+        ids.add(point.id)
+      }
+    }
+    if (value.groups === undefined && result.finished && result.points.length) finishCapture(result)
+    return result
+  }
+
+function hasExportGeometry(): boolean {
+    const groups = captureGroups(state).filter(group => group.points.length > 0)
+    return groups.length > 0 && groups.every(hasEnoughPoints)
+  }
 function isColor(value: unknown): value is string {
   return typeof value === 'string' && /^#[0-9a-f]{6}$/i.test(value)
 }
@@ -1344,30 +1388,30 @@ function renderAll(): void {
 function renderControls(): void {
   const busy = requestInFlight || uploadInFlight
   must<HTMLSpanElement>('collectionSummary').textContent =
-    `${state.name ? `${state.name} · ` : ''}${state.type} · ${state.points.length} points`
+    `${state.type} · ${allPoints(state).length} points · ${state.groups.length} finished groups`
   const relayReady = mode !== 'relay' || relay?.canCapture() === true
-  const contextMatches = mode !== 'relay' || !state.points.length || state.coordinateContext === contextKey()
+  const contextMatches = mode !== 'relay' || !allPoints(state).length || state.coordinateContext === contextKey()
   must<HTMLButtonElement>('captureBtn').disabled = busy || state.finished || !relayReady || !contextMatches
   must<HTMLButtonElement>('finishBtn').textContent = state.finished ? 'Resume' : 'Finish'
   must<HTMLButtonElement>('finishBtn').disabled = busy || (!state.finished && !hasEnoughPoints(state))
   must<HTMLButtonElement>('undoBtn').disabled = busy || state.points.length === 0
-  must<HTMLButtonElement>('clearBtn').disabled = busy || state.points.length === 0
+  must<HTMLButtonElement>('clearBtn').disabled = busy || allPoints(state).length === 0
   must<HTMLButtonElement>('settingsBtn').disabled = busy
   must<HTMLButtonElement>('pointsBtn').disabled = busy
-  must<HTMLButtonElement>('sendBtn').disabled = busy || !hasEnoughPoints(state) || !relayReady || !contextMatches ||
+  must<HTMLButtonElement>('sendBtn').disabled = busy || !hasExportGeometry() || !relayReady || !contextMatches ||
     (mode === 'relay' && pendingImport !== null)
-  must<HTMLButtonElement>('downloadSvgBtn').disabled = busy || !hasEnoughPoints(state)
+  must<HTMLButtonElement>('downloadSvgBtn').disabled = busy || !hasExportGeometry()
 }
 
 function renderEditor(): void {
-  if (state.points.length === 0) {
-    pointsTableEl.innerHTML = '<tr><td colspan="7" class="hint">No points yet.</td></tr>'
+  if (allPoints(state).length === 0) {
+    pointsTableEl.innerHTML = '<tr><td colspan="8" class="hint">No points yet.</td></tr>'
     return
   }
-  pointsTableEl.innerHTML = state.points
-    .map(
+  pointsTableEl.innerHTML = captureGroups(state).map((group, groupIndex) => group.points.map(
       (point, index) => `
       <tr>
+        <td>${groupIndex < state.groups.length ? `${groupIndex + 1} · ${group.type}` : `Current · ${group.type}`}</td>
         <td>${index + 1}</td>
         <td><input aria-label="Point ${index + 1} name" data-point="name" data-id="${escapeHtml(point.id)}" value="${escapeHtml(point.name)}" /></td>
         <td><input aria-label="Point ${index + 1} X" data-point="x" data-id="${escapeHtml(point.id)}" type="number" step="any" value="${point.x}" required /></td>
@@ -1376,7 +1420,7 @@ function renderEditor(): void {
         <td><input aria-label="Point ${index + 1} label offset Y" data-point="labelOffsetY" data-id="${escapeHtml(point.id)}" type="number" step="any" value="${point.labelOffsetY}" required /></td>
         <td><button data-point="delete" data-id="${escapeHtml(point.id)}" class="danger">Delete</button></td>
       </tr>`,
-    )
+    ).join(''))
     .join('')
   pointsTableEl.querySelectorAll<HTMLInputElement>('input[data-point]').forEach(input => {
     input.addEventListener('change', () => {
@@ -1389,8 +1433,11 @@ function renderEditor(): void {
       if (!pointId) {
         return
       }
-      state.points = state.points.filter(point => point.id !== pointId)
-      if (!hasEnoughPoints(state)) state.finished = false
+      for (const group of captureGroups(state)) group.points = group.points.filter(point => point.id !== pointId)
+      state.groups = state.groups.filter(group => group.points.length > 0)
+      if (captureGroups(state).some(group => group.points.length > 0 && !hasEnoughPoints(group))) {
+        setStatus('A group has too few points for its shape. Delete the rest of that group before exporting.')
+      }
       persistAndRender()
     })
   })
@@ -1402,7 +1449,7 @@ function updatePointFromInput(input: HTMLInputElement): void {
   if (!pointId || !key) {
     return
   }
-  const point = state.points.find(entry => entry.id === pointId)
+  const point = allPoints(state).find(entry => entry.id === pointId)
   if (!point) {
     return
   }
@@ -1432,12 +1479,19 @@ function renderPlot(): void {
   const innerWidth = pixelWidth - marginX * 2
   const innerHeight = pixelHeight - marginY * 2
   const primitives: Primitive[] = []
-  appendCollectionPrimitives(state, primitives, [])
+  for (const group of captureGroups(state)) {
+    const start = primitives.length
+    appendCollectionPrimitives(group, primitives, [])
+    if (!group.finished && group.type === 'polygon') {
+      const outline = primitives[start]
+      if (outline?.kind === 'polyline') outline.close = false
+    }
+  }
   let minX = 0
   let minY = 0
   let maxX = workspaceSize?.x ?? 0
   let maxY = workspaceSize?.y ?? 0
-  const locations = [...state.points]
+  const locations = allPoints(state)
   if (livePosition) locations.push({ ...livePosition, id: '', name: '', labelOffsetX: 0, labelOffsetY: 0 })
   for (const point of locations) {
     minX = Math.min(minX, point.x)
@@ -1493,16 +1547,17 @@ function renderPlot(): void {
       return `<circle cx="${primitive.cx}" cy="${primitive.cy}" r="${primitive.r}" stroke="${primitive.color}" />`
     }
     const points = primitive.points.map(point => `${point.x},${point.y}`).join(' ')
-    // Only completed polygons display the closing edge.
-    const tag = primitive.close && state.finished ? 'polygon' : 'polyline'
+    const tag = primitive.close ? 'polygon' : 'polyline'
     return `<${tag} points="${points}" stroke="${primitive.color}" />`
   }).join('')
-  if (state.type !== 'circles' && state.points.length > 1 && !hasEnoughPoints(state)) {
-    geometry += `<polyline points="${state.points.map(p => `${p.x},${p.y}`).join(' ')}" stroke="${state.strokeColor}" />`
+  for (const group of captureGroups(state)) {
+    if (group.type !== 'circles' && group.points.length > 1 && !hasEnoughPoints(group)) {
+      geometry += `<polyline points="${group.points.map(p => `${p.x},${p.y}`).join(' ')}" stroke="${group.strokeColor}" />`
+    }
   }
-  const pointDots = state.points.map((point, index) =>
-    `<circle class="point-dot" cx="${screenX(point.x)}" cy="${screenY(point.y)}" r="3" fill="${state.strokeColor}"><title>Point ${index + 1}${point.name ? `: ${escapeXml(point.name)}` : ''} · X ${point.x}, Y ${point.y}</title></circle>`
-  ).join('')
+  const pointDots = captureGroups(state).map(group => group.points.map((point, index) =>
+    `<circle class="point-dot" cx="${screenX(point.x)}" cy="${screenY(point.y)}" r="3" fill="${group.strokeColor}"><title>Point ${index + 1}${point.name ? `: ${escapeXml(point.name)}` : ''} · X ${point.x}, Y ${point.y}</title></circle>`
+  ).join('')).join('')
   const head = livePosition
     ? `<g class="head-marker${settledPosition.settled ? ' settled' : ''}" transform="translate(${screenX(livePosition.x)} ${screenY(livePosition.y)})"><title>${settledPosition.settled ? 'Reported position unchanged for three readings' : 'Reported position not yet settled'}</title><circle r="5" /><path d="M -9 0 H 9 M 0 -9 V 9" /></g>` : ''
   const workspace = workspaceSize

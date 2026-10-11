@@ -52,12 +52,13 @@ The Cloudflare backend must enforce authorization on every operation; relay IDs 
 ## What this first version does
 
 - Reads live position from LightBurn `GET /api/position` (workpiece X/Y in mm).
-- Captures points into one collection, with an optional name that starts blank.
-- A single **Capture settings** modal controls the whole collection:
+- Captures points into one collection containing consecutive capture groups, without a collection Name field.
+- A single **Capture settings** modal controls the current capture:
   - Circles (one circle per point)
   - Polyline (open path)
   - Polygon (closed path)
 - Lets you edit point names and numeric coordinates.
+- Geometry and label colours use compact expandable pickers containing the exact 32 RGB entries from the LightBurn Layers palette (00–29, T1 and T2), arranged as four rows of eight touching numbered swatches. Selecting a colour closes its picker. New collections default to black/00 geometry and red/02 labels. Existing custom colours are preserved, but applying capture settings requires choosing palette colours for both.
 - The plot uses Cartesian orientation: increasing X goes right and increasing Y goes up. Stored workpiece coordinates remain unchanged. SVG export converts Y-up to SVG's Y-down direction using the complete geometry bounds, including circles and upright labels. Import placement still needs verification in LightBurn.
 - Optional point numbering and point-name labels.
 - Labels are exported as single-line vector strokes (no installed font dependency).
@@ -69,12 +70,12 @@ The Cloudflare backend must enforce authorization on every operation; relay IDs 
 ## Compact workspace workflow
 
 1. Open **Connection** and click **Connect**. It uses an entered secret, or pairs locally when the field is blank. For pairing, bring LightBurn to the foreground (click its window or use Alt+Tab) and approve within 30 seconds. Live preview starts automatically and the dialog closes after two seconds on success. Errors leave it open; clear an invalid secret to pair again. There are no separate Test or preview controls.
-2. Open **Capture settings** to choose circles, polyline, or polygon, and optional naming/labels.
+2. Open **Capture settings** to choose circles, polyline, or polygon, colours and labels.
 3. Click **Capture point** (or Space outside controls/dialogs) at each desired position. No set needs to be created first.
-4. Click **Finish** (or Enter) to finish capture; a polygon closes its last-to-first edge. Click **Resume** to add more points.
-5. Open **Edit points** for numeric coordinate, point name, and label-offset edits.
-6. Download SVG or **Send to LightBurn**. **Clear points** starts a new collection while preserving capture settings.
-7. Use **Session** for JSON backups/import. The single-collection version 2 format does not load or migrate old multi-set sessions.
+4. Click **Finish** (or Enter) to save the current group with its own shape, geometry colour, diameter and label settings; a polygon closes its last-to-first edge. Change settings if needed, then click **Resume** to start a new group. Finished groups do not change when current settings change. Numbering restarts within each group.
+5. Open **Edit points** for numeric coordinates, point names and label-offset edits in any group, including finished groups. The Group column identifies their shapes. Undo affects only the current unfinished capture. Deleting too many points for a group's shape blocks export until the incomplete group is removed.
+6. Download SVG or **Send to LightBurn** to export all groups together, retaining each group's style and a shared placement anchor. **Clear points** clears all groups while preserving current settings.
+7. Use **Session** for version 3 JSON backups/import. Existing version 2 single collections and browser autosaves load without losing points; a previously finished collection becomes a finished group. Older multi-set sessions remain unsupported.
 
 Settings dialogs apply on **Apply settings**; Cancel/Escape leaves the collection unchanged. Coordinates and labels remain editable after finishing. The connection secret stays in memory only and is not part of browser autosave or session backups.
 
