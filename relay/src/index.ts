@@ -24,6 +24,33 @@ const LAUNCH_RATE_LIMIT = 20;
 const LAUNCH_BROWSER_LIMIT = 20;
 const LIVENESS_MS = 45_000;
 const FALLBACK_MS = 5_000;
+const CODE_LIFETIME_MS = 60_000;
+const CODE_RECOVERY_MS = 120_000;
+type CodeWindow = { id: string; code: string; generation: number; expiresAt: number; status: string };
+type CodeRow = { id: string; relay_id: string; code: string; generation: number; expires_at: number; created_at: number; status: string; claim_id: string | null; verifier_hash: string | null; browser_id: string | null; credential_hash: string | null; wrapped_iv: string | null; wrapped_credential: string | null; recovery_until: number | null; last_recovery: number | null };
+type CodeClaim = { status: "complete"; relayId: string; credential: string } | { status: "pending" };
+type CodeResult<T> = { ok: true; body: T } | { ok: false; status: number; error: string };
+
+function codeFailure(error: unknown): { ok: false; status: number; error: string } {
+  if (error instanceof HttpError) return { ok: false, status: error.status, error: error.code };
+  console.error(JSON.stringify({ event: "code_pairing_internal_error" }));
+  return { ok: false, status: 500, error: "internal_error" };
+}
+
+function codeOperation<T>(operation: () => T): CodeResult<T> {
+  try { return { ok: true, body: operation() }; }
+  catch (error) { return codeFailure(error); }
+}
+
+async function codeOperationAsync<T>(operation: () => Promise<T>): Promise<CodeResult<T>> {
+  try { return { ok: true, body: await operation() }; }
+  catch (error) { return codeFailure(error); }
+}
+
+function codeBody<T>(result: CodeResult<T>): T {
+  if (!result.ok) throw new HttpError(result.status, result.error);
+  return result.body;
+}
 type SocketIdentity = { role: "agent" | "browser"; browserId?: string; generation?: number; seen: number; lastMessage?: number; sequence?: number; watching?: boolean };
 type Capture = { browserId: string; generation: number; revision: string | null; created: number; sequence: number; observedAt: number; status: "pending" | "complete" | "failed"; body?: unknown; error?: string };
 type EnrollmentClaim = { status: "pending" } | { status: "complete"; relayId: string; credential: string };
@@ -131,6 +158,16 @@ function fromBase64Url(value: string): Uint8Array | null {
 
 function randomToken(byteLength = 32): string {
   return toBase64Url(crypto.getRandomValues(new Uint8Array(byteLength)));
+}
+
+function randomCode(): string {
+  let code = "";
+  while (code.length < 3) {
+    for (const byte of crypto.getRandomValues(new Uint8Array(8))) {
+      if (byte < 234 && code.length < 3) code += String.fromCharCode(65 + byte % 26);
+    }
+  }
+  return code;
 }
 
 function randomPhrase(): string {
@@ -398,6 +435,14 @@ export class ControlPlaneDO extends DurableObject<Env> {
           relay_id TEXT, wrapped_iv TEXT, wrapped_credential TEXT
         );
         CREATE TABLE IF NOT EXISTS registered_relays (relay_id TEXT PRIMARY KEY);
+        CREATE TABLE IF NOT EXISTS code_windows (
+          id TEXT PRIMARY KEY, relay_id TEXT NOT NULL, code TEXT NOT NULL UNIQUE,
+          generation INTEGER NOT NULL, expires_at INTEGER NOT NULL, created_at INTEGER NOT NULL,
+          status TEXT NOT NULL, claim_id TEXT UNIQUE, verifier_hash TEXT, browser_id TEXT,
+          credential_hash TEXT, wrapped_iv TEXT, wrapped_credential TEXT,
+          recovery_until INTEGER, last_recovery INTEGER
+        );
+        CREATE TABLE IF NOT EXISTS code_attempts (ip_hash TEXT NOT NULL, created_at INTEGER NOT NULL, kind TEXT NOT NULL);
       `);
       if (await ctx.storage.getAlarm() === null) await ctx.storage.setAlarm(Date.now() + 60_000);
     });
@@ -408,6 +453,7 @@ export class ControlPlaneDO extends DurableObject<Env> {
     this.ctx.storage.sql.exec("DELETE FROM preview_leases WHERE expires_at <= ?", now);
     this.ctx.storage.sql.exec("DELETE FROM enrollments WHERE expires_at <= ?", now);
     this.ctx.storage.sql.exec("DELETE FROM registration_rates WHERE window_start <= ?", now - 5 * 60_000);
+    this.reapCodes(now);
     await this.ctx.storage.setAlarm(now + 60_000);
   }
 
@@ -427,6 +473,124 @@ export class ControlPlaneDO extends DurableObject<Env> {
 
   inventory(relayId: string): void {
     this.ctx.storage.sql.exec("INSERT OR IGNORE INTO registered_relays VALUES (?)", relayId);
+  }
+
+  private reapCodes(now: number): void {
+    this.ctx.storage.sql.exec("UPDATE code_windows SET status='expired' WHERE status='waiting' AND expires_at <= ?", now);
+    this.ctx.storage.sql.exec("UPDATE code_windows SET wrapped_iv=NULL,wrapped_credential=NULL,verifier_hash=NULL WHERE recovery_until <= ?", now);
+    this.ctx.storage.sql.exec("DELETE FROM code_windows WHERE created_at <= ?", now - JOB_RETENTION_MS);
+    this.ctx.storage.sql.exec("DELETE FROM code_attempts WHERE created_at <= ?", now - 60_000);
+  }
+
+  codeAttempt(ipHash: string, recovery = false): CodeResult<void> {
+    return codeOperation(() => this.consumeCodeAttempt(ipHash, recovery));
+  }
+
+  private consumeCodeAttempt(ipHash: string, recovery: boolean): void {
+    const now = Date.now();
+    this.ctx.storage.transactionSync(() => {
+      this.reapCodes(now);
+      const kind = recovery ? "recovery" : "initial";
+      if (this.ctx.storage.sql.exec<{ n: number }>("SELECT COUNT(*) AS n FROM code_attempts WHERE kind=?", kind).one().n >= (recovery ? 60 : 10) ||
+          this.ctx.storage.sql.exec<{ n: number }>("SELECT COUNT(*) AS n FROM code_attempts WHERE ip_hash=? AND kind=?", ipHash, kind).one().n >= (recovery ? 10 : 3)) {
+        throw new HttpError(429, "code_rate_limited");
+      }
+      this.ctx.storage.sql.exec("INSERT INTO code_attempts VALUES (?,?,?)", ipHash, now, kind);
+    });
+  }
+
+  codeNew(relayId: string, generation: number, id: string): CodeResult<CodeWindow> {
+    return codeOperation(() => this.newCode(relayId, generation, id));
+  }
+
+  private newCode(relayId: string, generation: number, id: string): CodeWindow {
+    const now = Date.now();
+    return this.ctx.storage.transactionSync(() => {
+      this.reapCodes(now);
+      const prior = this.ctx.storage.sql.exec<CodeRow>("SELECT * FROM code_windows WHERE id=?", id).toArray()[0];
+      if (prior) {
+        if (prior.relay_id !== relayId || prior.generation !== generation) throw new HttpError(409, "code_unavailable");
+        return { id, code: prior.code, generation, expiresAt: prior.expires_at, status: prior.status };
+      }
+      if (this.ctx.storage.sql.exec("SELECT id FROM code_windows WHERE relay_id=? AND status='waiting' AND expires_at>?", relayId, now).toArray().length ||
+          this.ctx.storage.sql.exec<{ n: number }>("SELECT COUNT(*) AS n FROM code_windows WHERE status='waiting' AND expires_at>?", now).one().n >= 5 ||
+          this.ctx.storage.sql.exec<{ n: number }>("SELECT COUNT(*) AS n FROM code_windows WHERE created_at>?", now - 600_000).one().n >= 30 ||
+          this.ctx.storage.sql.exec<{ n: number }>("SELECT COUNT(*) AS n FROM code_windows WHERE relay_id=? AND created_at>?", relayId, now - 600_000).one().n >= 3) {
+        throw new HttpError(429, "code_pairing_busy");
+      }
+      let code = "";
+      for (let i = 0; i < 64; i++) {
+        const candidate = randomCode();
+        if (!this.ctx.storage.sql.exec("SELECT id FROM code_windows WHERE code=?", candidate).toArray().length) { code = candidate; break; }
+      }
+      if (!code) throw new HttpError(429, "code_pairing_busy");
+      this.ctx.storage.sql.exec("INSERT INTO code_windows (id,relay_id,code,generation,expires_at,created_at,status) VALUES (?,?,?,?,?,?,'waiting')",
+        id, relayId, code, generation, now + CODE_LIFETIME_MS, now);
+      return { id, code, generation, expiresAt: now + CODE_LIFETIME_MS, status: "waiting" };
+    });
+  }
+
+  codeCancel(relayId: string, id: string): CodeResult<string> {
+    return codeOperation(() => this.cancelCode(relayId, id));
+  }
+
+  private cancelCode(relayId: string, id: string): string {
+    return this.ctx.storage.transactionSync(() => {
+      this.reapCodes(Date.now());
+      const row = this.ctx.storage.sql.exec<CodeRow>("SELECT * FROM code_windows WHERE id=? AND relay_id=?", id, relayId).toArray()[0];
+      if (!row) throw new HttpError(409, "code_unavailable");
+      if (row.status === "waiting") this.ctx.storage.sql.exec("UPDATE code_windows SET status='cancelled' WHERE id=?", id);
+      return row.status === "waiting" ? "cancelled" : row.status;
+    });
+  }
+
+  async codeRedeem(code: string, claimId: string, verifier: string): Promise<CodeResult<CodeClaim>> {
+    return codeOperationAsync(() => this.redeemCode(code, claimId, verifier));
+  }
+
+  private async redeemCode(code: string, claimId: string, verifier: string): Promise<CodeClaim> {
+    const verifierHash = await hashToken(verifier), credential = randomToken();
+    const credentialHash = await hashToken(credential), wrapped = await wrapCredential(verifier, credential);
+    const browserId = crypto.randomUUID(), now = Date.now();
+    this.ctx.storage.transactionSync(() => {
+      this.reapCodes(now);
+      const row = this.ctx.storage.sql.exec<CodeRow>("SELECT * FROM code_windows WHERE code=?", code).toArray()[0];
+      if (!row || row.status !== "waiting" || row.expires_at <= now ||
+          this.ctx.storage.sql.exec("SELECT id FROM code_windows WHERE claim_id=?", claimId).toArray().length) throw new HttpError(409, "code_unavailable");
+      this.ctx.storage.sql.exec("UPDATE code_windows SET status='claimed',claim_id=?,verifier_hash=?,browser_id=?,credential_hash=?,wrapped_iv=?,wrapped_credential=?,recovery_until=? WHERE id=?",
+        claimId, verifierHash, browserId, credentialHash, wrapped.iv, wrapped.ciphertext, now + CODE_RECOVERY_MS, row.id);
+    });
+    return this.completeCodeClaim(claimId, verifier);
+  }
+
+  async codeClaim(claimId: string, verifier: string): Promise<CodeResult<CodeClaim>> {
+    return codeOperationAsync(() => this.claimCode(claimId, verifier));
+  }
+
+  private async claimCode(claimId: string, verifier: string): Promise<CodeClaim> {
+    const hash = await hashToken(verifier), now = Date.now();
+    this.ctx.storage.transactionSync(() => {
+      const row = this.ctx.storage.sql.exec<CodeRow>("SELECT * FROM code_windows WHERE claim_id=?", claimId).toArray()[0];
+      if (!row || !row.verifier_hash || !constantTimeEqual(row.verifier_hash, hash) || !row.recovery_until || row.recovery_until <= now) throw new HttpError(409, "code_claim_unavailable");
+      if (row.last_recovery !== null && now - row.last_recovery < FALLBACK_MS) throw new HttpError(429, "code_rate_limited");
+      this.ctx.storage.sql.exec("UPDATE code_windows SET last_recovery=? WHERE claim_id=?", now, claimId);
+    });
+    return this.completeCodeClaim(claimId, verifier);
+  }
+
+  private async completeCodeClaim(claimId: string, verifier: string): Promise<CodeClaim> {
+    const row = this.ctx.storage.sql.exec<CodeRow>("SELECT * FROM code_windows WHERE claim_id=?", claimId).toArray()[0];
+    if (!row?.browser_id || !row.credential_hash || !row.wrapped_iv || !row.wrapped_credential || !row.recovery_until ||
+        row.recovery_until <= Date.now() || !["claimed", "complete"].includes(row.status)) throw new HttpError(409, "code_claim_unavailable");
+    const result = await this.env.RELAYS.getByName(row.relay_id).codeGrant(row.id, row.generation, claimId, row.browser_id, row.credential_hash, row.expires_at, row.recovery_until);
+    if (row.recovery_until <= Date.now()) throw new HttpError(409, "code_claim_unavailable");
+    if (result === "unavailable") {
+      this.ctx.storage.sql.exec("UPDATE code_windows SET status='failed' WHERE claim_id=?", claimId);
+      throw new HttpError(409, "code_claim_unavailable");
+    }
+    if (result === "pending") return { status: "pending" };
+    this.ctx.storage.sql.exec("UPDATE code_windows SET status='complete' WHERE claim_id=?", claimId);
+    return { status: "complete", relayId: row.relay_id, credential: await unwrapCredential(verifier, row.wrapped_iv, row.wrapped_credential) };
   }
 
   async enrollmentStart(name: string, verifierHash: string, ipHash: string): Promise<unknown> {
@@ -628,6 +792,10 @@ export class RelayDO extends DurableObject<Env> {
         INSERT OR IGNORE INTO job_tombstones SELECT id FROM jobs;
         CREATE TABLE IF NOT EXISTS captures (id TEXT PRIMARY KEY, payload TEXT NOT NULL, created_at INTEGER NOT NULL);
         CREATE INDEX IF NOT EXISTS captures_created ON captures(created_at);
+        CREATE TABLE IF NOT EXISTS code_pairings (
+          id TEXT PRIMARY KEY, generation INTEGER NOT NULL, expires_at INTEGER NOT NULL,
+          status TEXT NOT NULL, claim_id TEXT UNIQUE, browser_id TEXT
+        );
       `);
       // Legacy coordinates are never promoted to a fresh observation after rehydration.
       ctx.storage.sql.exec("DELETE FROM snapshots");
@@ -684,6 +852,8 @@ export class RelayDO extends DurableObject<Env> {
         if (request.method === "POST" && route === "/agent/start") return this.agentStart(identity);
         if (request.method === "POST" && route === "/agent/update") return await this.agentUpdate(request, identity);
         if (request.method === "POST" && route === "/agent/browser-launch") return await this.browserLaunchNew(request);
+        if (request.method === "POST" && route === "/agent/code/new") return await this.codeNew(request, identity);
+        if (request.method === "POST" && route === "/agent/code/cancel") return await this.codeCancel(request);
         if (request.method === "POST" && (route === "/pairing/new" || route === "/agent/pairing/new")) return await this.pairingNew(request);
         if (request.method === "POST" && (route === "/pairing/decide" || route === "/agent/pairing/decide")) return await this.pairingDecide(request);
         if (request.method === "GET" && route === "/browsers") return this.listBrowsers();
@@ -940,7 +1110,7 @@ export class RelayDO extends DurableObject<Env> {
     }
     if (deliverWork) this.broadcast();
     if (invalidClockForLiveSample) throw new HttpError(400, "invalid_clock_calibration");
-    return jsonResponse({ serverTime: receivedAt, pairings, job: claimed, previewActive: this.previewUntil > receivedAt, captures: [...this.captures.entries()].filter(([, c]) => c.status === "pending" && c.generation === parsedGeneration && receivedAt - c.created < 10_000).map(([id]) => id) });
+    return jsonResponse({ serverTime: receivedAt, pairings, codePairing: this.codePairingState(), job: claimed, previewActive: this.previewUntil > receivedAt, captures: [...this.captures.entries()].filter(([, c]) => c.status === "pending" && c.generation === parsedGeneration && receivedAt - c.created < 10_000).map(([id]) => id) });
   }
 
   private clearSnapshotForGeneration(generation: number): void {
@@ -948,6 +1118,61 @@ export class RelayDO extends DurableObject<Env> {
       const meta = this.meta();
       if (meta && meta.generation === generation) { this.transient = null; this.settled = false; }
     });
+  }
+
+  private codeEligible(generation: number): boolean {
+    return this.meta()?.generation === generation && !!this.transient?.connected &&
+      Date.now() - this.transient.receivedAt < LIVENESS_MS &&
+      !this.ctx.storage.sql.exec("SELECT id FROM jobs WHERE status IN ('claimed','attempting','accepted') LIMIT 1").toArray().length;
+  }
+
+  private async codeNew(request: Request, identity: AgentIdentity): Promise<Response> {
+    if (!codePairingConfigured(this.env)) throw new HttpError(503, "code_pairing_unavailable");
+    const body = requiredObject(await readJson(request)); jsonBody(body, ["requestId"]);
+    const id = requireUuid(body.requestId);
+    if (!this.codeEligible(identity.generation)) throw new HttpError(503, "code_pairing_unavailable");
+    const result = codeBody(await this.env.CONTROL_PLANE.getByName("registration-control").codeNew(this.meta()!.relay_id, identity.generation, id));
+    this.ctx.storage.sql.exec("INSERT OR IGNORE INTO code_pairings (id,generation,expires_at,status) VALUES (?,?,?,?)", id, result.generation, result.expiresAt, result.status);
+    if (!this.codeEligible(identity.generation)) {
+      codeBody(await this.env.CONTROL_PLANE.getByName("registration-control").codeCancel(this.meta()!.relay_id, id));
+      throw new HttpError(503, "code_pairing_unavailable");
+    }
+    return jsonResponse({ ...result, serverTime: Date.now() });
+  }
+
+  private async codeCancel(request: Request): Promise<Response> {
+    const body = requiredObject(await readJson(request)); jsonBody(body, ["requestId"]);
+    const id = requireUuid(body.requestId);
+    const status = codeBody(await this.env.CONTROL_PLANE.getByName("registration-control").codeCancel(this.meta()!.relay_id, id));
+    this.ctx.storage.sql.exec("UPDATE code_pairings SET status=? WHERE id=? AND status!='complete'", status, id);
+    this.notifyWork();
+    return jsonResponse({ id, status });
+  }
+
+  async codeGrant(id: string, generation: number, claimId: string, browserId: string, credentialHash: string, expiresAt: number, recoveryUntil: number): Promise<"complete" | "pending" | "unavailable"> {
+    const result = this.ctx.storage.transactionSync(() => {
+      if (Date.now() >= recoveryUntil) return "unavailable";
+      const prior = this.ctx.storage.sql.exec<{ browser_id: string | null; claim_id: string | null }>("SELECT browser_id,claim_id FROM code_pairings WHERE id=?", id).toArray()[0];
+      if (prior?.claim_id) {
+        return prior.claim_id === claimId && prior.browser_id === browserId &&
+          this.ctx.storage.sql.exec("SELECT id FROM browsers WHERE id=? AND revoked=0", browserId).toArray().length ? "complete" : "unavailable";
+      }
+      if (!this.codeEligible(generation)) return "unavailable";
+      // Issuance response may be lost before this object's local window insert.
+      this.ctx.storage.sql.exec("INSERT OR IGNORE INTO code_pairings (id,generation,expires_at,status) VALUES (?,?,?,'claimed')", id, generation, expiresAt);
+      this.ctx.storage.sql.exec("INSERT INTO browsers (id,credential_hash,created_at,revoked) VALUES (?,?,?,0)", browserId, credentialHash, Date.now());
+      this.ctx.storage.sql.exec("UPDATE code_pairings SET status='complete',claim_id=?,browser_id=? WHERE id=?", claimId, browserId, id);
+      return "complete";
+    });
+    this.notifyWork();
+    return result;
+  }
+
+  private codePairingState(): { id: string; status: string; expiresAt: number } | null {
+    const row = this.ctx.storage.sql.exec<{ id: string; status: string; expires_at: number; generation: number }>("SELECT * FROM code_pairings ORDER BY expires_at DESC,rowid DESC LIMIT 1").toArray()[0];
+    if (!row) return null;
+    const status = row.status === "waiting" && (row.expires_at <= Date.now() || row.generation !== this.meta()?.generation) ? "expired" : row.status;
+    return { id: row.id, status, expiresAt: row.expires_at };
   }
 
   private async pairingNew(request: Request): Promise<Response> {
@@ -1522,6 +1747,7 @@ export class RelayDO extends DurableObject<Env> {
     );
     this.ctx.storage.sql.exec("DELETE FROM invitations WHERE expires_at <= ?", now);
     this.ctx.storage.sql.exec("DELETE FROM pairings WHERE created_at <= ?", now - JOB_RETENTION_MS);
+    this.ctx.storage.sql.exec("DELETE FROM code_pairings WHERE expires_at <= ?", now - JOB_RETENTION_MS);
   }
 
   private async createTicket(browser: BrowserIdentity): Promise<Response> {
@@ -1622,7 +1848,7 @@ export class RelayDO extends DurableObject<Env> {
     for (const socket of this.ctx.getWebSockets()) {
       const a = this.attachment(socket);
       if (a?.role === "agent" && a.generation === this.meta()?.generation && now - a.seen < LIVENESS_MS) {
-        this.send(socket, { v: 2, type: "work", body: { pairings, job: null, previewActive: this.previewUntil > now } });
+        this.send(socket, { v: 2, type: "work", body: { pairings, codePairing: this.codePairingState(), job: null, previewActive: this.previewUntil > now } });
       }
 
     }
@@ -1917,6 +2143,49 @@ function enrollmentConfigured(env: Env): boolean {
     /^0x[A-Za-z0-9_-]{10,}$/u.test(siteKey) && !/^[123]x/u.test(siteKey);
 }
 
+function codePairingConfigured(env: Env): boolean {
+  const key = envString(env, "TURNSTILE_SITE_KEY");
+  return envString(env, "CODE_PAIRING_ENABLED") === "true" && envString(env, "TURNSTILE_SECRET").length >= 16 &&
+    /^0x[A-Za-z0-9_-]{10,}$/u.test(key) && !/^[123]x/u.test(key);
+}
+
+async function verifyBrowser(request: Request, env: Env, token: unknown, action: string): Promise<void> {
+  if (typeof token !== "string" || !token || token.length > 2048) throw new HttpError(403, "turnstile_invalid");
+  let result: unknown;
+  try {
+    const response = await fetch("https://challenges.cloudflare.com/turnstile/v0/siteverify", {
+      method: "POST", headers: { "Content-Type": "application/x-www-form-urlencoded" }, signal: AbortSignal.timeout(10_000),
+      body: new URLSearchParams({ secret: envString(env, "TURNSTILE_SECRET"), response: token, remoteip: request.headers.get("CF-Connecting-IP") ?? "" }),
+    });
+    if (!response.ok) throw new Error("siteverify_failed");
+    result = await response.json();
+  } catch {
+    console.warn(JSON.stringify({ event: "verification_failed", action }));
+    throw new HttpError(403, "turnstile_invalid");
+  }
+  if (!isObject(result) || result.success !== true || result.action !== action || result.hostname !== "nicholas-a11y.github.io") throw new HttpError(403, "turnstile_invalid");
+}
+
+async function codePairing(request: Request, env: Env, path: string): Promise<Response> {
+  requireAllowedOrigin(request);
+  if (path === "/v1/pairing/config" && request.method === "GET") {
+    const enabled = codePairingConfigured(env);
+    return jsonResponse({ enabled, siteKey: enabled ? envString(env, "TURNSTILE_SITE_KEY") : "" });
+  }
+  if (!codePairingConfigured(env)) throw new HttpError(503, "code_pairing_unavailable");
+  if (request.method !== "POST" || !["/v1/pairing/code", "/v1/pairing/claim"].includes(path)) throw new HttpError(404, "not_found");
+  const cp = env.CONTROL_PLANE.getByName("registration-control");
+  // Admission precedes body parsing and verification; failed attempts cannot bypass it.
+  codeBody(await cp.codeAttempt(await hashToken(request.headers.get("CF-Connecting-IP") ?? "unknown"), path === "/v1/pairing/claim"));
+  const body = requiredObject(await readJson(request));
+  jsonBody(body, path.endsWith("/code") ? ["code", "requestId", "verifier", "turnstileToken"] : ["requestId", "verifier"]);
+  const id = requireUuid(body.requestId), verifier = requireToken(body.verifier);
+  if (path.endsWith("/claim")) return jsonResponse(codeBody(await cp.codeClaim(id, verifier)));
+  if (typeof body.code !== "string" || !/^[A-Za-z]{3}$/u.test(body.code)) throw new HttpError(400, "invalid_request");
+  await verifyBrowser(request, env, body.turnstileToken, "pairing");
+  return jsonResponse(codeBody(await cp.codeRedeem(body.code.toUpperCase(), id, verifier)));
+}
+
 async function enrollment(request: Request, env: Env, path: string): Promise<Response> {
   if (path === "/v1/enrollment/config" && request.method === "GET") {
     const enabled = enrollmentConfigured(env), downloadUrl = envString(env, "RAP_DOWNLOAD_URL");
@@ -1948,18 +2217,8 @@ async function enrollment(request: Request, env: Env, path: string): Promise<Res
   jsonBody(body, ["code", "turnstileToken"]);
   if (await cp.consumeRegistrationAttempt(ipHash, null, "", Date.now()) === "rate_limited") throw new HttpError(429, "registration_rate_limited");
   if (typeof body.code !== "string" || body.code.length > 256 || !constantTimeEqual(await hashToken(body.code), await hashToken(envString(env, "ENROLLMENT_CODE")))) throw new HttpError(403, "enrollment_code_invalid");
-  if (typeof body.turnstileToken !== "string" || !body.turnstileToken || body.turnstileToken.length > 2048) throw new HttpError(403, "turnstile_invalid");
   await cp.enrollmentGet(id);
-  let result: unknown;
-  try {
-    const r = await fetch("https://challenges.cloudflare.com/turnstile/v0/siteverify", {
-      method: "POST", headers: { "Content-Type": "application/x-www-form-urlencoded" }, signal: AbortSignal.timeout(10_000),
-      body: new URLSearchParams({ secret: envString(env, "TURNSTILE_SECRET"), response: body.turnstileToken, remoteip: request.headers.get("CF-Connecting-IP") ?? "" }),
-    });
-    if (!r.ok) throw new Error("siteverify_failed");
-    result = await r.json();
-  } catch { throw new HttpError(403, "turnstile_invalid"); }
-  if (!isObject(result) || result.success !== true || result.action !== "enrollment" || result.hostname !== "nicholas-a11y.github.io") throw new HttpError(403, "turnstile_invalid");
+  await verifyBrowser(request, env, body.turnstileToken, "enrollment");
   await cp.enrollmentApprove(id);
   return jsonResponse({ status: "approved" });
 }
@@ -1989,6 +2248,8 @@ export default {
         response = await register(request, env);
       } else if (url.pathname.startsWith("/v1/enrollment/")) {
         response = await enrollment(request, env, url.pathname);
+      } else if (url.pathname.startsWith("/v1/pairing/")) {
+        response = await codePairing(request, env, url.pathname);
       } else {
         const match = url.pathname.match(/^\/v1\/relays\/([0-9a-f-]{36})\/.*$/iu);
         if (!match) throw new HttpError(404, "not_found");

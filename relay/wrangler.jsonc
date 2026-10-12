@@ -5,6 +5,7 @@
   "compatibility_date": "2026-10-11",
   "vars": {
     "TURNSTILE_SITE_KEY": "",
+    "CODE_PAIRING_ENABLED": "false",
     "RAP_DOWNLOAD_URL": "",
   },
   "observability": {

@@ -35,7 +35,7 @@ test('waiting for RAP is not coordinate age, but invalid wait claims never remov
   }
 })
 
-async function setup() {
+async function setup(automaticControl = true, initial = fixture) {
   const original = globalThis.fetch
   const descriptor = Object.getOwnPropertyDescriptor(globalThis, 'WebSocket')
   const paths: string[] = []
@@ -52,12 +52,12 @@ async function setup() {
     if (path.endsWith('/control')) return Response.json({ ok: true })
     throw new Error(`Unexpected polling: ${path}`)
   }
-  const client = new RelayClient({ baseUrl: 'https://relay.example', relayId: 'test', credential: 'test-only' }, () => {})
+  const client = new RelayClient({ baseUrl: 'https://relay.example', relayId: 'test', credential: 'test-only' }, () => {}, 'socket', automaticControl)
   client.start()
   await flush()
   const socket = SocketFixture.latest
   socket.onopen?.()
-  socket.receive(fixture)
+  socket.receive(initial)
   await flush()
   return {
     client, socket, paths, captureId: () => captureId,
@@ -80,6 +80,18 @@ test('socket transport consumes events without HTTP snapshot polling or durable 
     await new Promise(resolve => setTimeout(resolve, 600))
     assert.deepEqual(env.paths, ['/v1/relays/test/ticket'])
     assert.equal(env.socket.sent.length, 1)
+  } finally { env.cleanup() }
+})
+
+test('code-paired client stays read-only on healthy free control until an explicit claim', async () => {
+  const env = await setup(false, { ...fixture, activeBrowser: false })
+  try {
+    assert.equal(env.client.isOnline(), true)
+    assert.equal(env.client.canCapture(), false)
+    assert.deepEqual(env.paths, ['/v1/relays/test/ticket'])
+    await env.client.claimControl()
+    assert.equal(env.client.canCapture(), true)
+    assert.deepEqual(env.paths, ['/v1/relays/test/ticket', '/v1/relays/test/control'])
   } finally { env.cleanup() }
 })
 

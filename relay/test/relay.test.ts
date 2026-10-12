@@ -1,6 +1,6 @@
 import { env } from "cloudflare:workers";
 import { evictDurableObject, runDurableObjectAlarm, runInDurableObject } from "cloudflare:test";
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import worker from "../src/index";
 
 const ORIGIN = "https://nicholas-a11y.github.io";
@@ -1235,3 +1235,219 @@ describe("browser control acquisition and takeover", () => {
 function randomTokenForTest(): string {
   return btoa(crypto.randomUUID() + crypto.randomUUID()).replaceAll("+", "-").replaceAll("/", "_").replace(/=+$/u, "").slice(0, 43);
 }
+
+describe("explicit three-letter code pairing", () => {
+  const cp = () => env.CONTROL_PLANE.getByName("registration-control");
+  const configured = (runtime: TestBindings) => Object.assign({}, runtime, {
+    CODE_PAIRING_ENABLED: "true", TURNSTILE_SITE_KEY: "0xTESTSITEKEYONLY", TURNSTILE_SECRET: "test-secret-not-for-production",
+  });
+  beforeEach(async () => {
+    await runInDurableObject(cp(), (_instance, state) => {
+      state.storage.sql.exec("DELETE FROM code_windows");
+      state.storage.sql.exec("DELETE FROM code_attempts");
+    });
+  });
+  afterEach(() => { vi.useRealTimers(); vi.restoreAllMocks(); });
+
+  async function ready(): Promise<Agent> {
+    const relay = await register();
+    relay.bindings = configured(relay.bindings);
+    await runInDurableObject(env.RELAYS.getByName(relay.relayId), (instance) => {
+      Object.assign(Reflect.get(instance, "env"), {
+        CODE_PAIRING_ENABLED: "true", TURNSTILE_SITE_KEY: "0xTESTSITEKEYONLY", TURNSTILE_SECRET: "test-secret-not-for-production",
+      });
+    });
+    const agent = await startAgent(relay);
+    await update(agent, 1);
+    return agent;
+  }
+  async function issue(agent: Agent, requestId = crypto.randomUUID()) {
+    const response = await call(`/v1/relays/${agent.relayId}/agent/code/new`, { credential: agent.credential, bindings: agent.bindings, body: { requestId } });
+    expect(response.status).toBe(200);
+    return await json<{ id: string; code: string; expiresAt: number; serverTime: number; status: string }>(response);
+  }
+  function verification() {
+    return vi.spyOn(globalThis, "fetch").mockImplementation(async () => Response.json({ success: true, action: "pairing", hostname: "nicholas-a11y.github.io" }));
+  }
+  function redeem(agent: Agent, code: string, requestId = crypto.randomUUID(), verifier = randomTokenForTest()) {
+    return call("/v1/pairing/code", { bindings: agent.bindings, body: { code, requestId, verifier, turnstileToken: crypto.randomUUID() } });
+  }
+
+  it("is operator disabled by default, origin protected, agent authenticated and healthy-only", async () => {
+    expect(await json(await call("/v1/pairing/config"))).toEqual({ enabled: false, siteKey: "" });
+    expect((await call("/v1/pairing/config", { origin: null })).status).toBe(403);
+    expect((await call("/v1/pairing/code", { body: {} })).status).toBe(503);
+    const agent = await ready(), root = `/v1/relays/${agent.relayId}/agent/code/new`;
+    expect((await call(root, { bindings: agent.bindings, body: { requestId: crypto.randomUUID() } })).status).toBe(401);
+    const browser = await launchBrowser(agent);
+    expect((await call(root, { credential: browser, bindings: agent.bindings, body: { requestId: crypto.randomUUID() } })).status).toBe(401);
+    await update(agent, 2, { connected: false, position: null, context: null });
+    expect((await call(root, { credential: agent.credential, bindings: agent.bindings, body: { requestId: crypto.randomUUID() } })).status).toBe(503);
+  });
+
+  it("issues exactly three letters idempotently for 60 seconds, with one live window per RAP", async () => {
+    const agent = await ready(), id = crypto.randomUUID(), first = await issue(agent, id);
+    expect(first.code).toMatch(/^[A-Z]{3}$/);
+    expect(first.expiresAt - first.serverTime).toBeLessThanOrEqual(60_000);
+    expect(first.expiresAt - first.serverTime).toBeGreaterThan(59_000);
+    expect((await issue(agent, id)).code).toBe(first.code);
+    expect((await call(`/v1/relays/${agent.relayId}/agent/code/new`, { credential: agent.credential, bindings: agent.bindings, body: { requestId: crypto.randomUUID() } })).status).toBe(429);
+    expect(await cp().codeCancel(agent.relayId, id)).toEqual({ ok: true, body: "cancelled" });
+    verification();
+    expect((await redeem(agent, first.code)).status).toBe(409);
+    const second = await issue(agent);
+    expect(second.code).not.toBe(first.code);
+    vi.useFakeTimers(); vi.setSystemTime(second.expiresAt);
+    expect((await redeem(agent, second.code)).status).toBe(409);
+  });
+
+  it("requires correct verification and rejects replayed tokens before code lookup", async () => {
+    const agent = await ready(), window = await issue(agent), mock = verification();
+    for (const result of [
+      { success: false }, { success: true, action: "enrollment", hostname: ORIGIN.replace("https://", "") },
+      { success: true, action: "pairing", hostname: "localhost" },
+    ]) {
+      mock.mockResolvedValueOnce(Response.json(result));
+      expect((await redeem(agent, window.code)).status).toBe(403);
+    }
+    expect((await redeem(agent, window.code.toLowerCase())).status).toBe(200);
+    mock.mockResolvedValueOnce(Response.json({ success: false, "error-codes": ["timeout-or-duplicate"] }));
+    expect((await redeem(agent, window.code)).status).toBe(403);
+  });
+
+  it("atomically grants one browser, recovers the same credential after eviction, and never steals control or revives revoked access", async () => {
+    const agent = await ready(), existing = await launchBrowser(agent);
+    const controlled = await control(agent, existing);
+    expect(controlled.status).toBe(200);
+    await controlled.text();
+    const window = await issue(agent), id = crypto.randomUUID(), verifier = randomTokenForTest();
+    const verify = verification();
+    const secondId = crypto.randomUUID(), secondVerifier = randomTokenForTest();
+    const results = await Promise.all([redeem(agent, window.code, id, verifier), redeem(agent, window.code, secondId, secondVerifier)]);
+    expect(results.map(r => r.status).sort()).toEqual([200, 409]);
+    const winningIndex = results.findIndex(r => r.status === 200);
+    const winningId = winningIndex === 0 ? id : secondId, winningVerifier = winningIndex === 0 ? verifier : secondVerifier;
+    const winner = await json<{ status: string; credential: string; relayId: string }>(results[winningIndex]);
+    expect(winner).toMatchObject({ status: "complete", relayId: agent.relayId });
+    expect(winner.credential).not.toBe(agent.credential);
+    expect(await json(await call(`/v1/relays/${agent.relayId}/snapshot`, { credential: winner.credential, bindings: agent.bindings }))).toMatchObject({ activeBrowser: false, controlOccupied: true });
+    expect(await cp().codeCancel(agent.relayId, window.id)).toEqual({ ok: true, body: "complete" });
+    expect((await call("/v1/pairing/claim", { bindings: agent.bindings, body: { requestId: winningId, verifier: randomTokenForTest() } })).status).toBe(409);
+    verify.mockRestore();
+    testSockets.get(`${agent.relayId}:${agent.generation}`)?.socket.close();
+    testSockets.delete(`${agent.relayId}:${agent.generation}`);
+    await evictDurableObject(env.RELAYS.getByName(agent.relayId), { webSockets: "close" });
+    await evictDurableObject(cp());
+    expect(await json(await call("/v1/pairing/claim", { bindings: agent.bindings, body: { requestId: winningId, verifier: winningVerifier } }))).toEqual(winner);
+    expect((await call("/v1/pairing/claim", { bindings: agent.bindings, body: { requestId: winningId, verifier: winningVerifier } })).status).toBe(429);
+    const browsers = await json<{ browsers: { id: string }[] }>(await call(`/v1/relays/${agent.relayId}/browsers`, { credential: agent.credential, bindings: agent.bindings }));
+    expect(browsers.browsers).toHaveLength(2);
+    await call(`/v1/relays/${agent.relayId}/browsers/revoke`, { credential: agent.credential, bindings: agent.bindings, body: { browserId: browsers.browsers[1].id } });
+    vi.useFakeTimers(); vi.setSystemTime(Date.now() + 5001);
+    expect((await call("/v1/pairing/claim", { bindings: agent.bindings, body: { requestId: winningId, verifier: winningVerifier } })).status).toBe(409);
+    expect((await call(`/v1/relays/${agent.relayId}/snapshot`, { credential: winner.credential, bindings: agent.bindings })).status).toBe(401);
+  });
+
+  it("enforces exact rolling attempt caps before parsing or verifying and separates bounded recovery", async () => {
+    const runtime = configured(bindings("unused")), mock = verification();
+    for (let i = 0; i < 3; i++) expect((await call("/v1/pairing/code", { bindings: runtime, body: {}, ip: "same-ip" })).status).toBe(400);
+    expect((await call("/v1/pairing/code", { bindings: runtime, body: {}, ip: "same-ip" })).status).toBe(429);
+    for (let i = 0; i < 7; i++) expect((await call("/v1/pairing/code", { bindings: runtime, body: {}, ip: `ip-${i}` })).status).toBe(400);
+    expect((await call("/v1/pairing/code", { bindings: runtime, body: {}, ip: "another" })).status).toBe(429);
+    expect(mock).not.toHaveBeenCalled();
+    vi.useFakeTimers(); vi.setSystemTime(Date.now() + 59_000);
+    expect((await call("/v1/pairing/code", { bindings: runtime, body: {} })).status).toBe(429);
+    vi.setSystemTime(Date.now() + 1001);
+    expect((await call("/v1/pairing/code", { bindings: runtime, body: {} })).status).toBe(400);
+    for (let i = 0; i < 10; i++) expect((await call("/v1/pairing/claim", { bindings: runtime, body: {}, ip: "recover-ip" })).status).toBe(400);
+    expect((await call("/v1/pairing/claim", { bindings: runtime, body: {}, ip: "recover-ip" })).status).toBe(429);
+  });
+
+  it("caps five service-wide windows, issuance rates and collision retries, and cleans temporary data", async () => {
+    const registry = env.CONTROL_PLANE.getByName(`codes-${crypto.randomUUID()}`);
+    const ids = Array.from({ length: 6 }, () => crypto.randomUUID());
+    const results = await Promise.all(ids.map(id => registry.codeNew(id, 1, crypto.randomUUID())));
+    expect(results.filter(r => r.ok)).toHaveLength(5);
+    const windows = results.flatMap(result => result.ok ? [result.body] : []);
+    expect(new Set(windows.map(window => window.code)).size).toBe(5);
+    for (let i = 0; i < windows.length; i++) await registry.codeCancel(ids[i], windows[i].id);
+    for (let i = 0; i < 2; i++) {
+      const window = await registry.codeNew(ids[0], 1, crypto.randomUUID());
+      expect(window.ok).toBe(true);
+      if (window.ok) await registry.codeCancel(ids[0], window.body.id);
+    }
+    expect(await registry.codeNew(ids[0], 1, crypto.randomUUID())).toMatchObject({ ok: false, error: "code_pairing_busy" });
+    await runInDurableObject(registry, (_instance, state) => {
+      state.storage.sql.exec("DELETE FROM code_windows");
+      for (let i = 0; i < 26; i++) for (let j = 0; j < 26; j++) for (let k = 0; k < 26; k++) {
+        state.storage.sql.exec("INSERT INTO code_windows (id,relay_id,code,generation,expires_at,created_at,status) VALUES (?,?,?,1,?,?,'cancelled')",
+          `${i}-${j}-${k}`, "old", String.fromCharCode(65+i,65+j,65+k), Date.now()-1, Date.now()-600001);
+      }
+    });
+    expect(await registry.codeNew("fresh", 1, crypto.randomUUID())).toMatchObject({ ok: false, error: "code_pairing_busy" });
+    vi.useFakeTimers(); vi.setSystemTime(Date.now() + 86_400_001);
+    await runDurableObjectAlarm(registry);
+    await runInDurableObject(registry, (_instance, state) => expect(state.storage.sql.exec<{ n: number }>("SELECT COUNT(*) AS n FROM code_windows").one().n).toBe(0));
+  }, 30_000);
+
+  it("does not grant for an offline or replaced generation, even when a code is reserved", async () => {
+    const agent = await ready(), window = await issue(agent);
+    await startAgent(agent);
+    verification();
+    expect((await redeem(agent, window.code)).status).toBe(409);
+    const list = await json<{ browsers: unknown[] }>(await call(`/v1/relays/${agent.relayId}/browsers`, { credential: agent.credential, bindings: agent.bindings }));
+    expect(list.browsers).toHaveLength(0);
+  });
+
+  it("cancellation during verification wins before reservation and creates no browser", async () => {
+    const agent = await ready(), window = await issue(agent);
+    vi.spyOn(globalThis, "fetch").mockImplementation(async () => {
+      expect(await cp().codeCancel(agent.relayId, window.id)).toEqual({ ok: true, body: "cancelled" });
+      return Response.json({ success: true, action: "pairing", hostname: "nicholas-a11y.github.io" });
+    });
+    expect((await redeem(agent, window.code)).status).toBe(409);
+    const list = await json<{ browsers: unknown[] }>(await call(`/v1/relays/${agent.relayId}/browsers`, { credential: agent.credential, bindings: agent.bindings }));
+    expect(list.browsers).toHaveLength(0);
+    expect(await env.RELAYS.getByName(agent.relayId).codeGrant(window.id, agent.generation, crypto.randomUUID(), crypto.randomUUID(), "a".repeat(64), window.expiresAt, Date.now() - 1)).toBe("unavailable");
+  });
+
+  it("permits the 30th global issuance but not the 31st within the rolling window", async () => {
+    const registry = env.CONTROL_PLANE.getByName(`codes-global-${crypto.randomUUID()}`);
+    await runInDurableObject(registry, (_instance, state) => {
+      for (let i = 0; i < 29; i++) state.storage.sql.exec(
+        "INSERT INTO code_windows (id,relay_id,code,generation,expires_at,created_at,status) VALUES (?,?,?,1,?,?,'cancelled')",
+        crypto.randomUUID(), crypto.randomUUID(), String.fromCharCode(65,65+Math.floor(i/26),65+i%26), Date.now()-1, Date.now()-1000,
+      );
+    });
+    const last = await registry.codeNew("last", 1, crypto.randomUUID());
+    expect(last.ok).toBe(true);
+    if (last.ok) await registry.codeCancel("last", last.body.id);
+    expect(await registry.codeNew("over", 1, crypto.randomUUID())).toMatchObject({ ok: false, error: "code_pairing_busy" });
+  });
+
+  it("recovers a reserved claim after a cross-object reply is lost without creating another browser", async () => {
+    const agent = await ready(), window = await issue(agent), requestId = crypto.randomUUID(), verifier = randomTokenForTest();
+    const realRelays = env.RELAYS;
+    verification();
+    // Inject the failure at the grant boundary, after the registry reservation.
+    await runInDurableObject(cp(), instance => {
+      Reflect.set(Reflect.get(instance, "env"), "RELAYS", { getByName: (relayId: string) => ({
+          codeGrant: async (id: string, generation: number, claim: string, browser: string, hash: string, expiry: number, recoveryUntil: number) => {
+            await realRelays.getByName(relayId).codeGrant(id, generation, claim, browser, hash, expiry, recoveryUntil);
+            throw new Error("simulated_reply_loss");
+          },
+        }) });
+    });
+    expect((await redeem(agent, window.code, requestId, verifier)).status).toBe(500);
+    await runInDurableObject(cp(), instance => { Reflect.set(Reflect.get(instance, "env"), "RELAYS", realRelays); });
+    expect((await redeem(agent, window.code)).status).toBe(409);
+    const recovered = await json<{ status: string; credential: string }>(await call("/v1/pairing/claim", { bindings: agent.bindings, body: { requestId, verifier } }));
+    expect(recovered.status).toBe("complete");
+    const listed = await json<{ browsers: unknown[] }>(await call(`/v1/relays/${agent.relayId}/browsers`, { credential: agent.credential, bindings: agent.bindings }));
+    expect(listed.browsers).toHaveLength(1);
+    vi.useFakeTimers(); vi.setSystemTime(Date.now() + 120001);
+    expect((await call("/v1/pairing/claim", { bindings: agent.bindings, body: { requestId, verifier } })).status).toBe(409);
+    await runDurableObjectAlarm(cp());
+    await runInDurableObject(cp(), (_instance, state) => expect(state.storage.sql.exec<{ wrapped_credential: string | null }>("SELECT wrapped_credential FROM code_windows WHERE id=?", window.id).one().wrapped_credential).toBeNull());
+  });
+});

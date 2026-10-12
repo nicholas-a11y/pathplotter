@@ -58,6 +58,8 @@ try {
             }
             '/pairing/new' { return @{ invitation = 'fixture-phone'; expiresAt = (Get-ServerNow) + 60000 } }
             '/pairing/decide' { return @{} }
+            '/agent/code/new' { return @{ id = $Body.requestId; code = 'ABC'; expiresAt = (Get-ServerNow) + 60000; serverTime = Get-ServerNow; status = 'waiting' } }
+            '/agent/code/cancel' { return @{ id = $Body.requestId; status = 'cancelled' } }
             default { throw 'Unexpected network call forbidden in GUI protocol checks.' }
         }
     }
@@ -106,6 +108,23 @@ try {
     if (-not $rejected -or -not $script:StopRequested) { throw 'GUI quit did not fence import ownership.' }
     $script:ActiveImport = $null; $script:StopRequested = $false; $bridge.StopRequested = $false
     Write-Host 'PASS GUI protocol: fresh auto-open once across reconnect, explicit fresh open, expired launch refusal, ordinary invitation separation, exact approval and removed-request refusal.'
+    $script:Healthy = $false
+    $before = $script:WireCalls.Count
+    $rejected = $false
+    try { Invoke-UiCommand @{ action = 'code-new' } } catch { $rejected = $true }
+    if (-not $rejected -or $script:WireCalls.Count -ne $before) { throw 'Code pairing reached cloud while unhealthy.' }
+    $script:Healthy = $true; $script:ActiveImport = @{ fixture = $true }
+    $rejected = $false
+    try { Invoke-UiCommand @{ action = 'code-new' } } catch { $rejected = $true }
+    if (-not $rejected -or $script:WireCalls.Count -ne $before) { throw 'Code pairing reached cloud during import.' }
+    $script:ActiveImport = $null
+    Invoke-UiCommand @{ action = 'code-new' }
+    $id = $script:CodeRequest.id
+    Invoke-UiCommand @{ action = 'code-new' }
+    if ($script:WireCalls[$before].body.requestId -cne $id -or $script:WireCalls[$before + 1].body.requestId -cne $id) { throw 'Explicit issuance recovery minted a different window.' }
+    Invoke-UiCommand @{ action = 'code-cancel' }
+    if ($null -ne $script:CodeRequest -or $script:WireCalls[$before + 2].body.requestId -cne $id) { throw 'Code cancellation lost the window identity.' }
+    Write-Host 'PASS code pairing protocol: healthy/import guards, private idempotent issuance and explicit Cancel.'
     & (Join-Path $PSScriptRoot 'GUI.ps1') -SmokeTest -DataDirectory $state
     $lock = New-Object IO.FileStream((Join-Path $state 'instance.lock'), 'OpenOrCreate', 'ReadWrite', 'None')
     $lock.Dispose()

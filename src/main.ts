@@ -8,6 +8,7 @@ import { LIVE_QUEUE_LIMIT, emptyLiveQueue, makeUpdate, enqueue, recordOutcome, p
 import { openImportStream, type ImportResult } from './import-stream'
 import { LiveHandover, HANDOVER_TIMEOUT_MS, type LiveHandoverState } from './live-handover'
 import { setupOnboarding, HOSTED_RELAY } from './onboarding'
+import { setupCodePairing } from './code-pairing'
 
 interface LivePosition {
   x: number
@@ -92,7 +93,8 @@ app.innerHTML = `
       </select>
     </label>
     <section id="relayConnection">
-      <p class="hint">Need RAP? Use Get started for the Windows download and setup steps. Already set up? Double-click RAP to open this computer's app; for a phone use Pair phone in RAP and approve its phrase. Capture control is automatic when available.</p>
+      <p class="hint">Need RAP? Use Get started for the Windows download and setup steps. Already set up? Double-click RAP to open this computer's app; for a phone use Pair phone in RAP and approve its phrase. For QR/link pairing, capture control is automatic when available.</p>
+      <details><summary>Existing QR/link or manual pairing</summary>
       <label>Relay API URL<input id="relayUrl" type="url" value="${HOSTED_RELAY}" /></label>
       <label>Relay ID<input id="relayId" /></label>
       <label>Pairing invitation<input id="relayInvitation" type="password" autocomplete="off" /></label>
@@ -100,6 +102,7 @@ app.innerHTML = `
         <button id="pairRelayBtn" class="primary">Pair</button>
       </div>
       <p id="relayMessage" role="status"></p>
+      </details>
       <details>
         <summary>Advanced / recovery</summary>
         <p class="hint">Only needed when changing workspace, recovering an interrupted import, or removing this browser's connection. These actions never move points or resend artwork.</p>
@@ -674,9 +677,10 @@ function requireRelayContext(): string {
   return key
 }
 
-function attachRelay(identity: NonNullable<ReturnType<typeof loadIdentity>>): void {
+function attachRelay(identity: NonNullable<ReturnType<typeof loadIdentity>>, automaticControl = true): void {
+  const transport = relay?.connectionType ?? 'socket'
   relay?.stop()
-  relay = new RelayClient(identity, relayChanged)
+  relay = new RelayClient(identity, relayChanged, transport, automaticControl)
   must<HTMLInputElement>('relayUrl').value = identity.baseUrl
   must<HTMLInputElement>('relayId').value = identity.relayId
   if (mode === 'relay') relay.start()
@@ -694,9 +698,29 @@ modeInput.addEventListener('change', () => {
   ++pairingEpoch
   updateConnectionMode()
 })
+setupCodePairing({
+  container: must<HTMLElement>('relayConnection'),
+  dialog: must<HTMLDialogElement>('connectionDialog'),
+  begin: () => {
+    if (mode !== 'relay' || endingSession || connectionInFlight || requestInFlight || uploadInFlight || liveOwnsWork() ||
+        pendingImport || handoverPending || handoverStopping || otherTabOwnsLive) throw new Error('Finish or reconcile current work before code pairing.')
+    if ((relay || loadIdentity()) && !window.confirm('Pair this browser using a RAP code? Its saved connection may be replaced. Existing points will not be transformed.')) return null
+    connectionInFlight = true
+    const epoch = ++pairingEpoch
+    return () => epoch === pairingEpoch && mode === 'relay' && must<HTMLDialogElement>('connectionDialog').open
+  },
+  connected: identity => {
+    sessionEnded = false
+    attachRelay(identity, false)
+    setStatus('Browser paired. Use Take control when ready; existing capture control is unchanged.')
+    renderControls()
+  },
+  finished: () => { connectionInFlight = false; renderControls() },
+})
 async function connectBrowserLink(link: BrowserLink, requestControl = false): Promise<void> {
   const button = must<HTMLButtonElement>('pairRelayBtn')
   const message = must<HTMLParagraphElement>('relayMessage')
+  if (connectionInFlight) { setStatus('Wait for the current connection request.'); return }
   button.disabled = true
   const epoch = ++pairingEpoch
   try {
@@ -737,6 +761,7 @@ must<HTMLButtonElement>('pairRelayBtn').addEventListener('click', async () => {
   const button = must<HTMLButtonElement>('pairRelayBtn')
   try {
     if (endingSession) return
+    if (connectionInFlight) throw new Error('Wait for the current connection request.')
     if (sessionEnded) { sessionEnded = false; relay?.start(); renderControls() }
     const baseUrl = relayBaseUrl(must<HTMLInputElement>('relayUrl').value)
     const relayId = must<HTMLInputElement>('relayId').value.trim()
@@ -811,7 +836,7 @@ must<HTMLButtonElement>('endSessionBtn').addEventListener('click', async () => {
   } finally { endingSession = false; renderControls() }
 })
 must<HTMLButtonElement>('unlinkRelayBtn').addEventListener('click', async () => {
-  if (liveOwnsWork() || uploadInFlight) { setStatus('Finish or reconcile live updates before unlinking.'); return }
+  if (liveOwnsWork() || uploadInFlight || connectionInFlight) { setStatus('Finish current connection/import work before unlinking.'); return }
   if (!window.confirm('Remove this browser’s local pairing? Revoke its grant in RAP to remove server access.')) return
   ++pairingEpoch
   try {

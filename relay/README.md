@@ -19,6 +19,21 @@ The existing `/v1/register` invitation route remains available when `BOOTSTRAP_T
 
 ## API behavior
 
+### Optional website-first code pairing
+
+`CODE_PAIRING_ENABLED` is checked in as `"false"`. Operator opt-in requires `"true"` plus the existing real production `TURNSTILE_SITE_KEY` and secret `TURNSTILE_SECRET`; no enrollment code is needed. Production Siteverify requires action `pairing` and hostname exactly `nicholas-a11y.github.io`. Enrollment retains its separate `enrollment` action. No deployment, real verification setup or hosted/hardware validation is implied by the local tests.
+
+- Agent-authenticated `POST /agent/code/new {requestId:<UUID>}` returns `{id,code,generation,expiresAt,serverTime,status}`. Retry the same private issuance UUID to recover the same window. Healthy, current-generation RAP and no active import are required. Exactly three uppercase ASCII letters are generated without modulo bias; expiry is 60 seconds. One live window/RAP and five service-wide. Issuance: three/RAP and thirty service-wide per rolling ten minutes.
+- Agent `POST /agent/code/cancel {requestId}` returns `{id,status}`. Cancellation and redemption linearize in the registry. A claimed/completed window cannot be cancelled into an unclaimed state; revoke its browser separately.
+- Allowed-origin `GET /v1/pairing/config` returns `{enabled,siteKey}` only.
+- Allowed-origin `POST /v1/pairing/code {code,requestId,verifier,turnstileToken}` requires exactly three ASCII letters (case-insensitive), UUID and a private browser-generated 256-bit verifier, persisted before submitting. Admission precedes parsing/Siteverify/lookup: three initial submissions/IP and ten globally per rolling minute, counting failures. No public code-existence lookup or machine directory.
+- Atomic reservation consumes the code for one verifier/request before cross-object I/O. RelayDO idempotently creates an ordinary scoped browser credential, never the RAP credential, and claims no control lease. Return `{status:"complete",relayId,credential}` only after persistence. Cross-object failures leave the reservation consumed and explicitly recoverable, not silently rolled back.
+- Allowed-origin `POST /v1/pairing/claim {requestId,verifier}` recovers only that accepted reservation for two minutes and returns the same grant. Checks must be at least five seconds apart; recovery ingress is separately bounded to ten/IP and sixty globally per rolling minute. There is no code lookup or verification bypass for new claims. Revoked grants cannot be recreated.
+- Agent update/work envelopes may include `codePairing:{id,status,expiresAt}|null`, delivering outcomes without additional steady-state polling. Browser grants remain listed/revocable through the existing agent routes.
+- Codes stay unavailable for reuse for 24 hours. Encrypted claim results and verifier hashes expire logically after two minutes and are removed by the existing control-plane alarm; code metadata is removed after 24 hours. Request-time checks enforce expiry even if an alarm runs late.
+
+**Risk:** 26^3 is only 17,576 combinations. Browser verification/limits cannot guarantee against a verified attacker guessing first. This is internet-wide auto-pair authorization, not LAN membership, and browser access persists until revoked. Keep the feature off if that trade-off is unacceptable; existing stronger QR/link and desktop approval remain available. Busy/denied admission can also block legitimate users; never silently loosen limits.
+
 - RAP agent routes include `POST /pairing/new`, `POST /pairing/decide`, `GET /browsers`, `POST /browsers/revoke` and `POST /jobs/:jobId/status`, relative to `/v1/relays/:relayId`. The earlier `/agent/pairing/...` and `/agent/jobs/...` forms remain aliases; both require the agent credential.
 
 - Browser origins are restricted to `https://nicholas-a11y.github.io`, `http://localhost:5173`, and `http://127.0.0.1:5173`; CORS is not used as authentication.

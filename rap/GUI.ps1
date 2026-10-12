@@ -218,10 +218,18 @@ function Handle-UiEvent($Event) {
         }
         'health' {
             $d.healthy = $Event.value.connected
-            $d.status.Text = $Event.value.message
+            $d.importing = [bool]$Event.value.importing
+            $d.activeSlowHttp = [bool]$Event.value.slowHttp
+            $d.status.Text = $(if ($d.healthy) { 'Connected' } else { 'Reconnecting / not ready' }) +
+                ' - ' + $(if ($d.activeSlowHttp) { 'HTTP compatibility mode' } else { 'WebSockets' }) + '. ' + $Event.value.message
             if ($Event.value.importing) { $d.status.Text += ' Import in progress; never automatically retried.' }
             $d.tray.Text = 'PathPlotter RAP - ' + $(if ($d.healthy) { 'Connected' } else { 'Not ready' })
             if (-not $d.healthy) { Show-Approvals @{} }
+        }
+        'transport' {
+            $d.activeSlowHttp = [bool]$Event.value
+            $d.healthy = $false
+            $d.status.Text = 'Reconnecting - ' + $(if ($d.activeSlowHttp) { 'HTTP compatibility mode' } else { 'WebSockets' }) + '.'
         }
         'desktop' {
             # Never place launch grants in labels, clipboard, QR, logs or saved state.
@@ -233,6 +241,17 @@ function Handle-UiEvent($Event) {
             $Event.value = $null
         }
         'phone' { Show-Phone $Event.value; $d.smokePhones++ }
+        'code-window' {
+            $d.codeId = $Event.value.id; $d.codeDeadline = $d.clock.ElapsedMilliseconds + $Event.value.remainingMs
+            $d.codeText.Text = $Event.value.code
+            $d.codeStatus.Text = 'Code window requested. Cancel is best effort; completed browser access must be revoked separately.'
+        }
+        'code-status' {
+            if ($d.codeId -ceq $Event.value.id -and $Event.value.status -cne 'waiting') {
+                $d.codeText.Text = ''; $d.codeId = ''
+                $d.codeStatus.Text = $(if ($Event.value.status -in @('claimed', 'complete')) { 'Code claimed. Check Connected browsers; access persists until revoked.' } else { 'Code window ' + $Event.value.status + '.' })
+            }
+        }
         'pairings' { Show-Approvals $Event.value }
         'browsers' { Show-Browsers $Event.value }
         'action-complete' {
@@ -273,6 +292,7 @@ function Start-RapDesktop {
         bridge = (New-Object PathPlotterRap.UiBridge); clock = [Diagnostics.Stopwatch]::StartNew()
         activation = $activation; configured = $false; healthy = $false; busy = $false; closing = $false; stopped = $false; failed = $false
         phone = $null; phoneImage = $null; phoneUrl = ''; phoneDeadline = 0L; browsers = $null
+        codeId = ''; codeDeadline = 0L
         pairings = @{}; pairingSignature = ''; smoke = [bool]$SmokeTest; smokeOpens = 0; smokePhones = 0; smokeStage = 0; smokeConsentTicks = 0
         fixtureEvents = (New-Object 'Collections.Generic.List[string]')
     }
@@ -295,6 +315,23 @@ function Start-RapDesktop {
         $d.pair = New-UiButton 'Pair phone' @{ action = 'phone' }
         $d.list = New-UiButton 'Connected browsers' @{ action = 'browsers' }
         foreach ($button in @($d.open, $d.pair, $d.list)) { $button.Enabled = $false; $actions.Controls.Add($button) }
+        $codePanel = New-Object Windows.Forms.FlowLayoutPanel
+        $codePanel.Size = New-Object Drawing.Size(580, 165); $codePanel.FlowDirection = 'TopDown'; $codePanel.WrapContents = $false
+        $codeHelp = New-Object Windows.Forms.Label
+        $codeHelp.Text = 'Website-first pairing: explicitly allow a 60-second code window, then enter its three letters in PathPlotter Connection. Anyone who knows or guesses this short code can gain saved access. Use Pair phone with desktop approval for stronger protection.'
+        $codeHelp.Size = New-Object Drawing.Size(560, 60); $codePanel.Controls.Add($codeHelp)
+        $codeActions = New-Object Windows.Forms.FlowLayoutPanel
+        $codeActions.Size = New-Object Drawing.Size(560, 35)
+        $d.codeNew = New-UiButton 'Allow code pairing' @{ action = 'code-new' }
+        $d.codeCancel = New-UiButton 'Cancel code' @{ action = 'code-cancel' }
+        $d.codeNew.Enabled = $false; $d.codeCancel.Enabled = $false
+        $codeActions.Controls.Add($d.codeNew); $codeActions.Controls.Add($d.codeCancel); $codePanel.Controls.Add($codeActions)
+        $d.codeText = New-Object Windows.Forms.Label
+        $d.codeText.Size = New-Object Drawing.Size(560, 25); $d.codeText.Font = New-Object Drawing.Font('Segoe UI', 14, [Drawing.FontStyle]::Bold)
+        $codePanel.Controls.Add($d.codeText)
+        $d.codeStatus = New-Object Windows.Forms.Label
+        $d.codeStatus.Size = New-Object Drawing.Size(560, 35); $d.codeStatus.Text = 'Not enabled. Requires operator opt-in and browser verification.'
+        $codePanel.Controls.Add($d.codeStatus); $layout.Controls.Add($codePanel)
         $d.setup = New-Object Windows.Forms.FlowLayoutPanel
         $d.setup.Size = New-Object Drawing.Size(580, 255); $d.setup.FlowDirection = 'TopDown'; $d.setup.WrapContents = $false; $d.setup.Visible = $false
         $layout.Controls.Add($d.setup)
@@ -340,15 +377,34 @@ function Start-RapDesktop {
             }
         })
         $d.enrollment.Controls.Add($d.confirmEnrollment); $layout.Controls.Add($d.enrollment)
-        $fallback = New-Object Windows.Forms.Button
-        $fallback.Text = 'Connection mode: socket / explicit slow HTTP fallback...'; $fallback.AutoSize = $true
-        $fallback.Add_Click({
-            $choice = [Windows.Forms.MessageBox]::Show('Enable reduced-rate HTTP fallback? Updates, capture and approval work are slower (at least 5 seconds). No automatic import retries. Choose No to restore normal sockets.', 'Connection mode', 'YesNoCancel', 'Warning')
-            if ($choice -eq 'Yes') {
-                [void](Submit-Ui @{ action = 'slow-http' })
-            } elseif ($choice -eq 'No') { [void](Submit-Ui @{ action = 'socket' }) }
+        $d.importing = $false; $d.activeSlowHttp = $false
+        $advanced = New-Object Windows.Forms.CheckBox
+        $advanced.Text = 'Advanced connection settings'; $advanced.AutoSize = $true
+        $d.transportPanel = New-Object Windows.Forms.FlowLayoutPanel
+        $d.transportPanel.Size = New-Object Drawing.Size(580, 155)
+        $d.transportPanel.FlowDirection = 'TopDown'; $d.transportPanel.WrapContents = $false
+        $d.transportPanel.Visible = $false
+        $advanced.Add_CheckedChanged({ param($sender, $eventArgs) $script:Desktop.transportPanel.Visible = $sender.Checked })
+        $layout.Controls.Add($advanced)
+        $d.socketChoice = New-Object Windows.Forms.RadioButton
+        $d.socketChoice.Text = 'WebSockets (recommended; reconnects automatically)'
+        $d.socketChoice.AutoSize = $true; $d.socketChoice.Checked = $true
+        $d.httpChoice = New-Object Windows.Forms.RadioButton
+        $d.httpChoice.Text = 'Compatibility mode - slower HTTP'
+        $d.httpChoice.AutoSize = $true
+        $d.transportPanel.Controls.Add($d.socketChoice); $d.transportPanel.Controls.Add($d.httpChoice)
+        $help = New-Object Windows.Forms.Label
+        $help.Text = 'Use HTTP only if your network blocks WebSockets. Updates and approvals may take longer. Select the same mode in PathPlotter. No automatic HTTP fallback or import retries.'
+        $help.Size = New-Object Drawing.Size(555, 48); $d.transportPanel.Controls.Add($help)
+        $d.applyTransport = New-Object Windows.Forms.Button
+        $d.applyTransport.Text = 'Apply'; $d.applyTransport.AutoSize = $true; $d.applyTransport.Enabled = $false
+        $d.applyTransport.Add_Click({
+            $s = $script:Desktop
+            if ($s.importing) { $s.notice.Text = 'Wait for the current import outcome before changing connection settings.'; return }
+            [void](Submit-Ui @{ action = $(if ($s.httpChoice.Checked) { 'slow-http' } else { 'socket' }) })
         })
-        $layout.Controls.Add($fallback)
+        $d.transportPanel.Controls.Add($d.applyTransport)
+        $layout.Controls.Add($d.transportPanel)
         $d.consent = New-UiButton 'Request local LightBurn permission (state, project, upload)' @{ action = 'consent' }
         $d.consent.Visible = $false; $layout.Controls.Add($d.consent)
         $d.recovery = New-Object Windows.Forms.Button
@@ -421,6 +477,16 @@ function Start-RapDesktop {
                 }
                 foreach ($control in @($s.list, $s['menu-browsers'], $s['menu-forget-lightburn'], $s['menu-forget-relay'])) {
                     $control.Enabled = $s.configured -and -not $s.busy -and -not $s.closing -and -not $s.stopped
+                }
+                $s.applyTransport.Enabled = $s.configured -and -not $s.importing -and -not $s.busy -and
+                    -not $s.closing -and -not $s.stopped -and ($s.httpChoice.Checked -ne $s.activeSlowHttp)
+                $s.codeNew.Enabled = $s.healthy -and -not $s.importing -and -not $s.busy -and -not $s.closing -and -not $s.stopped
+                $s.codeCancel.Enabled = [bool]$s.codeId -and -not $s.busy -and -not $s.closing -and -not $s.stopped
+                if ($s.codeId) {
+                    $remaining = $s.codeDeadline - $s.clock.ElapsedMilliseconds
+                    if ($remaining -le 0) { $s.codeText.Text = ''; $s.codeId = ''; $s.codeStatus.Text = 'Code window expired. No new code was generated.' }
+                    elseif (-not $s.healthy) { $s.codeText.Text = ''; $s.codeStatus.Text = 'Disconnected; cancellation unconfirmed. Server expiry remains in effect.' }
+                    else { $s.codeStatus.Text = 'Expires in ' + [Math]::Ceiling($remaining / 1000) + ' seconds. Pairing saves access until revoked.' }
                 }
                 if ($null -ne $s.phone -and $s.phoneUrl) {
                     $remaining = $s.phoneDeadline - $s.clock.ElapsedMilliseconds
@@ -495,7 +561,52 @@ function Step-GuiSmoke {
                 $s.smokeStage = 6
             }
         }
-        6 { if (-not $s.phoneUrl -and $s.clock.ElapsedMilliseconds -gt 2500) { Request-RapQuit; $s.smokeStage = 7 } }
+        6 {
+            if (-not $s.phoneUrl -and -not $s.busy) {
+                if (-not $s.socketChoice.Checked -or $s.activeSlowHttp) { throw 'WebSockets must be the default.' }
+                $s.transportPanel.Visible = $true
+                $s.httpChoice.Checked = $true
+                if ($s.activeSlowHttp) { throw 'Selecting a radio button must not change transport.' }
+                $s.smokeStage = 9
+            }
+        }
+        9 {
+            if ($s.applyTransport.Enabled) { $s.applyTransport.PerformClick(); $s.smokeStage = 10 }
+        }
+        10 {
+            if ($s.activeSlowHttp -and -not $s.busy) {
+                $s.importing = $true
+                $s.applyTransport.Enabled = $false
+                $s.socketChoice.Checked = $true
+                $s.applyTransport.PerformClick()
+                if (-not $s.activeSlowHttp -or $s.busy) { throw 'Apply must not run during an import.' }
+                $s.importing = $false
+                $s.smokeStage = 11
+            }
+        }
+        11 {
+            if ($s.applyTransport.Enabled) { $s.applyTransport.PerformClick(); $s.smokeStage = 12 }
+        }
+        12 {
+            if (-not $s.activeSlowHttp -and -not $s.busy -and $s.codeNew.Enabled) {
+                $s.codeNew.PerformClick(); $s.smokeStage = 13
+            }
+        }
+        13 {
+            if ($s.codeText.Text -ceq 'ABC' -and $s.codeCancel.Enabled -and -not $s.busy) {
+                if ($s.codeDeadline - $s.clock.ElapsedMilliseconds -gt 60000) { throw 'Code countdown exceeds 60 seconds.' }
+                $s.codeCancel.PerformClick(); $s.smokeStage = 14
+            }
+        }
+        14 {
+            if (-not $s.codeId -and -not $s.busy -and $s.fixtureEvents.Contains('code-cancelled')) {
+                Handle-UiEvent @{ kind = 'code-window'; value = @{ id = 'expired-fixture'; code = 'XYZ'; remainingMs = 0 } }
+                $s.smokeStage = 15
+            }
+        }
+        15 {
+            if (-not $s.codeId -and -not $s.codeText.Text) { Request-RapQuit; $s.smokeStage = 7 }
+        }
     }
 }
 
@@ -503,11 +614,12 @@ function Assert-GuiSmoke {
     $s = $script:Desktop
     if ($s.failed -or $s.smokeStage -ne 7 -or $s.smokeOpens -ne 1 -or $s.smokePhones -ne 1 -or
         $s.fixtureEvents.Contains('approve') -or -not $s.fixtureEvents.Contains('reject') -or -not $s.fixtureEvents.Contains('disconnected') -or
-        -not $s.fixtureEvents.Contains('enrollment-confirmed') -or -not $s.fixtureEvents.Contains('consent-denied') -or -not $s.fixtureEvents.Contains('consent-granted') -or $s.smokeConsentTicks -lt 10) {
+        -not $s.fixtureEvents.Contains('enrollment-confirmed') -or -not $s.fixtureEvents.Contains('consent-denied') -or -not $s.fixtureEvents.Contains('consent-granted') -or
+        -not $s.fixtureEvents.Contains('code-created') -or -not $s.fixtureEvents.Contains('code-cancelled') -or $s.smokeConsentTicks -lt 10) {
         throw ('GUI fixture smoke checks failed: stage=' + $s.smokeStage + ', failed=' + $s.failed +
             ', opens=' + $s.smokeOpens + ', phones=' + $s.smokePhones + ', fixture=' + ($s.fixtureEvents -join ','))
     }
-    Write-Host 'PASS GUI: STA form/tray, guided verifier enrollment + matching phrase + >=5s pending claim, denied/explicitly retried consent, responsive UI timer, desktop auto-open once, phone QR expiry, exact pairing phrase rejection, duplicate activation and graceful disconnected shutdown.'
+    Write-Host 'PASS GUI: STA form/tray, guided enrollment, consent, responsive UI, desktop/phone pairing, explicit code window/countdown/cancel/expiry, advanced transport radio selection with explicit Apply and import guard, duplicate activation and graceful shutdown.'
 }
 
 if (-not $LibraryOnly) {

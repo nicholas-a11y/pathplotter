@@ -5,6 +5,7 @@ $onlyWorkerFunctions = [bool]$LibraryOnly
 $script:UiBridge = $Bridge
 $script:Healthy = $false
 $script:AutoOpened = $false
+$script:CodeRequest = $null
 $script:HostedApp = 'https://nicholas-a11y.github.io/pathplotter/'
 
 function Send-Ui([string]$Kind, $Value = $null) {
@@ -103,7 +104,11 @@ function Get-DesktopLaunchUrl {
 
 function Publish-RapHealth([string]$Message, [bool]$Connected) {
     $script:Healthy = $Connected
-    Send-Ui 'health' @{ message = $Message; connected = $Connected; importing = ($null -ne $script:ActiveImport) }
+    Send-Ui 'health' @{ message = $Message; connected = $Connected; importing = ($null -ne $script:ActiveImport); slowHttp = [bool]$script:SlowHttp }
+    if (-not $Connected -and $null -ne $script:CodeRequest) {
+        try { Stop-CodePairing }
+        catch { Send-Ui 'notice' 'Code cancellation could not be confirmed while disconnected. The server window still expires after 60 seconds; check Connected browsers for any completed pairing.' }
+    }
     if ($Connected -and -not $script:AutoOpened -and -not $Bridge.StopRequested) {
         # One attempt per normal launch, never on a reconnect or ordinary invitation.
         $script:AutoOpened = $true
@@ -125,10 +130,56 @@ function Show-PendingPairings($Pairings) {
     Send-Ui 'pairings' ([hashtable]$next.Clone())
 }
 
+function Show-CodePairing($State) {
+    if ($null -eq $State -or $null -eq $script:CodeRequest -or (Get-Field $State 'id') -cne $script:CodeRequest.id) { return }
+    $status = Get-Field $State 'status'
+    if ($status -cnotmatch '^(waiting|claimed|complete|cancelled|expired|failed)$') { throw 'Invalid code pairing state.' }
+    Send-Ui 'code-status' @{ id = $script:CodeRequest.id; status = $status }
+    if ($status -cne 'waiting') {
+        $script:CodeRequest = $null
+        if ($status -ceq 'complete') { Send-Ui 'notice' 'A browser paired using the code and retains access until revoked. Check Connected browsers to revoke unwanted access.' }
+    }
+}
+
+function Stop-CodePairing {
+    if ($null -eq $script:CodeRequest) { return }
+    $result = Invoke-Cloud '/agent/code/cancel' @{ requestId = $script:CodeRequest.id }
+    Show-CodePairing $result
+}
+
 function Invoke-UiCommand($Command) {
     switch -CaseSensitive ($Command.action) {
-        'slow-http' { Set-RapTransport $true; Send-Ui 'notice' 'Slow HTTP fallback enabled explicitly. Updates and capture work wait at least 5 seconds; use socket mode to restore live preview.' }
-        'socket' { Set-RapTransport $false }
+        'code-new' {
+            if (-not $script:Healthy -or $null -ne $script:ActiveImport -or $Bridge.StopRequested) { throw 'Wait for a healthy, idle RAP before code pairing.' }
+            if ($null -eq $script:CodeRequest -or $script:CodeRequest.deadline -le $script:Clock.ElapsedMilliseconds) {
+                $script:CodeRequest = @{ id = [Guid]::NewGuid().ToString(); deadline = $script:Clock.ElapsedMilliseconds + 60000 }
+            }
+            Send-Ui 'code-window' @{ id = $script:CodeRequest.id; code = ''; remainingMs = [Math]::Max(0, $script:CodeRequest.deadline - $script:Clock.ElapsedMilliseconds) }
+            try {
+                $requestTick = $script:Clock.ElapsedMilliseconds
+                $result = Invoke-Cloud '/agent/code/new' @{ requestId = $script:CodeRequest.id }
+                $code = Get-Field $result 'code'
+                $remaining = (Convert-Time (Get-Field $result 'expiresAt')) - (Convert-Time (Get-Field $result 'serverTime')) -
+                    ($script:Clock.ElapsedMilliseconds - $requestTick)
+                if ($code -isnot [string] -or $code -cnotmatch '^[A-Z]{3}$' -or $remaining -gt 60000) { throw 'Invalid code window.' }
+                Send-Ui 'code-window' @{ id = $script:CodeRequest.id; code = $code; remainingMs = [Math]::Max(0, $remaining) }
+                $script:CodeRequest.deadline = $script:Clock.ElapsedMilliseconds + [Math]::Max(0, $remaining)
+                Show-CodePairing $result
+            } catch { Send-Ui 'notice' 'Code pairing unavailable, busy or interrupted. Check that the operator enabled it. Retry Allow code pairing to recover the same window, or Cancel; no new window is created automatically.' }
+        }
+        'code-cancel' { Stop-CodePairing }
+        'slow-http' {
+            if ($null -ne $script:ActiveImport) { Send-Ui 'notice' 'Wait for the current import outcome before changing connection settings. Connection mode was not changed.'; return }
+            Set-RapTransport $true
+            Send-Ui 'transport' $true
+            Send-Ui 'notice' 'HTTP compatibility mode selected. Responses may take several seconds; select the same mode in PathPlotter. No automatic import retries.'
+        }
+        'socket' {
+            if ($null -ne $script:ActiveImport) { Send-Ui 'notice' 'Wait for the current import outcome before changing connection settings. Connection mode was not changed.'; return }
+            Set-RapTransport $false
+            Send-Ui 'transport' $false
+            Send-Ui 'notice' 'WebSockets selected. Reconnecting; select WebSockets in PathPlotter too. HTTP fallback is never automatic.'
+        }
         'open' { Send-Ui 'desktop' (Get-DesktopLaunchUrl) }
         'phone' {
             if (-not $script:Healthy) { throw 'Wait for a healthy connection.' }
@@ -197,4 +248,8 @@ if ($Fixture) { . (Join-Path $PSScriptRoot 'Tests\GUIFixture.ps1') }
 if ($onlyWorkerFunctions) { return }
 try { Start-Rap }
 catch { Send-Ui 'fatal' 'RAP could not start. Check registration, local permissions, protected state and the instance lock. Do not delete the import journal to retry imports.' }
-finally { Send-Ui 'stopped' }
+finally {
+    try { Stop-CodePairing }
+    catch { Send-Ui 'notice' 'Code cancellation was not confirmed on shutdown. Server expiry remains in effect; completed browser access must be revoked separately.' }
+    Send-Ui 'stopped'
+}

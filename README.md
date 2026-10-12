@@ -75,9 +75,25 @@ The website cannot detect, install or silently start RAP. **Get started** provid
 4. Click **Approve matching phrase** on the computer.
 5. Wait for fresh coordinates and capture control. If another browser has control, use **Take control** and confirm the switch.
 
-Phone requests always require desktop approval. Do not share pairing links or screenshots of the QR code.
+QR/link pairing always requires desktop approval. Do not share pairing links or screenshots of the QR code.
 
-The browser's **Connection** dialog also supports manual entry of the relay URL, relay ID and invitation. Its single **Pair** button pairs and requests capture control. An already paired browser can use **Pair** without another invitation. Saved same-RAP authorization is reused; reopening a same-RAP link closes Connection immediately and puts any outstanding-work reminder in the main status area.
+### Website-first pairing with three letters (optional)
+
+1. Open PathPlotter in your browser and choose **Connection > Cloud relay (RAP)**.
+2. Choose **Start code pairing** to load browser verification.
+3. In the healthy, idle RAP status window, choose **Allow code pairing**.
+4. Enter its three letters within **60 seconds**, complete verification and choose **Connect with code**. Case does not matter; no relay ID or QR is needed.
+5. The code closes after one claim. Use **Take control** when ready; code pairing never takes control from another browser automatically.
+
+This feature is **operator-disabled by default**. Both devices require internet, not necessarily the same Wi-Fi. It is not LAN discovery. Three letters are guessable: someone who knows or guesses the code during the window can gain **saved browser access until revoked**. Browser verification and strict service limits reduce, but do not eliminate, this risk. Use the QR/link with desktop approval for stronger protection.
+
+There are at most five live code windows across the service, three submissions per IP per rolling minute and ten submissions per rolling minute globally. Busy/rate-limited messages are explicit; wait or use the existing QR/link method. RAP also limits new windows and never renews them automatically.
+
+**Cancel code** stops an unclaimed window. If already claimed, revoke unwanted access through RAP's **Connected browsers** instead. Closing/disconnecting RAP attempts cancellation, but on network failure the server expiry remains the final bound. A completed pairing is not revoked by closing RAP or using **End session**.
+
+If a response is lost, **Recover pairing** uses the saved private request rather than trying the code again. Recovery is short-lived and checks are at least five seconds apart. Do not discard recovery unless prepared to review/revoke any completed browser grant in RAP. Points and the previous connection are preserved if pairing fails.
+
+The browser's **Connection > Existing QR/link or manual pairing** section still supports the relay URL, relay ID and invitation. Its **Pair** button pairs and requests capture control. An already paired browser can use **Pair** without another invitation. Saved same-RAP authorization is reused; reopening a same-RAP link closes Connection immediately and puts any outstanding-work reminder in the main status area.
 
 For detailed startup, tray controls and credential recovery, see [RAP instructions](rap/README.md).
 

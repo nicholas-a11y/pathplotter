@@ -1,4 +1,12 @@
 # Safe worker fixture. Never uses network, actual user registration or LightBurn.
+$script:ActiveImport = @{ fixture = $true }
+Invoke-UiCommand @{ action = 'slow-http' }
+if ($script:SlowHttp -or $null -eq $script:ActiveImport) { throw 'Worker changed transport or stopped an active import.' }
+$script:SlowHttp = $true
+Invoke-UiCommand @{ action = 'socket' }
+if (-not $script:SlowHttp -or $null -eq $script:ActiveImport) { throw 'Worker restored sockets during an active import.' }
+$script:SlowHttp = $false
+$script:ActiveImport = $null
 $script:FixtureConsentAttempts = 0
 $script:FixtureClaimAttempts = 0
 function Invoke-Http([string]$Url, [string]$Method, [string]$Token, $Body = $null, [hashtable]$Headers = @{}, [int]$TimeoutMs = 5000, [switch]$Raw) {
@@ -36,6 +44,15 @@ function Invoke-Cloud([string]$Path, $Body = @{}, [string]$Method = 'POST') {
         }
         '/agent/browser-launch' { return @{ launchToken = 'fixture-launch-never-display'; expiresAt = $now + 60000 } }
         '/pairing/new' { return @{ invitation = 'fixture-phone'; expiresAt = $now + 300000 } }
+        '/agent/code/new' {
+            if ($null -ne $script:ActiveImport) { throw 'Code window issued during an import.' }
+            Send-Ui 'fixture' 'code-created'
+            return @{ id = $Body.requestId; code = 'ABC'; expiresAt = $now + 60000; serverTime = $now; status = 'waiting' }
+        }
+        '/agent/code/cancel' {
+            Send-Ui 'fixture' 'code-cancelled'
+            return @{ id = $Body.requestId; status = 'cancelled' }
+        }
         '/pairing/decide' {
             if ($Body.pairingId -cne 'fixture-pair') { throw 'Wrong pairing target.' }
             if ($Body.approve) { Send-Ui 'fixture' 'approve' }

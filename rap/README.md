@@ -168,8 +168,14 @@ the original observation timing, never a cached preview or a restamped result.
 The server enforces request lifetime/context/owner/generation; a late read fails
 instead of weakening the browser's two-second freshness requirement.
 
-There is **no automatic HTTP fallback**. Select **Connection mode** in the status
-window (or `slow-http` in diagnostics) to explicitly enable reduced-rate updates
+There is **no automatic HTTP fallback**. Expand **Advanced connection settings**
+in the status window, choose **WebSockets (recommended; reconnects automatically)**
+or **Compatibility mode - slower HTTP**, then click **Apply**. Selecting a radio
+button alone does not reconnect. Apply is unavailable during imports, and the
+worker also refuses transport changes while an import is active. The status
+reports the actual transport separately from the selected, unapplied choice.
+Select the same transport in PathPlotter. WebSockets is the default at startup.
+Use `slow-http` in diagnostics to explicitly enable reduced-rate updates
 and capture work, no faster than every five seconds. Socket mode restores normal
 operation with a new generation. No transport switch retries an uncertain upload.
 The fallback can miss a ten-second capture deadline during slow local reads,
@@ -180,6 +186,23 @@ and invalid context/coordinates are distinct fixed local error categories.
 No automatic LightBurn pairing is performed on authorization failure. Check
 the Windows clock, API capability grants, and which LightBurn copy has focus.
 Use `forget-lightburn` and restart only when you intend to pair again.
+
+## Optional website-first code pairing
+
+The status window offers **Allow code pairing** while RAP is healthy and no import is active. The operator must first enable this optional service and configure real browser verification; it is off by default. This is separate from transport settings and computer enrollment.
+
+1. On the static website, choose **Connection > Cloud relay (RAP) > Start code pairing**.
+2. In RAP, explicitly choose **Allow code pairing**.
+3. Enter the displayed three letters in the website and complete verification within the **60-second** countdown. No relay ID, QR or second desktop approval is needed.
+4. A successful claim closes the code. The browser retains access until revoked through **Connected browsers**. Capture-control takeover remains a separate explicit browser action.
+
+**Anyone who knows or guesses this short code during the window can gain persistent browser access.** Verification and strict limits reduce but cannot eliminate guessing. This does not prove the browser is on the same LAN. Use **Pair phone**, compare its phrase and approve in RAP for stronger protection.
+
+**Cancel code** closes an unclaimed window. Already-claimed access must be revoked separately. Expiry does not renew the code. RAP hides codes when disconnected and attempts cancellation on disconnect/orderly quit; failure to reach the relay cannot guarantee immediate cancellation, so the server's 60-second expiry still applies. Closing the status window merely hides RAP in the tray and is not Quit.
+
+If issuance is interrupted, explicitly retry **Allow code pairing** to recover the same window within its lifetime. If the browser loses a reply, use its **Recover pairing**, not the short code again. Recovery lasts two minutes after acceptance. Existing QR/desktop links and saved pairing remain unchanged.
+
+Service admission is limited to five live windows globally, three initial submissions/IP/minute and ten globally/minute; new windows are separately capped at three/RAP and thirty globally per rolling ten minutes. Limits can temporarily block legitimate users. No code is automatically issued on startup or reconnect.
 
 ## Import safety and limitations
 
