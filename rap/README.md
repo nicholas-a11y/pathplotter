@@ -13,9 +13,15 @@ and the Windows .NET Framework are used.
    **Start RAP.cmd** (or **Start RAP.vbs** to avoid even a brief command-window
    flash). RAP starts a small Windows Forms status window and tray icon, with no
    everyday console. A second launch activates the existing status window.
-2. On first use, enter the operator-supplied HTTPS relay origin, a computer name,
-   and a single-use registration invitation in the graphical setup. Invitation
-   input is masked and cleared after submission.
+2. On first use, choose a computer name and **Register this computer**. The
+   current relay is prefilled; leave the invitation blank for guided browser
+   enrollment. RAP opens the hosted setup page and displays a comparison phrase.
+   Verify the exact phrase for this computer, complete the browser verification
+   and explicitly approve there, then confirm the matching phrase in RAP.
+   Setup checks are at least five seconds apart. **Advanced: override relay
+   origin** and an optional masked operator invitation retain existing setup paths.
+   The service must have enrollment enabled; unavailable/full setup is not a
+   reason to approve a different phrase or silently register another computer.
 3. Open LightBurn, enable its REST API in Settings > Extensions, and keep
    **Allow API Access From Network disabled**. Click **Request local LightBurn
    permission** to consent to `state`, `project`, and `upload`. Bring
@@ -59,7 +65,8 @@ runspace owns all protocol operations and serialized imports; synchronous
 network calls never run on the form/tray thread. First-time LightBurn's own
 consent dialog and bounded HTTP requests can delay worker actions, not the UI.
 Quit waits for worker cleanup, fences incomplete imports, disposes retained
-streams, publishes disconnected when possible, and removes the tray icon.
+streams/sockets, and removes the tray icon. Socket closure reports disconnect;
+slow HTTP mode only sends a disconnected update if its five-second interval permits.
 It does not force-kill an upload or erase uncertain outcomes.
 
 The launcher does **not** use an execution-policy bypass. If Windows policy
@@ -86,6 +93,8 @@ delayed during setup, but not by the 20-second confirmation wait.
 | `approve ID` / `reject ID` | Decide a currently pending, phrase-verified pairing. |
 | `browsers` | List paired browser IDs. |
 | `revoke ID` | Revoke a browser through the authenticated relay contract. |
+| `slow-http` | Explicitly opt into HTTP updates at least five seconds apart; capture, approval and job delivery are slower. |
+| `socket` | Restore normal socket transport; reconnect with a new generation. |
 | `forget-lightburn` | Forget the local LightBurn secret and stop. **Also revoke** PathPlotter RAP in LightBurn's **Manage API Security**. Restarting requires explicit pairing consent. |
 | `forget-relay` | Delete local credentials and stop, preserving the import journal. **Ask the operator to revoke the old relay agent credential**, and revoke the LightBurn entry in its UI. |
 | `quit` / Ctrl+C | Stop; publish a disconnected heartbeat when possible. |
@@ -107,29 +116,64 @@ network logons. No arbitrary command, URL or credential is accepted via IPC.
 These protections do not defend against software running as your
 Windows user or an administrator.
 
-RAP targets a **500 ms cycle**, without overlapping status/project/position
-reads. It validates status and documented workspace/device context each cycle.
-Latency, cloud requests and synchronous import setup can make the actual interval
-longer. Confirmation is cooperatively polled without waiting across main-loop
-iterations, retaining one SSE stream while coordinate reads/publications continue.
+Enrollment additionally protects `enrollment.dpapi` **before** sending its
+random 32-byte verifier. A lost start/claim reply is resumed explicitly using
+the same relay, computer name and verifier, not a new identity. The verifier
+never enters the browser URL. Claimed credentials are flushed to
+`credentials.dpapi` before the pending enrollment is removed. **Discard expired
+enrollment setup** requires explicit consent: discarding an ambiguous verifier
+can forfeit registration recovery. Existing credentials and journals are untouched.
+
+RAP targets **500 ms local observations**, without overlapping status/project/position
+reads, independently of publication and reconnect backoff. With authorized
+preview active, changed observations are published at **at most 2 Hz**. Three
+distinct identical local observations establish settled state; it is published
+once, then stationary updates wait for **15-second fresh health** or explicit
+server work. Without preview, ordinary coordinates are not continuously pushed.
+Latency and synchronous import setup can make actual observation intervals longer.
+Confirmation is cooperatively polled without waiting across main-loop iterations,
+retaining one SSE stream while local observation and socket work continue.
 This is not a hard 500 ms delivery guarantee, and the **2-second stale cutoff
 is unchanged**. API success is an observation, not proof of a newly measured controller
 position. Missing workpiece X/Y never fall back to machine coordinates or zero.
 Missing workpiece dimensions remain `null`; missing machine size, workpiece
 offset or machine-view context fails closed.
 
-Timed `/agent/start` and `/agent/update` responses supply `serverTime`. RAP
+Timed `/agent/start` and socket `update-result` responses supply `serverTime`. RAP
 calibrates a monotonic server-clock estimate with **full roundtrip duration**
 as its uncertainty, never the desktop wall clock. Each connected update includes
 `observedAtServer` (back-projected to the earliest instant of the local read)
 and `clockUncertaintyMs`, as well as elapsed read age. The backend computes
 `max(reported age, serverNow - observedAtServer + clockUncertaintyMs)` at receipt,
-so a buffered/delayed observation cannot look newly observed. Updates have a
-whole-request 1000 ms abort deadline. Missing calibration or a local sample
+so a buffered/delayed observation cannot look newly observed. Socket connect
+and send deadlines are five seconds; unacknowledged updates fail after five seconds.
+HTTP fallback updates retain a whole-request 1000 ms abort deadline. Missing calibration or a local sample
 exceeding 2 seconds publishes disconnected with no position/context. Browsers
 still account for receipt age and their own server-clock calibration.
-Reads and cloud reconnect use bounded backoff (0.5–30 s).
+Socket reconnect uses bounded backoff (0.5–30 s); HTTP fallback reconnect never
+accelerates its five-second update interval. Local observations continue independently.
 A new agent generation fences old sessions; fresh observations are required.
+
+The built-in .NET `ClientWebSocket` authenticates
+`/v1/relays/{relayId}/agent/stream?generation=N` using the Authorization header,
+not credentials in a URL. Transport helpers only enqueue text: **16 KiB outgoing
+/ 1 MiB incoming per message** (incoming includes the existing 512 KiB SVG job),
+**16 outgoing / 32 incoming messages, 4 MiB total incoming payload**,
+strict UTF-8 and text-only receive,
+including bounded fragmented messages. All v2 JSON, pairing, capture and job
+handling remains in the single MTA worker. `work` requests force a fresh update
+even when stationary so pending jobs can be safely claimed. `capture` requests
+perform a **new local read**, correlated by UUID, and return `capture-result` with
+the original observation timing, never a cached preview or a restamped result.
+The server enforces request lifetime/context/owner/generation; a late read fails
+instead of weakening the browser's two-second freshness requirement.
+
+There is **no automatic HTTP fallback**. Select **Connection mode** in the status
+window (or `slow-http` in diagnostics) to explicitly enable reduced-rate updates
+and capture work, no faster than every five seconds. Socket mode restores normal
+operation with a new generation. No transport switch retries an uncertain upload.
+The fallback can miss a ten-second capture deadline during slow local reads,
+setup or uploads; request a new capture explicitly, never commit an old preview.
 
 API authorization failure, no machine connection, network refusal/timeouts,
 and invalid context/coordinates are distinct fixed local error categories.
@@ -182,7 +226,7 @@ LightBurn applying the upload; undocumented origin changes cannot be promised
 detectable. These are protocol limitations, not an exactly-once guarantee.
 
 Cloud timestamps accept epoch milliseconds or ISO-8601 UTC strings; numeric
-generation and increasing sequence implement the v1 contract. The tray's
+generation and increasing sequence preserve fencing under the v2 transport. The tray's
 desktop launch requires the updated authenticated
 `POST /v1/relays/{relayId}/agent/browser-launch` endpoint: `{}` returns
 `{launchToken, expiresAt}`. RAP opens `#relay=...&relayId=...&launch=TOKEN`
@@ -206,10 +250,14 @@ The standalone script returns a nonzero exit code on failure and requires
 actual PS5.1. It parses all RAP scripts, compiles the in-memory .NET helpers,
 tests DPAPI/atomic state/ACLs, exact HMAC/SVG/freshness/context validation
 (including delayed-publication and missing-calibration cases),
-strict SSE recognition and raw HTTP transport against ephemeral loopback
+strict SSE recognition, raw HTTP transport and real ClientWebSocket
+Authorization/send/fragmentation/size/cancellation against ephemeral loopback
 **test fixtures**, and mocked approval/revocation/import ordering, fencing,
 nonblocking main-loop publication during confirmation, serial imports, timeout,
-stop/exit cleanup, duplicate delivery and restart reconciliation.
+stop/exit cleanup, duplicate delivery and restart reconciliation. Scheduling checks
+verify independent 500 ms reads, 2 Hz maximum pushes, settled-once/15-second
+health, stationary fresh capture and pairing work, explicit >=5-second HTTP
+fallback, and verifier-bound ambiguous enrollment recovery.
 It never contacts LightBurn/cloud, requests hardware
 pairing, uploads to hardware, or changes the user's real RAP state. Its isolated
 test state and compilation scratch files stay within `rap` and are removed.
@@ -217,7 +265,8 @@ No test framework or runtime installation is needed.
 
 `Test-GUI.ps1` compiles the bundled local QR encoder, rejects desktop-grant QR
 generation, verifies fixed-action duplicate activation, and runs a real STA
-form/tray with a mocked protocol runspace. It exercises graphical enrollment,
+form/tray with a mocked protocol runspace. It exercises guided graphical enrollment,
+matching-phrase confirmation and >=5-second pending claim checks,
 denied and then explicitly retried local consent, healthy auto-open once,
 phone QR/link expiry, exact-phrase targeting (mismatches cannot approve),
 explicit rejection, responsive worker/UI scheduling, and graceful disconnected

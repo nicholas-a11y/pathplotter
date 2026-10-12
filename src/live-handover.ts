@@ -16,7 +16,7 @@ function parseState(value: unknown): LiveHandoverState {
   if (!record(value) || typeof value.enabled !== 'boolean') throw new Error('Invalid live ownership response.')
   const target = value.target
   if (target === null && !value.enabled) return { enabled: false, target: null }
-  if (!record(target) || !['local', 'relay'].includes(String(target.mode)) ||
+  if (!record(target) || !['local', 'relay', 'webtool'].includes(String(target.mode)) ||
       typeof target.baseUrl !== 'string' || typeof target.contextRevision !== 'string' || !target.contextRevision ||
       (target.mode === 'relay' && (typeof target.relayId !== 'string' || !target.relayId))) {
     throw new Error('Invalid live ownership destination.')

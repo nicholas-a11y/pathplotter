@@ -16,6 +16,10 @@ function Wait-Ui([string]$Action) {
         $command = $null
         if ($Bridge.Commands.TryDequeue([ref]$command)) {
             if ($command.action -ceq $Action) { return $command }
+            if ($command.action -ceq 'discard-enrollment' -and $Action -ceq 'register') {
+                [IO.File]::Delete((Join-Path $script:DataDirectory 'enrollment.dpapi'))
+                Send-Ui 'setup'
+            }
         }
         Start-Sleep -Milliseconds 50
     }
@@ -37,21 +41,41 @@ function Initialize-Config {
         [IO.File]::Delete((Join-Path $script:DataDirectory 'credentials.dpapi'))
         $script:Config = $null
     }
-    while ($null -eq $script:Config) {
-        Send-Ui 'setup'
+    while ($null -eq $script:Config -and -not $Bridge.StopRequested) {
+        $savedEnrollment = $null
+        try { $savedEnrollment = Read-Protected 'enrollment.dpapi' }
+        catch { Send-Ui 'notice' 'Pending enrollment is unreadable. Explicitly discard expired setup below, or restore its protected file to recover an ambiguous registration.' }
+        Send-Ui 'setup' $savedEnrollment
         $command = Wait-Ui 'register'
         try {
             $api = Assert-CloudRoot $command.api
             $name = $command.name
             if ([string]::IsNullOrWhiteSpace($name) -or $name.Length -gt 80 -or $name -match '[\x00-\x1f]') { throw 'Invalid computer name.' }
-            if ([string]::IsNullOrWhiteSpace($command.invitation)) { throw 'Registration invitation required.' }
-            $result = Invoke-Http ($api + '/v1/register') 'POST' '' @{ bootstrapToken = $command.invitation; name = $name }
-            if ((Get-Field $result 'relayId') -isnot [string] -or [string]::IsNullOrEmpty($result.relayId) -or
-                (Get-Field $result 'credential') -isnot [string] -or [string]::IsNullOrEmpty($result.credential)) { throw 'Invalid registration response.' }
-            $script:Config = @{ apiRoot = $api; relayId = $result.relayId; credential = $result.credential; lightBurnSecret = '' }
-            Write-Protected 'credentials.dpapi' $script:Config
+            if ([string]::IsNullOrWhiteSpace($command.invitation)) {
+                $pending = Start-Enrollment $api $name
+                Send-Ui 'enrollment' @{ phrase = $pending.phrase; url = (Get-EnrollmentUrl $pending) }
+                $confirmation = Wait-Ui 'confirm-enrollment'
+                if ($confirmation.phrase -cne $pending.phrase) { throw 'Enrollment phrase mismatch.' }
+                $deadline = $script:Clock.ElapsedMilliseconds + 600000
+                $nextClaim = 0L
+                while (-not $Bridge.StopRequested -and $script:Clock.ElapsedMilliseconds -lt $deadline) {
+                    if ($script:Clock.ElapsedMilliseconds -ge $nextClaim) {
+                        $nextClaim = $script:Clock.ElapsedMilliseconds + 5000
+                        if (Complete-Enrollment $pending) { break }
+                    }
+                    if ($Bridge.StopRequested) { throw 'Setup cancelled.' }
+                    Start-Sleep -Milliseconds 50
+                }
+                if ($null -eq $script:Config) { throw 'Enrollment cancelled or expired; protected verifier retained for explicit resume.' }
+            } else {
+                $result = Invoke-Http ($api + '/v1/register') 'POST' '' @{ bootstrapToken = $command.invitation; name = $name }
+                if ((Get-Field $result 'relayId') -isnot [string] -or [string]::IsNullOrEmpty($result.relayId) -or
+                    (Get-Field $result 'credential') -isnot [string] -or [string]::IsNullOrEmpty($result.credential)) { throw 'Invalid registration response.' }
+                $script:Config = @{ apiRoot = $api; relayId = $result.relayId; credential = $result.credential; lightBurnSecret = '' }
+                Write-Protected 'credentials.dpapi' $script:Config
+            }
         } catch {
-            Send-Ui 'notice' 'Registration failed. Check the HTTPS origin, printable computer name and operator invitation. A consumed invitation may need replacement; no automatic retry.'
+            Send-Ui 'notice' 'Setup failed or expired. Retry explicitly to resume the protected enrollment with the same relay and name. Check service availability or use an operator invitation. A consumed invitation may need replacement.'
         } finally { $command.invitation = $null }
     }
     while ([string]::IsNullOrEmpty($script:Config.lightBurnSecret)) {
@@ -103,6 +127,8 @@ function Show-PendingPairings($Pairings) {
 
 function Invoke-UiCommand($Command) {
     switch -CaseSensitive ($Command.action) {
+        'slow-http' { Set-RapTransport $true; Send-Ui 'notice' 'Slow HTTP fallback enabled explicitly. Updates and capture work wait at least 5 seconds; use socket mode to restore live preview.' }
+        'socket' { Set-RapTransport $false }
         'open' { Send-Ui 'desktop' (Get-DesktopLaunchUrl) }
         'phone' {
             if (-not $script:Healthy) { throw 'Wait for a healthy connection.' }

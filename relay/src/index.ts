@@ -11,7 +11,7 @@ const MAX_JSON_BYTES = 16 * 1024;
 const MAX_JOB_JSON_BYTES = 540 * 1024;
 const MAX_SVG_BYTES = 512 * 1024;
 const SNAPSHOT_MAX_AGE_MS = 2_000;
-const BROWSER_LEASE_MS = 15_000;
+const BROWSER_LEASE_MS = 45_000;
 const PAIRING_LIFETIME_MS = 5 * 60_000;
 const JOB_LIFETIME_MS = 60_000;
 const JOB_RETENTION_MS = 24 * 60 * 60_000;
@@ -22,6 +22,11 @@ const LAUNCH_OUTSTANDING_LIMIT = 5;
 const LAUNCH_RATE_WINDOW_MS = 10 * 60_000;
 const LAUNCH_RATE_LIMIT = 20;
 const LAUNCH_BROWSER_LIMIT = 20;
+const LIVENESS_MS = 45_000;
+const FALLBACK_MS = 5_000;
+type SocketIdentity = { role: "agent" | "browser"; browserId?: string; generation?: number; seen: number; lastMessage?: number; sequence?: number; watching?: boolean };
+type Capture = { browserId: string; generation: number; revision: string | null; created: number; sequence: number; observedAt: number; status: "pending" | "complete" | "failed"; body?: unknown; error?: string };
+type EnrollmentClaim = { status: "pending" } | { status: "complete"; relayId: string; credential: string };
 
 type JsonObject = Record<string, unknown>;
 type Snapshot = {
@@ -78,6 +83,12 @@ function jsonResponse(value: unknown, status = 200): Response {
 function errorResponse(error: unknown): Response {
   if (error instanceof HttpError) {
     return jsonResponse({ error: error.code }, error.status);
+  }
+  // RPC preserves Error messages, not application subclasses/properties.
+  if (error instanceof Error) {
+    const codes: Record<string, number> = { registration_rate_limited: 429, registration_capacity: 429, enrollment_busy: 429, enrollment_not_found: 404, unauthorized: 401 };
+    const code = Object.keys(codes).find((c) => error.message === c || error.message.endsWith(`: ${c}`));
+    if (code) return jsonResponse({ error: code }, codes[code]);
   }
   return jsonResponse({ error: "internal_error" }, 500);
 }
@@ -242,17 +253,6 @@ function requireAllowedOrigin(request: Request): string {
   return origin;
 }
 
-function currentSnapshot(sql: SqlStorage): Snapshot | null {
-  const row = sql.exec<{ payload: string }>("SELECT payload FROM snapshots WHERE singleton = 1").toArray()[0];
-  if (!row) return null;
-  try {
-    const parsed: unknown = JSON.parse(row.payload);
-    return isObject(parsed) ? parsed as unknown as Snapshot : null;
-  } catch {
-    return null;
-  }
-}
-
 function jobResult(job: Pick<StoredJob, "id" | "status" | "error">, resolved = false): JobResult {
   const result: JobResult = job.error ? { id: job.id, status: job.status, error: job.error } : { id: job.id, status: job.status };
   if (resolved && job.status === "unknown") result.resolved = true;
@@ -391,11 +391,106 @@ export class ControlPlaneDO extends DurableObject<Env> {
           relay_id TEXT NOT NULL,
           consumed_at INTEGER NOT NULL
         );
+        CREATE TABLE IF NOT EXISTS preview_leases (relay_id TEXT PRIMARY KEY, expires_at INTEGER NOT NULL);
+        CREATE TABLE IF NOT EXISTS enrollments (
+          id TEXT PRIMARY KEY, name TEXT NOT NULL, verifier_hash TEXT NOT NULL,
+          phrase TEXT NOT NULL, expires_at INTEGER NOT NULL, status TEXT NOT NULL,
+          relay_id TEXT, wrapped_iv TEXT, wrapped_credential TEXT
+        );
+        CREATE TABLE IF NOT EXISTS registered_relays (relay_id TEXT PRIMARY KEY);
       `);
+      if (await ctx.storage.getAlarm() === null) await ctx.storage.setAlarm(Date.now() + 60_000);
     });
   }
 
-  consumeRegistrationAttempt(ipHash: string, tokenHash: string | null, relayId: string, now: number): "allowed" | "invalid" | "consumed" | "rate_limited" {
+  async alarm(): Promise<void> {
+    const now = Date.now();
+    this.ctx.storage.sql.exec("DELETE FROM preview_leases WHERE expires_at <= ?", now);
+    this.ctx.storage.sql.exec("DELETE FROM enrollments WHERE expires_at <= ?", now);
+    this.ctx.storage.sql.exec("DELETE FROM registration_rates WHERE window_start <= ?", now - 5 * 60_000);
+    await this.ctx.storage.setAlarm(now + 60_000);
+  }
+
+  async preview(relayId: string, wanted: boolean): Promise<boolean> {
+    const now = Date.now();
+    const accepted = this.ctx.storage.transactionSync(() => {
+      this.ctx.storage.sql.exec("DELETE FROM preview_leases WHERE expires_at <= ? OR (relay_id = ? AND ? = 0)", now, relayId, wanted ? 1 : 0);
+      if (!wanted) return false;
+      const exists = this.ctx.storage.sql.exec("SELECT relay_id FROM preview_leases WHERE relay_id = ?", relayId).toArray().length > 0;
+      if (!exists && this.ctx.storage.sql.exec<{ n: number }>("SELECT COUNT(*) AS n FROM preview_leases").one().n >= 2) return false;
+      this.ctx.storage.sql.exec("INSERT INTO preview_leases VALUES (?, ?) ON CONFLICT(relay_id) DO UPDATE SET expires_at = excluded.expires_at", relayId, now + LIVENESS_MS);
+      return true;
+    });
+    await this.ctx.storage.setAlarm(now + 60_000);
+    return accepted;
+  }
+
+  inventory(relayId: string): void {
+    this.ctx.storage.sql.exec("INSERT OR IGNORE INTO registered_relays VALUES (?)", relayId);
+  }
+
+  async enrollmentStart(name: string, verifierHash: string, ipHash: string): Promise<unknown> {
+    const now = Date.now();
+    if (this.consumeRegistrationAttempt(ipHash, null, "", now) === "rate_limited") throw new HttpError(429, "registration_rate_limited");
+    const result = this.ctx.storage.transactionSync(() => {
+      this.ctx.storage.sql.exec("DELETE FROM enrollments WHERE expires_at <= ?", now);
+      const retry = this.ctx.storage.sql.exec<{ id: string; phrase: string; expires_at: number }>("SELECT id,phrase,expires_at FROM enrollments WHERE verifier_hash = ? AND status != 'complete'", verifierHash).toArray()[0];
+      if (retry) return { requestId: retry.id, phrase: retry.phrase, expiresAt: retry.expires_at };
+      const known = this.ctx.storage.sql.exec<{ n: number }>("SELECT COUNT(*) AS n FROM registered_relays").one().n;
+      const legacy = this.ctx.storage.sql.exec<{ n: number }>("SELECT COUNT(DISTINCT relay_id) AS n FROM consumed_invitations WHERE relay_id NOT IN (SELECT relay_id FROM registered_relays)").one().n;
+      const reserved = this.ctx.storage.sql.exec<{ n: number }>("SELECT COUNT(*) AS n FROM enrollments WHERE status != 'complete'").one().n;
+      if (known + legacy + reserved >= 50) throw new HttpError(429, "registration_capacity");
+      if (reserved >= 20) throw new HttpError(429, "enrollment_busy");
+      const id = crypto.randomUUID(), phrase = randomPhrase(), expiresAt = now + PAIRING_LIFETIME_MS;
+      this.ctx.storage.sql.exec("INSERT INTO enrollments (id,name,verifier_hash,phrase,expires_at,status) VALUES (?,?,?,?,?,'pending')", id, name, verifierHash, phrase, expiresAt);
+      return { requestId: id, phrase, expiresAt };
+    });
+    await this.ctx.storage.setAlarm(now + 60_000);
+    return result;
+  }
+
+  enrollmentGet(id: string): { name: string; phrase: string; expiresAt: number; status: string } {
+    const row = this.ctx.storage.sql.exec<{ name: string; phrase: string; expires_at: number; status: string }>("SELECT name,phrase,expires_at,status FROM enrollments WHERE id = ? AND expires_at > ?", id, Date.now()).toArray()[0];
+    if (!row) throw new HttpError(404, "enrollment_not_found");
+    return { name: row.name, phrase: row.phrase, expiresAt: row.expires_at, status: row.status };
+  }
+
+  enrollmentApprove(id: string): void {
+    this.enrollmentGet(id);
+    this.ctx.storage.sql.exec("UPDATE enrollments SET status = 'approved' WHERE id = ? AND status = 'pending'", id);
+  }
+
+  async enrollmentClaim(id: string, verifier: string): Promise<{ ok: true; body: EnrollmentClaim } | { ok: false; status: number; error: string }> {
+    try {
+      return { ok: true, body: await this.claimEnrollment(id, verifier) };
+    } catch (error) {
+      return error instanceof HttpError
+        ? { ok: false, status: error.status, error: error.code }
+        : { ok: false, status: 500, error: "internal_error" };
+    }
+  }
+
+  private async claimEnrollment(id: string, verifier: string): Promise<EnrollmentClaim> {
+    const row = this.ctx.storage.sql.exec<{ verifier_hash: string; status: string; name: string; relay_id: string | null; wrapped_iv: string | null; wrapped_credential: string | null }>("SELECT * FROM enrollments WHERE id = ? AND expires_at > ?", id, Date.now()).toArray()[0];
+    if (!row || !constantTimeEqual(row.verifier_hash, await hashToken(verifier))) throw new HttpError(401, "unauthorized");
+    if (row.status === "pending") return { status: "pending" };
+    if (row.status === "complete" && row.relay_id && row.wrapped_iv && row.wrapped_credential) return { status: "complete", relayId: row.relay_id, credential: await unwrapCredential(verifier, row.wrapped_iv, row.wrapped_credential) };
+    // Persist a stable identity before external initialization; concurrent claims reconcile it.
+    const relayId = row.relay_id ?? crypto.randomUUID();
+    const credential = row.wrapped_iv && row.wrapped_credential ? await unwrapCredential(verifier, row.wrapped_iv, row.wrapped_credential) : randomToken();
+    const wrapped = await wrapCredential(verifier, credential);
+    const existing = this.ctx.storage.sql.exec<{ relay_id: string | null }>("SELECT relay_id FROM enrollments WHERE id = ?", id).one();
+    if (existing.relay_id && existing.relay_id !== relayId) return this.claimEnrollment(id, verifier);
+    this.ctx.storage.sql.exec("UPDATE enrollments SET relay_id=?,wrapped_iv=?,wrapped_credential=? WHERE id=? AND relay_id IS NULL", relayId, wrapped.iv, wrapped.ciphertext, id);
+    const saved = this.ctx.storage.sql.exec<{ wrapped_iv: string; wrapped_credential: string }>("SELECT wrapped_iv,wrapped_credential FROM enrollments WHERE id=?", id).one();
+    const stableCredential = await unwrapCredential(verifier, saved.wrapped_iv, saved.wrapped_credential);
+    await this.env.RELAYS.getByName(relayId).initializeRelay(relayId, row.name, await hashToken(stableCredential));
+    this.inventory(relayId);
+    this.ctx.storage.sql.exec("UPDATE enrollments SET status='complete',expires_at=? WHERE id=?", Date.now() + 120_000, id);
+    return { status: "complete", relayId, credential: stableCredential };
+  }
+
+  consumeRegistrationAttempt(ipHash: string, tokenHash: string | null, relayId: string, now: number): "allowed" | "invalid" | "consumed" | "rate_limited" | "capacity" {
     return this.ctx.storage.transactionSync(() => {
       const windowStart = Math.floor(now / 60_000) * 60_000;
       const row = this.ctx.storage.sql.exec<{ attempts: number }>(
@@ -411,13 +506,16 @@ export class ControlPlaneDO extends DurableObject<Env> {
         ipHash,
         windowStart,
       );
-      this.ctx.storage.sql.exec("DELETE FROM registration_rates WHERE window_start < ?", now - 24 * 60 * 60_000);
+      this.ctx.storage.sql.exec("DELETE FROM registration_rates WHERE window_start < ?", now - 5 * 60_000);
       if (!tokenHash) return "invalid";
       const consumed = this.ctx.storage.sql.exec<{ token_hash: string }>(
         "SELECT token_hash FROM consumed_invitations WHERE token_hash = ?",
         tokenHash,
       ).toArray()[0];
       if (consumed) return "consumed";
+      const total = this.ctx.storage.sql.exec<{ n: number }>("SELECT COUNT(*) AS n FROM (SELECT relay_id FROM registered_relays UNION SELECT relay_id FROM consumed_invitations)").one().n;
+      const reserved = this.ctx.storage.sql.exec<{ n: number }>("SELECT COUNT(*) AS n FROM enrollments WHERE status != 'complete' AND expires_at > ?", now).one().n;
+      if (total + reserved >= 50) return "capacity";
       this.ctx.storage.sql.exec(
         "INSERT INTO consumed_invitations (token_hash, relay_id, consumed_at) VALUES (?, ?, ?)",
         tokenHash,
@@ -430,6 +528,19 @@ export class ControlPlaneDO extends DurableObject<Env> {
 }
 
 export class RelayDO extends DurableObject<Env> {
+  private transient: Snapshot | null = null;
+  private sequence = 0;
+  private settled = false;
+  private identical = 0;
+  private previewUntil = 0;
+  private lastHttpUpdate = 0;
+  private lastPreviewRenew = 0;
+  private lastJobReap = 0;
+  private agentUpdateAt = 0;
+  private observedAt = 0;
+  private previewEpoch = 0;
+  private readonly pollTimes = new Map<string, number>();
+  private readonly captures = new Map<string, Capture>();
   constructor(ctx: DurableObjectState, env: Env) {
     super(ctx, env);
     ctx.blockConcurrencyWhile(async () => {
@@ -496,6 +607,8 @@ export class RelayDO extends DurableObject<Env> {
         );
         CREATE INDEX IF NOT EXISTS jobs_status_expiry ON jobs(status, expires_at);
         CREATE INDEX IF NOT EXISTS jobs_browser_created ON jobs(browser_id, created_at DESC);
+        CREATE INDEX IF NOT EXISTS jobs_created ON jobs(created_at);
+        CREATE INDEX IF NOT EXISTS pairings_created ON pairings(created_at);
         CREATE TABLE IF NOT EXISTS job_resolutions (
           job_id TEXT PRIMARY KEY,
           resolved_at INTEGER NOT NULL
@@ -511,7 +624,21 @@ export class RelayDO extends DurableObject<Env> {
           browser_id TEXT PRIMARY KEY,
           created_at INTEGER NOT NULL
         );
+        CREATE TABLE IF NOT EXISTS job_tombstones (id TEXT PRIMARY KEY);
+        INSERT OR IGNORE INTO job_tombstones SELECT id FROM jobs;
+        CREATE TABLE IF NOT EXISTS captures (id TEXT PRIMARY KEY, payload TEXT NOT NULL, created_at INTEGER NOT NULL);
+        CREATE INDEX IF NOT EXISTS captures_created ON captures(created_at);
       `);
+      // Legacy coordinates are never promoted to a fresh observation after rehydration.
+      ctx.storage.sql.exec("DELETE FROM snapshots");
+      this.sequence = Math.max(0, ...ctx.getWebSockets().map((s) => this.attachment(s)?.sequence ?? 0));
+      this.agentUpdateAt = Math.max(0, ...ctx.getWebSockets().filter((s) => this.attachment(s)?.role === "agent").map((s) => this.attachment(s)?.lastMessage ?? 0));
+      for (const row of ctx.storage.sql.exec<{ id: string; payload: string }>("SELECT id,payload FROM captures WHERE created_at > ?", Date.now() - JOB_RETENTION_MS).toArray()) {
+        const c = JSON.parse(row.payload) as Capture;
+        if (c.status === "pending") { c.status = "failed"; c.error = "fresh_observation_required"; }
+        this.captures.set(row.id, c);
+      }
+      if (await ctx.storage.getAlarm() === null) await ctx.storage.setAlarm(Date.now() + 60_000);
     });
   }
 
@@ -540,6 +667,7 @@ export class RelayDO extends DurableObject<Env> {
       const route = match[2];
       const meta = this.meta();
       if (!meta || meta.relay_id !== relayId) throw new HttpError(404, "not_found");
+      if (await this.ctx.storage.getAlarm() === null) await this.ctx.storage.setAlarm(Date.now() + 60_000);
 
       if (request.method === "POST" && route === "/pairing/request") return await this.pairingRequest(request);
       if (request.method === "POST" && route === "/pairing/status") return await this.pairingStatus(request);
@@ -550,6 +678,9 @@ export class RelayDO extends DurableObject<Env> {
       if (route.startsWith("/agent/") || route === "/pairing/new" || route === "/pairing/decide" ||
           route === "/browsers" || route.startsWith("/browsers/") || agentStatus) {
         const identity = await this.authenticateAgent(request);
+        if (request.method === "GET" && route === "/agent/stream") return await this.agentStream(request, identity);
+        const captureResult = route.match(/^\/agent\/capture\/([0-9a-f-]{36})$/iu);
+        if (request.method === "POST" && captureResult) return await this.captureResult(request, requireUuid(captureResult[1]), identity);
         if (request.method === "POST" && route === "/agent/start") return this.agentStart(identity);
         if (request.method === "POST" && route === "/agent/update") return await this.agentUpdate(request, identity);
         if (request.method === "POST" && route === "/agent/browser-launch") return await this.browserLaunchNew(request);
@@ -563,7 +694,17 @@ export class RelayDO extends DurableObject<Env> {
 
       if (route === "/snapshot" && request.method === "GET") {
         const browser = await this.authenticateBrowser(request);
+        this.checkViewerCapacity(browser.id);
+        this.fallbackLimit(`browser:${browser.id}`);
+        await this.renewPreview(true);
         return this.browserSnapshot(browser);
+      }
+      if (route === "/capture" && request.method === "POST") return await this.captureNew(request, await this.authenticateBrowser(request));
+      const capture = route.match(/^\/capture\/([0-9a-f-]{36})$/iu);
+      if (capture && request.method === "GET") {
+        const browser = await this.authenticateBrowser(request);
+        this.fallbackLimit(`capture:${browser.id}`);
+        return await this.captureGet(requireUuid(capture[1]), browser.id);
       }
       if (route === "/control" && request.method === "POST") {
         const browser = await this.authenticateBrowser(request);
@@ -623,6 +764,7 @@ export class RelayDO extends DurableObject<Env> {
   }
 
   private async authenticateBrowser(request: Request): Promise<BrowserIdentity> {
+    requireAllowedOrigin(request);
     const tokenHash = await hashToken(bearer(request));
     const rows = this.ctx.storage.sql.exec<{ id: string; credential_hash: string }>(
       "SELECT id, credential_hash FROM browsers WHERE revoked = 0",
@@ -653,11 +795,21 @@ export class RelayDO extends DurableObject<Env> {
       this.ctx.storage.sql.exec("DELETE FROM snapshots WHERE singleton = 1");
       return next;
     });
+    this.transient = null;
+    this.sequence = 0;
+    this.lastHttpUpdate = 0;
+    this.agentUpdateAt = 0;
+    this.settled = false;
+    for (const socket of this.ctx.getWebSockets()) {
+      const a = this.attachment(socket);
+      if (a?.role === "agent") socket.close(1008, "stale_generation");
+    }
+    this.failCaptures("stale_generation", () => true);
     this.broadcast();
     return jsonResponse({ generation, serverTime });
   }
 
-  private async agentUpdate(request: Request, identity: AgentIdentity): Promise<Response> {
+  private async agentUpdate(request: Request, identity: AgentIdentity, socketUpdate = false, deliverWork = true): Promise<Response> {
     this.requireMethod(request, "POST");
     const body = requiredObject(await readJson(request));
     jsonBody(body, [
@@ -670,6 +822,7 @@ export class RelayDO extends DurableObject<Env> {
       "observedAtServer",
       "clockUncertaintyMs",
       "error",
+      "settled",
     ]);
     const generation = body.generation;
     const sequence = body.sequence;
@@ -682,11 +835,8 @@ export class RelayDO extends DurableObject<Env> {
 
     const meta = this.meta();
     if (!meta || meta.generation !== parsedGeneration) throw new HttpError(409, "stale_generation");
-    const prior = this.ctx.storage.sql.exec<{ sequence: number }>(
-      "SELECT sequence FROM snapshots WHERE singleton = 1 AND generation = ?",
-      parsedGeneration,
-    ).toArray()[0];
-    if (prior && (sequence as number) <= prior.sequence) throw new HttpError(409, "stale_sequence");
+    if ((sequence as number) <= this.sequence) throw new HttpError(409, "stale_sequence");
+    if (!socketUpdate && this.lastHttpUpdate && Date.now() - this.lastHttpUpdate < FALLBACK_MS) throw new HttpError(429, "fallback_rate_limited");
 
     let connected = body.connected === true;
     let position = parsePoint(body.position);
@@ -741,15 +891,14 @@ export class RelayDO extends DurableObject<Env> {
     this.ctx.storage.transactionSync(() => {
       const currentMeta = this.meta();
       if (!currentMeta || currentMeta.generation !== parsedGeneration) throw new HttpError(409, "stale_generation");
-      this.ctx.storage.sql.exec(
-        `INSERT INTO snapshots (singleton, generation, sequence, payload) VALUES (1, ?, ?, ?)
-         ON CONFLICT(singleton) DO UPDATE SET generation = excluded.generation,
-           sequence = excluded.sequence, payload = excluded.payload`,
-        parsedGeneration,
-        sequence,
-        JSON.stringify(snapshot),
-      );
-      this.reapJobs(receivedAt);
+      const same = this.transient?.connected === snapshot.connected && JSON.stringify(this.transient.position) === JSON.stringify(snapshot.position) && this.transient.context?.revision === snapshot.context?.revision;
+      this.identical = same ? this.identical + (typeof observedAtServer === "number" && observedAtServer > this.observedAt ? 1 : 0) : 1;
+      if (typeof observedAtServer === "number") this.observedAt = observedAtServer;
+      this.settled = connected && (body.settled === true || (body.settled === undefined && this.identical >= 3));
+      this.transient = snapshot;
+      this.sequence = snapshot.sequence;
+      if (!socketUpdate) this.lastHttpUpdate = receivedAt;
+      if (receivedAt - this.lastJobReap >= FALLBACK_MS) { this.reapJobs(receivedAt); this.lastJobReap = receivedAt; }
       pairings = this.ctx.storage.sql.exec<{ id: string; phrase: string }>(
         "SELECT id, phrase FROM pairings WHERE status = 'pending' AND expires_at > ? ORDER BY created_at LIMIT 20",
         receivedAt,
@@ -760,7 +909,7 @@ export class RelayDO extends DurableObject<Env> {
       const active = this.ctx.storage.sql.exec<{ id: string }>(
         "SELECT id FROM jobs WHERE status IN ('claimed', 'attempting', 'accepted') LIMIT 1",
       ).toArray()[0];
-      if (fresh && !active) {
+      if (deliverWork && fresh && !active) {
         const job = this.ctx.storage.sql.exec<StoredJob>(
           "SELECT * FROM jobs WHERE status = 'queued' AND expires_at > ? ORDER BY created_at LIMIT 1",
           receivedAt,
@@ -785,15 +934,19 @@ export class RelayDO extends DurableObject<Env> {
         }
       }
     });
-    this.broadcast();
+    for (const socket of this.ctx.getWebSockets()) {
+      const a = this.attachment(socket);
+      if (a?.role === "agent" && a.generation === parsedGeneration) { a.sequence = snapshot.sequence; socket.serializeAttachment(a); }
+    }
+    if (deliverWork) this.broadcast();
     if (invalidClockForLiveSample) throw new HttpError(400, "invalid_clock_calibration");
-    return jsonResponse({ serverTime: receivedAt, pairings, job: claimed });
+    return jsonResponse({ serverTime: receivedAt, pairings, job: claimed, previewActive: this.previewUntil > receivedAt, captures: [...this.captures.entries()].filter(([, c]) => c.status === "pending" && c.generation === parsedGeneration && receivedAt - c.created < 10_000).map(([id]) => id) });
   }
 
   private clearSnapshotForGeneration(generation: number): void {
     this.ctx.storage.transactionSync(() => {
       const meta = this.meta();
-      if (meta && meta.generation === generation) this.ctx.storage.sql.exec("DELETE FROM snapshots WHERE singleton = 1");
+      if (meta && meta.generation === generation) { this.transient = null; this.settled = false; }
     });
   }
 
@@ -870,6 +1023,7 @@ export class RelayDO extends DurableObject<Env> {
         now,
       );
     });
+    this.notifyWork();
     return jsonResponse({ pairingId, pendingToken, phrase });
   }
 
@@ -1062,6 +1216,7 @@ export class RelayDO extends DurableObject<Env> {
       return true;
     });
     if (!revoked) throw new HttpError(404, "browser_not_found");
+    this.failCaptures("revoked", (c) => c.browserId === browserId);
     for (const socket of this.ctx.getWebSockets()) {
       const attachment: unknown = socket.deserializeAttachment();
       if (isObject(attachment) && attachment.browserId === browserId) socket.close(1008, "revoked");
@@ -1081,9 +1236,12 @@ export class RelayDO extends DurableObject<Env> {
     activeBrowser: boolean;
     controlOccupied: boolean;
     job: JobResult | null;
+    protocol: 2;
+    agentOnline: boolean;
+    previewActive: boolean;
+    settled: boolean;
   } {
     return this.ctx.storage.transactionSync(() => {
-      this.reapJobs(serverTime);
       const meta = this.meta();
       if (!meta) throw new HttpError(404, "not_found");
       const ownsLiveLease = meta.lease_browser_id === browserId && (meta.lease_expires_at ?? 0) > serverTime;
@@ -1093,7 +1251,7 @@ export class RelayDO extends DurableObject<Env> {
           serverTime + BROWSER_LEASE_MS,
           browserId,
         );
-      } else if ((meta.lease_expires_at ?? 0) <= serverTime) {
+      } else if (renewLease && (meta.lease_expires_at ?? 0) <= serverTime) {
         this.ctx.storage.sql.exec(
           "UPDATE relay_meta SET lease_browser_id = NULL, lease_expires_at = NULL WHERE singleton = 1 AND lease_expires_at <= ?",
           serverTime,
@@ -1107,10 +1265,14 @@ export class RelayDO extends DurableObject<Env> {
         (meta.lease_expires_at ?? 0) > serverTime;
       return {
         serverTime,
-        snapshot: currentSnapshot(this.ctx.storage.sql),
+        snapshot: this.transient && serverTime - this.transient.receivedAt < JOB_RETENTION_MS ? this.transient : null,
         activeBrowser: ownsLiveLease,
         controlOccupied,
         job: latest ? jobResult(latest, this.isResolved(latest.id)) : null,
+        protocol: 2,
+        agentOnline: this.ctx.getWebSockets().some((s) => { const a = this.attachment(s); return a?.role === "agent" && a.generation === meta.generation && serverTime - a.seen < LIVENESS_MS; }) || !!(this.transient && serverTime - this.transient.receivedAt < LIVENESS_MS),
+        previewActive: this.previewUntil > serverTime,
+        settled: this.settled,
       };
     });
   }
@@ -1158,7 +1320,7 @@ export class RelayDO extends DurableObject<Env> {
       );
       return !ownsLiveLease;
     });
-    if (changed) this.broadcast();
+    if (changed) { this.failCaptures("capture_expired", (c) => c.browserId !== browser.id); this.broadcast(); }
     return jsonResponse({ activeBrowser: true });
   }
 
@@ -1194,6 +1356,9 @@ export class RelayDO extends DurableObject<Env> {
         browser.id,
       );
     });
+    this.failCaptures("capture_expired", (c) => c.browserId === browser.id);
+    this.broadcast();
+    this.notifyWork();
     return jsonResponse({});
   }
 
@@ -1224,11 +1389,12 @@ export class RelayDO extends DurableObject<Env> {
         if (!constantTimeEqual(existing.checksum, checksum)) throw new HttpError(409, "job_id_conflict");
         return jobResult(existing, this.isResolved(existing.id));
       }
+      if (this.ctx.storage.sql.exec("SELECT id FROM job_tombstones WHERE id = ?", id).toArray().length) throw new HttpError(409, "job_id_retired");
       const meta = this.meta();
       if (!meta || meta.lease_browser_id !== browser.id || (meta.lease_expires_at ?? 0) <= now) {
         throw new HttpError(409, "active_browser_required");
       }
-      const snapshot = currentSnapshot(this.ctx.storage.sql);
+      const snapshot = this.transient;
       if (!snapshot || !snapshot.connected || !snapshot.position || !snapshot.context ||
           snapshot.context.revision !== body.contextRevision ||
           snapshot.observationAgeMs + (now - snapshot.receivedAt) > SNAPSHOT_MAX_AGE_MS) {
@@ -1262,8 +1428,11 @@ export class RelayDO extends DurableObject<Env> {
         now,
         now,
       );
+      this.ctx.storage.sql.exec("INSERT INTO job_tombstones VALUES (?)", id);
       return { id, status: "queued" };
     });
+    this.notifyWork();
+    this.broadcast();
     return jsonResponse(result);
   }
 
@@ -1323,6 +1492,8 @@ export class RelayDO extends DurableObject<Env> {
       );
       return error ? { id, status: requested as JobStatus, error } : { id, status: requested as JobStatus };
     });
+    this.broadcast();
+    this.notifyWork();
     return jsonResponse(result);
   }
 
@@ -1350,7 +1521,7 @@ export class RelayDO extends DurableObject<Env> {
       now,
     );
     this.ctx.storage.sql.exec("DELETE FROM invitations WHERE expires_at <= ?", now);
-    this.ctx.storage.sql.exec("DELETE FROM pairings WHERE expires_at <= ?", now - JOB_RETENTION_MS);
+    this.ctx.storage.sql.exec("DELETE FROM pairings WHERE created_at <= ?", now - JOB_RETENTION_MS);
   }
 
   private async createTicket(browser: BrowserIdentity): Promise<Response> {
@@ -1359,6 +1530,7 @@ export class RelayDO extends DurableObject<Env> {
     const now = Date.now();
     this.ctx.storage.transactionSync(() => {
       this.reapJobs(now);
+      if (this.ctx.storage.sql.exec<{ n: number }>("SELECT COUNT(*) AS n FROM tickets WHERE expires_at > ?", now).one().n >= 20) throw new HttpError(429, "too_many_tickets");
       this.ctx.storage.sql.exec(
         "INSERT INTO tickets (ticket_hash, browser_id, expires_at) VALUES (?, ?, ?)",
         hash,
@@ -1394,35 +1566,257 @@ export class RelayDO extends DurableObject<Env> {
       if (!row || row.expires_at <= now) throw new HttpError(401, "unauthorized");
       return row.browser_id;
     });
-    const socketCount = this.ctx.getWebSockets().length;
-    if (socketCount >= 8) throw new HttpError(429, "too_many_streams");
+    this.checkViewerCapacity(browserId);
+    if (this.ctx.getWebSockets().filter((s) => this.attachment(s)?.role === "browser").length >= 2) throw new HttpError(429, "too_many_viewers");
     const pair = new WebSocketPair();
     const client = pair[0];
     const server = pair[1];
     this.ctx.acceptWebSocket(server);
-    server.serializeAttachment({ browserId });
+    server.serializeAttachment({ role: "browser", browserId, seen: now, watching: true } satisfies SocketIdentity);
+    await this.renewPreview(true);
     const envelope = this.snapshotEnvelope(browserId, now, true);
     server.send(JSON.stringify(envelope));
+    if (this.previewUntil <= now) server.send(JSON.stringify({ v: 2, type: "error", error: "preview_busy" }));
     return new Response(null, { status: 101, webSocket: client });
   }
 
-  webSocketMessage(socket: WebSocket, message: string | ArrayBuffer): void {
-    const text = typeof message === "string" ? message : "";
-    if (text === "ping") {
-      try {
-        socket.send("pong");
-      } catch {
-        socket.close(1011, "send_failed");
+  private attachment(socket: WebSocket): SocketIdentity | null {
+    const a: unknown = socket.deserializeAttachment();
+    return isObject(a) && (a.role === "browser" || a.role === "agent") ? a as SocketIdentity : null;
+  }
+
+  private fallbackLimit(key: string): void {
+    const now = Date.now(), last = this.pollTimes.get(key);
+    if (last !== undefined && now - last < FALLBACK_MS) throw new HttpError(429, "fallback_rate_limited");
+    this.pollTimes.set(key, now);
+  }
+
+  private checkViewerCapacity(browserId: string): void {
+    const viewers = new Set(this.ctx.getWebSockets().map((s) => this.attachment(s)).filter((a) => a?.role === "browser" && Date.now() - a.seen < LIVENESS_MS).map((a) => a!.browserId!));
+    for (const [key, time] of this.pollTimes) if (key.startsWith("browser:") && Date.now() - time < LIVENESS_MS) viewers.add(key.slice(8));
+    if (!viewers.has(browserId) && viewers.size >= 2) throw new HttpError(429, "too_many_viewers");
+  }
+
+  private async renewPreview(wanted: boolean): Promise<void> {
+    const now = Date.now();
+    if (wanted && now - this.lastPreviewRenew < 15_000 && this.previewUntil > now) return;
+    this.lastPreviewRenew = now;
+    const epoch = ++this.previewEpoch;
+    const meta = this.meta();
+    if (!meta) return;
+    const accepted = await this.env.CONTROL_PLANE.getByName("registration-control").preview(meta.relay_id, wanted);
+    if (epoch !== this.previewEpoch) return;
+    this.previewUntil = accepted ? now + LIVENESS_MS : 0;
+    this.notifyWork();
+  }
+
+  private hasWatchers(exclude?: WebSocket): boolean {
+    const now = Date.now();
+    return this.ctx.getWebSockets().some((s) => { const a = this.attachment(s); return s !== exclude && a?.role === "browser" && a.watching !== false && now - a.seen < LIVENESS_MS; }) ||
+      [...this.pollTimes.entries()].some(([key, time]) => key.startsWith("browser:") && now - time < LIVENESS_MS);
+  }
+
+  private notifyWork(): void {
+    const now = Date.now();
+    const pairings = this.ctx.storage.sql.exec<{ id: string; phrase: string }>("SELECT id,phrase FROM pairings WHERE status='pending' AND expires_at > ? LIMIT 20", now).toArray();
+    for (const socket of this.ctx.getWebSockets()) {
+      const a = this.attachment(socket);
+      if (a?.role === "agent" && a.generation === this.meta()?.generation && now - a.seen < LIVENESS_MS) {
+        this.send(socket, { v: 2, type: "work", body: { pairings, job: null, previewActive: this.previewUntil > now } });
       }
+
     }
   }
 
-  webSocketClose(socket: WebSocket, code: number, reason: string): void {
+  private send(socket: WebSocket, value: unknown): void {
+    try { socket.send(JSON.stringify(value)); }
+    catch { try { socket.close(1011, "send_failed"); } catch { /* Already closed. */ } }
+  }
+
+  private async agentStream(request: Request, identity: AgentIdentity): Promise<Response> {
+    if (request.headers.get("Upgrade")?.toLowerCase() !== "websocket") throw new HttpError(426, "websocket_upgrade_required");
+    if (Number(new URL(request.url).searchParams.get("generation")) !== identity.generation) throw new HttpError(409, "stale_generation");
+    for (const socket of this.ctx.getWebSockets()) if (this.attachment(socket)?.role === "agent") socket.close(1008, "agent_replaced");
+    const pair = new WebSocketPair();
+    this.ctx.acceptWebSocket(pair[1]);
+    pair[1].serializeAttachment({ role: "agent", generation: identity.generation, seen: Date.now(), sequence: this.sequence, lastMessage: this.agentUpdateAt } satisfies SocketIdentity);
+    this.notifyWork();
+    return new Response(null, { status: 101, webSocket: pair[0] });
+  }
+
+  async webSocketMessage(socket: WebSocket, message: string | ArrayBuffer): Promise<void> {
+    let id: string | undefined;
+    try {
+      const a = this.attachment(socket);
+      if (!a || Date.now() - a.seen >= LIVENESS_MS) throw new HttpError(401, "socket_expired");
+      if (a.role === "agent" && a.generation !== this.meta()?.generation) throw new HttpError(409, "stale_generation");
+      if (a.role === "browser" && !this.ctx.storage.sql.exec("SELECT id FROM browsers WHERE id=? AND revoked=0", a.browserId!).toArray().length) throw new HttpError(401, "revoked");
+      if (typeof message !== "string" || encoder.encode(message).length > MAX_JSON_BYTES) throw new HttpError(413, "message_too_large");
+      if (a.role === "browser" && message === "ping") { socket.send("pong"); return; }
+      const body = requiredObject(JSON.parse(message));
+      if (body.id !== undefined) id = requireUuid(body.id);
+      if (body.v !== 2) throw new HttpError(400, "unsupported_protocol");
+      const now = Date.now();
+      const hiding = a.role === "browser" && body.type === "heartbeat" && body.watching === false && a.watching !== false;
+      if (a.role === "browser" && !hiding && a.lastMessage && now - a.lastMessage < 100) throw new HttpError(429, "message_rate_limited");
+      a.seen = now; a.lastMessage = now; socket.serializeAttachment(a);
+      if (a.role === "browser" && body.type === "heartbeat") {
+        if (body.watching !== undefined && typeof body.watching !== "boolean") throw new HttpError(400, "invalid_message");
+        if (typeof body.watching === "boolean") { a.watching = body.watching; socket.serializeAttachment(a); }
+        this.pollTimes.delete(`browser:${a.browserId}`);
+        await this.renewPreview(this.hasWatchers());
+        socket.send(JSON.stringify(this.snapshotEnvelope(a.browserId!, now, true)));
+        if (a.watching !== false && this.previewUntil <= now) socket.send(JSON.stringify({ v: 2, type: "error", error: "preview_busy" }));
+        if (!this.transient || now - this.transient.receivedAt > 15_000) this.notifyWork();
+      } else if (a.role === "agent" && body.type === "update" && id) {
+        if (this.agentUpdateAt && now - this.agentUpdateAt < 500) throw new HttpError(429, "message_rate_limited");
+        this.agentUpdateAt = now;
+        const response = await this.agentUpdate(this.messageRequest(body.body), { generation: a.generation! }, true);
+        a.sequence = this.sequence; socket.serializeAttachment(a);
+        socket.send(JSON.stringify({ v: 2, type: "update-result", id, body: await response.json() }));
+      } else if (a.role === "agent" && body.type === "capture-result" && id) {
+        await this.captureResult(this.messageRequest(body.body), id, { generation: a.generation! });
+        a.sequence = this.sequence; socket.serializeAttachment(a);
+      } else throw new HttpError(400, "invalid_message");
+    } catch (error) {
+      this.send(socket, { v: 2, type: "error", error: error instanceof HttpError ? error.code : "invalid_message", ...(id ? { id } : {}) });
+      if (error instanceof HttpError && ["socket_expired", "revoked", "stale_generation"].includes(error.code)) socket.close(1008, error.code);
+    }
+  }
+
+  private messageRequest(body: unknown): Request {
+    return new Request("https://internal/operation", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
+  }
+
+  private saveCapture(id: string, c: Capture): void {
+    this.captures.set(id, c);
+    this.ctx.storage.sql.exec("INSERT INTO captures VALUES (?,?,?) ON CONFLICT(id) DO UPDATE SET payload=excluded.payload", id, JSON.stringify(c), c.created);
+  }
+
+  private failCaptures(error: string, matches: (capture: Capture) => boolean): void {
+    for (const [id, c] of this.captures) {
+      if (c.status !== "pending" || !matches(c)) continue;
+      c.status = "failed"; c.error = error; this.saveCapture(id, c);
+      for (const socket of this.ctx.getWebSockets()) if (this.attachment(socket)?.browserId === c.browserId) this.send(socket, { v: 2, type: "error", id, error });
+    }
+  }
+
+  private async captureNew(request: Request, browser: BrowserIdentity): Promise<Response> {
+    const body = requiredObject(await readJson(request)); jsonBody(body, ["requestId"]);
+    const id = requireUuid(body.requestId), now = Date.now(), meta = this.meta();
+    if (!meta || meta.lease_browser_id !== browser.id || (meta.lease_expires_at ?? 0) <= now) throw new HttpError(409, "active_browser_required");
+    const existing = this.captures.get(id);
+    if (existing) {
+      if (existing.browserId === browser.id && existing.status === "pending" && now - existing.created < 10_000) return jsonResponse({ requestId: id });
+      throw new HttpError(409, "capture_id_used");
+    }
+    for (const c of this.captures.values()) if (c.status === "pending" && now - c.created >= 10_000) { c.status = "failed"; c.error = "capture_timeout"; }
+    if ([...this.captures.values()].some((c) => c.status === "pending" && c.browserId === browser.id)) throw new HttpError(409, "capture_pending");
+    if ([...this.captures.values()].filter((c) => c.status === "pending").length >= 10 || this.captures.size >= 1000) throw new HttpError(429, "capture_busy");
+    this.saveCapture(id, { browserId: browser.id, generation: meta.generation, revision: this.transient?.context?.revision ?? null, created: now, sequence: this.sequence, observedAt: this.observedAt, status: "pending" });
+    const alarm = await this.ctx.storage.getAlarm();
+    if (alarm === null || alarm > now + 10_000) await this.ctx.storage.setAlarm(now + 10_000);
+    for (const s of this.ctx.getWebSockets()) if (this.attachment(s)?.role === "agent") this.send(s, { v: 2, type: "capture", id });
+    return jsonResponse({ requestId: id });
+  }
+
+  private async captureGet(id: string, browserId: string): Promise<Response> {
+    const c = this.captures.get(id);
+    if (!c || c.browserId !== browserId) throw new HttpError(404, "capture_not_found");
+    const validateOwner = () => {
+      const meta = this.meta();
+      if (meta?.generation !== c.generation || meta.lease_browser_id !== c.browserId || (meta.lease_expires_at ?? 0) <= Date.now()) {
+        c.status = "failed"; c.error = "capture_expired"; this.saveCapture(id, c);
+      }
+    };
+    if (c.status !== "failed") validateOwner();
+    // First status request can wait for this fresh observation, avoiding a mandatory stale 5s poll.
+    const waitStart = Date.now();
+    let waited = false;
+    while (c.status === "pending" && Date.now() - c.created < 10_000) {
+      waited = true; await new Promise((resolve) => setTimeout(resolve, 100)); validateOwner();
+    }
+    if (c.status === "complete" && (!this.transient?.context || (c.revision !== null && this.transient.context.revision !== c.revision))) {
+      c.status = "failed"; c.error = "fresh_matching_context_required"; this.saveCapture(id, c);
+    }
+    const waitMs = waited ? Math.max(0, Math.min(10_000, Date.now() - waitStart)) : 0;
+    if (c.status === "pending") { c.status = "failed"; c.error = "capture_timeout"; this.saveCapture(id, c); }
+    const body = isObject(c.body) ? { ...c.body, serverTime: Date.now(), waitMs: 0 } : c.body;
+    return jsonResponse(c.status === "complete" ? { status: c.status, body, waitMs } : { status: c.status, error: c.error, waitMs });
+  }
+
+  private async captureResult(request: Request, id: string, identity: AgentIdentity): Promise<Response> {
+    const c = this.captures.get(id), now = Date.now(), meta = this.meta();
+    if (!c || c.status !== "pending") throw new HttpError(409, "capture_not_pending");
+    if (now - c.created >= 10_000 || c.generation !== identity.generation || meta?.generation !== c.generation || meta?.lease_browser_id !== c.browserId || (meta.lease_expires_at ?? 0) <= now) {
+      c.status = "failed"; c.error = "capture_expired"; this.saveCapture(id, c); throw new HttpError(409, c.error);
+    }
+    const body = requiredObject(await readJson(request));
+    if (typeof body.observedAtServer !== "number" || typeof body.clockUncertaintyMs !== "number" ||
+      typeof body.sequence !== "number" || body.sequence <= c.sequence || body.observedAtServer <= c.observedAt ||
+      body.observedAtServer + body.clockUncertaintyMs < c.created) throw new HttpError(409, "fresh_observation_required");
+    await this.agentUpdate(this.messageRequest(body), identity, true, false);
+    const s = this.transient;
+    const currentMeta = this.meta();
+    if (currentMeta?.generation !== c.generation || currentMeta.lease_browser_id !== c.browserId || (currentMeta.lease_expires_at ?? 0) <= Date.now()) {
+      c.status = "failed"; c.error = "capture_expired";
+    } else if (!s?.connected || !s.position || !s.context || (c.revision !== null && c.revision !== s.context.revision) || s.observationAgeMs + Date.now() - s.receivedAt > SNAPSHOT_MAX_AGE_MS) {
+      c.status = "failed"; c.error = "fresh_matching_context_required";
+    } else {
+      c.status = "complete";
+      const completedAt = Date.now();
+      c.body = { ...this.snapshotEnvelope(c.browserId, completedAt, false), waitMs: Math.max(0, completedAt - c.created) };
+    }
+    this.saveCapture(id, c);
+    for (const socket of this.ctx.getWebSockets()) if (this.attachment(socket)?.browserId === c.browserId) this.send(socket, c.status === "complete" ? { v: 2, type: "capture-result", id, body: c.body } : { v: 2, type: "error", id, error: c.error });
+    return jsonResponse({ status: c.status });
+  }
+
+  async alarm(): Promise<void> {
+    const now = Date.now();
+    this.reapJobs(now); this.reapPairings(now); this.reapLaunches(now);
+    this.ctx.storage.sql.exec("DELETE FROM captures WHERE created_at <= ?", now - JOB_RETENTION_MS + 60_000);
+    if (this.transient && now - this.transient.receivedAt >= JOB_RETENTION_MS - 60_000) this.transient = null;
+    for (const [id, c] of this.captures) {
+      if (now - c.created >= JOB_RETENTION_MS - 60_000) this.captures.delete(id);
+      else if (c.status === "pending" && now - c.created >= 10_000) {
+        c.status = "failed"; c.error = "capture_timeout"; this.saveCapture(id, c);
+        for (const socket of this.ctx.getWebSockets()) if (this.attachment(socket)?.browserId === c.browserId) this.send(socket, { v: 2, type: "error", id, error: c.error });
+      }
+    }
+    for (const [key, time] of this.pollTimes) if (now - time >= LIVENESS_MS) this.pollTimes.delete(key);
+    for (const s of this.ctx.getWebSockets()) { const a = this.attachment(s); if (!a || now - a.seen >= LIVENESS_MS) s.close(1008, "socket_expired"); }
+    if (!this.hasWatchers()) await this.renewPreview(false);
+    this.broadcast();
+    const active = this.ctx.getWebSockets().some((s) => { const a = this.attachment(s); return a && now - a.seen < LIVENESS_MS; }) || this.hasWatchers() || now - this.lastHttpUpdate < LIVENESS_MS;
+    const captureDeadline = Math.min(Infinity, ...[...this.captures.values()].filter((c) => c.status === "pending").map((c) => c.created + 10_000));
+    const deadline = (query: string, ...values: number[]): number => {
+      const value = this.ctx.storage.sql.exec<{ deadline: number | null }>(query, ...values).one().deadline;
+      return value !== null && value > now ? value : Infinity;
+    };
+    const retainedDeadline = Math.min(
+      deadline("SELECT MIN(created_at) + ? AS deadline FROM jobs", JOB_RETENTION_MS),
+      deadline("SELECT MIN(expires_at) AS deadline FROM jobs WHERE status IN ('queued','claimed')"),
+      deadline("SELECT MIN(created_at) + ? AS deadline FROM pairings", JOB_RETENTION_MS),
+      deadline("SELECT MIN(expires_at) AS deadline FROM pairings WHERE status='pending'"),
+      deadline("SELECT MIN(expires_at) AS deadline FROM invitations"),
+      deadline("SELECT MIN(expires_at) AS deadline FROM tickets"),
+      deadline("SELECT MIN(MAX(expires_at, created_at + ?)) AS deadline FROM browser_launches", LAUNCH_RATE_WINDOW_MS),
+      deadline("SELECT MIN(created_at) + ? AS deadline FROM captures", JOB_RETENTION_MS - 60_000),
+    );
+    const next = Math.min(active ? now + 60_000 : Infinity, captureDeadline, retainedDeadline, this.transient ? this.transient.receivedAt + JOB_RETENTION_MS - 60_000 : Infinity);
+    if (Number.isFinite(next)) await this.ctx.storage.setAlarm(Math.max(now + 1, next));
+    else await this.ctx.storage.deleteAlarm();
+  }
+
+  async webSocketClose(socket: WebSocket, code: number, reason: string): Promise<void> {
     try {
       socket.close(code, reason);
     } catch {
       // Socket is already closed.
     }
+    if (!this.hasWatchers(socket)) await this.renewPreview(false);
+    this.broadcast();
   }
 
   webSocketError(socket: WebSocket): void {
@@ -1441,12 +1835,13 @@ export class RelayDO extends DurableObject<Env> {
     ).toArray().map((row) => row.id));
     for (const socket of sockets) {
       const attachment: unknown = socket.deserializeAttachment();
+      if (isObject(attachment) && attachment.role === "agent") continue;
       if (!isObject(attachment) || typeof attachment.browserId !== "string" || !active.has(attachment.browserId)) {
         socket.close(1008, "revoked");
         continue;
       }
       try {
-        socket.send(JSON.stringify(this.snapshotEnvelope(attachment.browserId, Date.now(), true)));
+        socket.send(JSON.stringify(this.snapshotEnvelope(attachment.browserId, Date.now(), false)));
       } catch {
         socket.close(1011, "send_failed");
       }
@@ -1502,11 +1897,71 @@ async function register(request: Request, env: Env): Promise<Response> {
   if (!configured) throw new HttpError(503, "registration_unavailable");
   if (!valid || decision === "invalid") throw new HttpError(401, "invalid_bootstrap_token");
   if (decision === "consumed") throw new HttpError(409, "bootstrap_token_used");
+  if (decision === "capacity") throw new HttpError(429, "registration_capacity");
   const credential = randomToken();
   const name = body.name.trim();
   const initialized = await env.RELAYS.getByName(relayId).initializeRelay(relayId, name, await hashToken(credential));
   if (!initialized) throw new HttpError(503, "registration_failed");
+  await env.CONTROL_PLANE.getByName("registration-control").inventory(relayId);
   return jsonResponse({ relayId, credential }, 201);
+}
+
+function envString(env: Env, key: string): string {
+  const value: unknown = Reflect.get(env, key);
+  return typeof value === "string" ? value.trim() : "";
+}
+
+function enrollmentConfigured(env: Env): boolean {
+  const siteKey = envString(env, "TURNSTILE_SITE_KEY");
+  return envString(env, "ENROLLMENT_CODE").length >= 6 && envString(env, "TURNSTILE_SECRET").length >= 16 &&
+    /^0x[A-Za-z0-9_-]{10,}$/u.test(siteKey) && !/^[123]x/u.test(siteKey);
+}
+
+async function enrollment(request: Request, env: Env, path: string): Promise<Response> {
+  if (path === "/v1/enrollment/config" && request.method === "GET") {
+    const enabled = enrollmentConfigured(env), downloadUrl = envString(env, "RAP_DOWNLOAD_URL");
+    return jsonResponse({ enabled, siteKey: enabled ? envString(env, "TURNSTILE_SITE_KEY") : "", ...(downloadUrl.startsWith("https://") ? { downloadUrl } : {}) });
+  }
+  if (!enrollmentConfigured(env)) throw new HttpError(503, "enrollment_unavailable");
+  const cp = env.CONTROL_PLANE.getByName("registration-control");
+  const ipHash = await hashToken(request.headers.get("CF-Connecting-IP") ?? "unknown");
+  if (path === "/v1/enrollment/start" && request.method === "POST") {
+    const body = requiredObject(await readJson(request)); jsonBody(body, ["name", "verifier"]);
+    if (typeof body.name !== "string" || !body.name.trim() || body.name.length > 64 || /[\u0000-\u001f\u007f]/u.test(body.name) ||
+      typeof body.verifier !== "string" || fromBase64Url(body.verifier)?.length !== 32 || body.verifier.length !== 43) throw new HttpError(400, "invalid_request");
+    return jsonResponse(await cp.enrollmentStart(body.name.trim(), await hashToken(body.verifier), ipHash), 201);
+  }
+  const match = path.match(/^\/v1\/enrollment\/([0-9a-f-]{36})(\/approve|\/claim)?$/iu);
+  if (!match) throw new HttpError(404, "not_found");
+  const id = requireUuid(match[1]);
+  if (!match[2] && request.method === "GET") return jsonResponse(await cp.enrollmentGet(id));
+  if (request.method !== "POST") throw new HttpError(405, "method_not_allowed");
+  const body = requiredObject(await readJson(request));
+  if (match[2] === "/claim") {
+    jsonBody(body, ["verifier"]);
+    if (typeof body.verifier !== "string" || fromBase64Url(body.verifier)?.length !== 32 || body.verifier.length !== 43) throw new HttpError(400, "invalid_request");
+    const result = await cp.enrollmentClaim(id, body.verifier);
+    return result.ok ? jsonResponse(result.body) : jsonResponse({ error: result.error }, result.status);
+  }
+  if (match[2] !== "/approve") throw new HttpError(404, "not_found");
+  requireAllowedOrigin(request);
+  jsonBody(body, ["code", "turnstileToken"]);
+  if (await cp.consumeRegistrationAttempt(ipHash, null, "", Date.now()) === "rate_limited") throw new HttpError(429, "registration_rate_limited");
+  if (typeof body.code !== "string" || body.code.length > 256 || !constantTimeEqual(await hashToken(body.code), await hashToken(envString(env, "ENROLLMENT_CODE")))) throw new HttpError(403, "enrollment_code_invalid");
+  if (typeof body.turnstileToken !== "string" || !body.turnstileToken || body.turnstileToken.length > 2048) throw new HttpError(403, "turnstile_invalid");
+  await cp.enrollmentGet(id);
+  let result: unknown;
+  try {
+    const r = await fetch("https://challenges.cloudflare.com/turnstile/v0/siteverify", {
+      method: "POST", headers: { "Content-Type": "application/x-www-form-urlencoded" }, signal: AbortSignal.timeout(10_000),
+      body: new URLSearchParams({ secret: envString(env, "TURNSTILE_SECRET"), response: body.turnstileToken, remoteip: request.headers.get("CF-Connecting-IP") ?? "" }),
+    });
+    if (!r.ok) throw new Error("siteverify_failed");
+    result = await r.json();
+  } catch { throw new HttpError(403, "turnstile_invalid"); }
+  if (!isObject(result) || result.success !== true || result.action !== "enrollment" || result.hostname !== "nicholas-a11y.github.io") throw new HttpError(403, "turnstile_invalid");
+  await cp.enrollmentApprove(id);
+  return jsonResponse({ status: "approved" });
 }
 
 export default {
@@ -1532,6 +1987,8 @@ export default {
       let response: Response;
       if (url.pathname === "/v1/register") {
         response = await register(request, env);
+      } else if (url.pathname.startsWith("/v1/enrollment/")) {
+        response = await enrollment(request, env, url.pathname);
       } else {
         const match = url.pathname.match(/^\/v1\/relays\/([0-9a-f-]{36})\/.*$/iu);
         if (!match) throw new HttpError(404, "not_found");

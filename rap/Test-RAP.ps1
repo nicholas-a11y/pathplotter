@@ -541,10 +541,10 @@ try {
     }
     function Get-Observation { $script:ReadCount++; return Fresh-Observation }
     function Read-ConsoleCommand {
-        if ($script:ScheduleMode -eq 'fatal' -and $script:CycleCount -ge 1) { throw 'Mock interrupted main loop.' }
+        if ($script:ScheduleMode -eq 'fatal' -and $script:CycleCount -ge 1 -and $script:Socket.Queue.Count -eq 0) { throw 'Mock interrupted main loop.' }
         $limit = 2
         if ($script:ScheduleMode -eq 'serial') { $limit = 4 }
-        if ($script:CycleCount -ge $limit) { $script:StopRequested = $true }
+        if ($script:CycleCount -ge $limit -and ($null -eq $script:Socket -or $script:Socket.Queue.Count -eq 0)) { $script:StopRequested = $true }
     }
     function Invoke-Cloud([string]$Path, $Body = @{}, [string]$Method = 'POST') {
         if ($Path -eq '/agent/start') { return @{ generation = 10; serverTime = 1800000000000.0 } }
@@ -570,9 +570,66 @@ try {
                 $id = 'schedule-fenced'
             } elseif ($script:ScheduleMode -eq 'fatal') { $id = 'schedule-interrupted' }
             else { $id = 'schedule-second' }
-            return @{ serverTime = 1800000000000.0; pairings = @(); job = (New-TestJob $id) }
+            $job = New-TestJob $id
+            if ($script:ScheduleMode -eq 'serial' -and $script:CycleCount -in @(2, 3)) { $job = $null }
+            return @{ serverTime = 1800000000000.0; pairings = @(); job = $job; previewActive = $true }
         }
         return @{ id = ($Path -split '/')[2]; status = $Body.status }
+    }
+    function New-AgentSocket {
+        $mock = New-Object PSObject -Property @{ IsOpen = $true; IsFinished = $false; Failure = ''; Queue = (New-Object 'Collections.Generic.Queue[string]') }
+        $mock | Add-Member ScriptMethod Enqueue {
+            param($text)
+            $message = $text | ConvertFrom-Json
+            $result = Invoke-Cloud '/agent/update' $message.body
+            $this.Queue.Enqueue((@{ v = 2; type = 'update-result'; id = $message.id; body = $result } | ConvertTo-Json -Depth 25 -Compress))
+            $this.Queue.Enqueue((@{ v = 2; type = 'work'; body = $result } | ConvertTo-Json -Depth 25 -Compress))
+        }
+        $mock | Add-Member ScriptMethod Take { if ($this.Queue.Count) { return $this.Queue.Dequeue() }; return $null }
+        $mock | Add-Member ScriptMethod Dispose { $this.IsOpen = $false }
+        return $mock
+    }
+    Check 'Built-in PS5.1 ClientWebSocket authorization, fragmented receive, async send and bounded idle cancellation' {
+        Assert ([Net.WebSockets.ClientWebSocket].Assembly.GetName().Name -eq 'System')
+        $fixture = New-Object PathPlotterRapTests.SocketFixture
+        $socket = New-Object PathPlotterRap.AgentSocket($fixture.Url, 'fixture-socket-credential')
+        try {
+            $timer = [Diagnostics.Stopwatch]::StartNew()
+            while (-not $socket.IsOpen -and $timer.ElapsedMilliseconds -lt 5000) { Start-Sleep -Milliseconds 10 }
+            Assert $socket.IsOpen
+            Assert ($fixture.Headers -match 'Authorization: Bearer fixture-socket-credential' -and $fixture.Url -notmatch 'credential')
+            $socket.Enqueue('{"v":2,"type":"update"}')
+            $fixture.Send('{"v":2,"type":"work"}', $true)
+            $text = $null
+            while ($null -eq $text -and $timer.ElapsedMilliseconds -lt 5000) { $text = $socket.Take(); Start-Sleep -Milliseconds 10 }
+            Assert ($text -ceq '{"v":2,"type":"work"}')
+            while ($null -eq $fixture.Received -and $timer.ElapsedMilliseconds -lt 5000) { Start-Sleep -Milliseconds 10 }
+            Assert ($fixture.Received -ceq '{"v":2,"type":"update"}')
+            $large = 'x' * 614400
+            $fixture.Send($large, $true)
+            $timer.Restart(); $text = $null
+            while ($null -eq $text -and $timer.ElapsedMilliseconds -lt 5000) { $text = $socket.Take(); Start-Sleep -Milliseconds 10 }
+            Assert ($text -ceq $large) 'Valid full-size job envelope did not pass bounded fragmented receive.'
+            Must-Throw { $socket.Enqueue(('x' * 16385)) }
+            $timer.Restart(); $socket.Dispose()
+            Assert ($socket.IsFinished -and $timer.ElapsedMilliseconds -lt 2000 -and -not $socket.IsOpen)
+        } finally { $socket.Dispose(); $fixture.Dispose() }
+        $fixture = New-Object PathPlotterRapTests.SocketFixture
+        $socket = New-Object PathPlotterRap.AgentSocket($fixture.Url, 'fixture-only')
+        try {
+            for ($i = 0; $i -lt 5; $i++) { $fixture.Send(('x' * 900000), $false) }
+            $timer.Restart()
+            while (-not $socket.IsFinished -and $timer.ElapsedMilliseconds -lt 5000) { Start-Sleep -Milliseconds 10 }
+            Assert ($socket.IsFinished -and $socket.Failure -match 'IOException') 'Aggregate inbound byte budget was not enforced.'
+        } finally { $socket.Dispose(); $fixture.Dispose() }
+        $fixture = New-Object PathPlotterRapTests.SocketFixture
+        $socket = New-Object PathPlotterRap.AgentSocket($fixture.Url, 'fixture-only')
+        try {
+            $fixture.Send(('x' * 1048577), $false)
+            $timer.Restart()
+            while (-not $socket.IsFinished -and $timer.ElapsedMilliseconds -lt 5000) { Start-Sleep -Milliseconds 10 }
+            Assert ($socket.IsFinished -and $null -eq $socket.Take() -and $socket.Failure -match 'InvalidDataException')
+        } finally { $socket.Dispose(); $fixture.Dispose() }
     }
     Check 'Actual Start-Rap scheduling reads and publishes fresh coordinates while confirmation waits; serial next import and quit cleanup' {
         $script:Journal = @{}; Save-Journal
@@ -607,6 +664,116 @@ try {
         Assert ((Read-Protected 'journal.dpapi').'schedule-interrupted'.status -eq 'unknown')
         $lock = New-Object IO.FileStream((Join-Path $statePath 'instance.lock'), 'OpenOrCreate', 'ReadWrite', 'None')
         $lock.Dispose()
+    }
+    Check 'Stationary socket capture performs new serialized reads; work still delivers pairing; duplicate requests fail closed' {
+        $script:CaptureReads = 0
+        function Get-Observation {
+            $script:CaptureReads++
+            $observation = Fresh-Observation
+            $observation.position.x = $script:CaptureReads
+            return $observation
+        }
+        $script:Socket = New-Object PSObject -Property @{ Queue = (New-Object 'Collections.Generic.Queue[string]'); Sent = (New-Object 'Collections.Generic.List[string]') }
+        $script:Socket | Add-Member ScriptMethod Take { if ($this.Queue.Count) { return $this.Queue.Dequeue() }; return $null }
+        $script:Socket | Add-Member ScriptMethod Enqueue { param($text); $this.Sent.Add($text) }
+        $script:CaptureIds = @{}; $script:OutstandingUpdates = @{}
+        $script:Generation = 10; $script:ServerTime = 1800000000000.0; $script:ServerTick = $script:Clock.ElapsedMilliseconds; $script:ClockUncertainty = 0
+        $first = [Guid]::NewGuid().ToString(); $second = [Guid]::NewGuid().ToString()
+        $script:Socket.Queue.Enqueue((@{ v = 2; type = 'work'; body = @{ previewActive = $false; job = $null; pairings = @(@{ id = 'stationary-pair'; phrase = 'AMBER RIVER' }) } } | ConvertTo-Json -Depth 10 -Compress))
+        foreach ($id in @($first, $second)) { $script:Socket.Queue.Enqueue((@{ v = 2; type = 'capture'; id = $id } | ConvertTo-Json -Compress)) }
+        Receive-AgentMessages
+        Assert ($script:CaptureReads -eq 2 -and $script:PendingPairings.ContainsKey('stationary-pair'))
+        $a = $script:Socket.Sent[0] | ConvertFrom-Json; $b = $script:Socket.Sent[1] | ConvertFrom-Json
+        Assert ($a.type -ceq 'capture-result' -and $a.id -ceq $first -and $a.body.position.x -eq 1 -and $b.body.position.x -eq 2)
+        Assert ($a.body.sequence -lt $b.body.sequence -and $a.body.observedAtServer -le $b.body.observedAtServer)
+        $script:Socket.Queue.Enqueue((@{ v = 2; type = 'capture'; id = $first } | ConvertTo-Json -Compress))
+        Must-Throw { Receive-AgentMessages }
+        Assert ($script:CaptureReads -eq 2)
+        $script:Socket = $null
+    }
+    $script:TimingMessages = New-Object 'Collections.Generic.List[object]'
+    $script:TimingHttp = New-Object 'Collections.Generic.List[object]'
+    $script:TimingClock = [Diagnostics.Stopwatch]::StartNew()
+    $script:TimingLimit = 16200
+    $script:ReadCount = 0
+    function Get-Observation { $script:ReadCount++; return Fresh-Observation }
+    function Read-ConsoleCommand { if ($script:TimingClock.ElapsedMilliseconds -ge $script:TimingLimit) { $script:StopRequested = $true } }
+    function Invoke-Cloud([string]$Path, $Body = @{}, [string]$Method = 'POST') {
+        if ($Path -eq '/agent/start') { return @{ generation = 11; serverTime = 1800000000000.0 } }
+        $script:TimingHttp.Add(@{ path = $Path; tick = $script:Clock.ElapsedMilliseconds; body = $Body })
+        if ($Path -eq '/agent/update') {
+            $captures = @()
+            if ($script:TimingHttp.Count -eq 1) { $captures = @([Guid]::NewGuid().ToString()) }
+            return @{ serverTime = 1800000000000.0; previewActive = $false; pairings = @(); job = $null; captures = $captures }
+        }
+        if ($Path -like '/agent/capture/*') { return @{} }
+        throw 'Unexpected timing fixture cloud call.'
+    }
+    function New-AgentSocket {
+        $mock = New-Object PSObject -Property @{ IsOpen = $true; IsFinished = $false; Failure = ''; Queue = (New-Object 'Collections.Generic.Queue[string]') }
+        $mock | Add-Member ScriptMethod Enqueue {
+            param($text)
+            $message = $text | ConvertFrom-Json
+            $script:TimingMessages.Add(@{ tick = $script:Clock.ElapsedMilliseconds; body = $message.body })
+            $result = @{ serverTime = 1800000000000.0; previewActive = $true; pairings = @(); job = $null }
+            $this.Queue.Enqueue((@{ v = 2; type = 'update-result'; id = $message.id; body = $result } | ConvertTo-Json -Depth 25 -Compress))
+        }
+        $mock | Add-Member ScriptMethod Take { if ($this.Queue.Count) { return $this.Queue.Dequeue() }; return $null }
+        $mock | Add-Member ScriptMethod Dispose { $this.IsOpen = $false }
+        return $mock
+    }
+    Check 'Local 500ms reads remain independent: maximum 2Hz preview, settled once, fresh 15s idle health, no HTTP updates' {
+        $script:Journal = @{}; Save-Journal
+        $script:SlowHttp = $false; $script:TimingClock.Restart()
+        Start-Rap
+        Assert ($script:ReadCount -ge 30 -and $script:TimingHttp.Count -eq 0)
+        Assert ($script:TimingMessages.Count -eq 4) 'Stationary socket published too often or omitted health.'
+        for ($i = 1; $i -lt $script:TimingMessages.Count; $i++) {
+            Assert ($script:TimingMessages[$i].tick - $script:TimingMessages[$i - 1].tick -ge 500)
+        }
+        Assert (-not $script:TimingMessages[0].body.settled -and $script:TimingMessages[2].body.settled)
+        Assert ($script:TimingMessages[3].tick - $script:TimingMessages[2].tick -ge 15000)
+        Assert ($script:TimingMessages[3].body.observationAgeMs -lt 600 -and $script:TimingMessages[3].body.connected)
+    }
+    Check 'Explicit HTTP fallback polls no faster than 5s and dispatches a genuinely fresh capture' {
+        Set-RapTransport $true
+        $script:TimingLimit = 10200; $script:TimingClock.Restart(); $script:TimingHttp.Clear()
+        $before = $script:ReadCount
+        Start-Rap
+        $updates = @($script:TimingHttp | Where-Object { $_.path -eq '/agent/update' })
+        $captures = @($script:TimingHttp | Where-Object { $_.path -like '/agent/capture/*' })
+        Assert ($updates.Count -eq 3 -and $captures.Count -eq 1 -and $script:ReadCount - $before -ge 20)
+        Assert ($updates[1].tick - $updates[0].tick -ge 5000 -and $updates[2].tick - $updates[1].tick -ge 5000)
+        Assert ($captures[0].body.sequence -gt $updates[0].body.sequence -and $captures[0].body.observationAgeMs -lt 100)
+        Set-RapTransport $false
+    }
+    Check 'Verifier DPAPI precedes enrollment start; ambiguous start resumes same verifier; claim persists credential before verifier deletion' {
+        $script:Config = $null; $script:EnrollmentAttempts = 0; $script:ClaimAttempts = 0; $script:SavedVerifier = ''
+        function Invoke-Http([string]$Url, [string]$Method, [string]$Token, $Body = $null, [hashtable]$Headers = @{}, [int]$TimeoutMs = 5000, [switch]$Raw) {
+            Assert ($Token -eq '' -and $Url -notmatch [regex]::Escape([string](Get-Field $Body 'verifier')))
+            if ($Url -like '*/start') {
+                $script:EnrollmentAttempts++
+                $pending = Read-Protected 'enrollment.dpapi'
+                Assert ($pending.verifier -ceq $Body.verifier -and $pending.verifier -match '^[A-Za-z0-9_-]{43}$')
+                if ($script:EnrollmentAttempts -eq 1) { $script:SavedVerifier = $Body.verifier; throw 'Simulated lost start response.' }
+                Assert ($Body.verifier -ceq $script:SavedVerifier)
+                return @{ requestId = 'fixture-enrollment'; phrase = 'AMBER RIVER'; expiresAt = 1800000600000.0 }
+            }
+            if ($Url -like '*/claim') {
+                $script:ClaimAttempts++
+                Assert ($Body.verifier -ceq $script:SavedVerifier)
+                if ($script:ClaimAttempts -eq 1) { return @{ status = 'pending' } }
+                return @{ status = 'complete'; relayId = 'enrolled-relay'; credential = 'enrolled-credential' }
+            }
+            throw 'Unexpected enrollment fixture call.'
+        }
+        Must-Throw { Start-Enrollment 'https://fixture.invalid' 'Fixture PC' }
+        $pending = Start-Enrollment 'https://fixture.invalid' 'Fixture PC'
+        Assert ((Get-EnrollmentUrl $pending) -ceq 'https://nicholas-a11y.github.io/pathplotter/#enroll=fixture-enrollment&relay=https%3A%2F%2Ffixture.invalid')
+        Must-Throw { Start-Enrollment 'https://another.invalid' 'Fixture PC' }
+        Assert (-not (Complete-Enrollment $pending) -and $null -eq $script:Config)
+        Assert (Complete-Enrollment $pending)
+        Assert ((Read-Protected 'credentials.dpapi').credential -ceq 'enrolled-credential' -and -not [IO.File]::Exists((Join-Path $statePath 'enrollment.dpapi')))
     }
 } finally {
     if (Get-Command Stop-Import -ErrorAction SilentlyContinue) { Stop-Import }

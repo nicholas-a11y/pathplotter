@@ -3,7 +3,7 @@ import type { BuiltSvg } from './geometry'
 export const LIVE_QUEUE_LIMIT = 20
 export type ImportOutcome = 'confirmed' | 'failed' | 'expired' | 'unknown'
 export interface ImportTarget {
-  mode: 'local' | 'relay'
+  mode: 'local' | 'relay' | 'webtool'
   baseUrl: string
   relayId?: string
   contextRevision: string
@@ -61,7 +61,7 @@ export function parseLiveQueue(value: unknown): LiveQueue {
         typeof item.svg !== 'string' || !item.svg.startsWith('<?xml') || new TextEncoder().encode(item.svg).length > 512 * 1024 ||
         !Array.isArray(item.unsupportedCharacters) || item.unsupportedCharacters.length ||
         !record(item.anchor) || !finite(item.anchor.x) || !finite(item.anchor.y) ||
-        !record(item.target) || !['local', 'relay'].includes(String(item.target.mode)) ||
+        !record(item.target) || !['local', 'relay', 'webtool'].includes(String(item.target.mode)) ||
         typeof item.target.baseUrl !== 'string' || typeof item.target.contextRevision !== 'string' || !item.target.contextRevision ||
         (item.target.mode === 'relay' && (typeof item.target.relayId !== 'string' || !item.target.relayId)) ||
         !['queued', 'submitted', 'confirmed', 'failed', 'expired', 'unknown'].includes(String(item.phase))) return invalid()

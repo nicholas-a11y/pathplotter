@@ -50,7 +50,7 @@ jobs:
         run: '& "$env:SystemRoot\System32\WindowsPowerShell\v1.0\powershell.exe" -NoProfile -STA -File ".\rap\Test-GUI.ps1"'
       - name: Package portable tray app
         shell: powershell
-        run: Compress-Archive -Path .\rap\* -DestinationPath .\PathPlotter-RAP-Windows.zip
+        run: .\scripts\Package-RAP.ps1 -OutputPath "$env:GITHUB_WORKSPACE\PathPlotter-RAP-Windows.zip"
       - uses: actions/upload-artifact@v4
         with:
           name: PathPlotter-RAP-Windows

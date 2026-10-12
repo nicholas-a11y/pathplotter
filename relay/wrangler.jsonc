@@ -3,6 +3,10 @@
   "name": "pathplotter-relay",
   "main": "src/index.ts",
   "compatibility_date": "2026-10-11",
+  "vars": {
+    "TURNSTILE_SITE_KEY": "",
+    "RAP_DOWNLOAD_URL": "",
+  },
   "observability": {
     "enabled": true,
     "traces": {

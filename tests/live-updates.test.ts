@@ -13,6 +13,18 @@ function point(x: number, y: number) {
 }
 const target = { mode: 'relay' as const, baseUrl: 'https://relay.example', relayId: 'example', contextRevision: 'revision' }
 
+test('Webtool live journals preserve a distinct direct destination across reload', async () => {
+  const state = group('circles')
+  state.points.push(point(10, 20))
+  const destination = { mode: 'webtool' as const, baseUrl: 'http://localhost:19520', contextRevision: 'revision' }
+  const queue = emptyLiveQueue()
+  enqueue(queue, await makeUpdate(buildDelta(state, 'capture')!, destination))
+  const restored = parseLiveQueue(JSON.parse(JSON.stringify(queue)))
+  assert.deepEqual(restored.items[0]!.target, destination)
+  assert.equal(restored.items[0]!.phase, 'queued')
+  assert.throws(() => parseLiveQueue({ ...queue, items: [{ ...queue.items[0], target: { ...destination, mode: 'unknown' } }] }), /Invalid live update journal/)
+})
+
 test('live paths send only the next edge and Finish sends only the closing edge', () => {
   const state = group()
   state.points.push(point(10, 20))

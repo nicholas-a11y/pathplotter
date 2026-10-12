@@ -1,4 +1,5 @@
 import { env } from "cloudflare:workers";
+import { evictDurableObject, runDurableObjectAlarm, runInDurableObject } from "cloudflare:test";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import worker from "../src/index";
 
@@ -9,6 +10,14 @@ type TestBindings = Env & { BOOTSTRAP_TOKEN: string };
 type Relay = { relayId: string; credential: string; bindings: TestBindings };
 type Agent = Relay & { generation: number; serverTime: number };
 type Browser = { pairingId: string; pendingToken: string; phrase: string; credential: string };
+const testSockets = new Map<string, { socket: WebSocket; last: number }>();
+const testRelays: string[] = [];
+
+afterEach(async () => {
+  for (const { socket } of testSockets.values()) socket.close();
+  testSockets.clear();
+  for (const id of testRelays.splice(0)) await env.CONTROL_PLANE.getByName("registration-control").preview(id, false);
+});
 
 function bindings(token: string): TestBindings {
   return Object.assign({}, env, { BOOTSTRAP_TOKEN: token }) as TestBindings;
@@ -55,6 +64,7 @@ async function register(token = `bootstrap-${crypto.randomUUID()}`): Promise<Rel
   });
   expect(response.status).toBe(201);
   const value = await json<{ relayId: string; credential: string }>(response);
+  testRelays.push(value.relayId);
   return { ...value, bindings: runtime };
 }
 
@@ -74,10 +84,35 @@ async function update(
   sequence: number,
   overrides: Record<string, unknown> = {},
 ): Promise<Response> {
-  return call(`/v1/relays/${agent.relayId}/agent/update`, {
-    credential: agent.credential,
-    bindings: agent.bindings,
-    body: {
+  const key = `${agent.relayId}:${agent.generation}`;
+  let connection = testSockets.get(key);
+  if (connection && Date.now() - connection.last >= 45_000) { connection.socket.close(); connection = undefined; }
+  if (!connection) {
+    const response = await call(`/v1/relays/${agent.relayId}/agent/stream?generation=${agent.generation}`, {
+      credential: agent.credential, bindings: agent.bindings, upgrade: true, origin: null,
+    });
+    expect(response.status).toBe(101);
+    const socket = response.webSocket!;
+    socket.accept();
+    connection = { socket, last: 0 }; testSockets.set(key, connection);
+  }
+  if (connection.last) {
+    if (vi.isFakeTimers()) vi.setSystemTime(Math.max(Date.now(), connection.last + 501));
+    else await new Promise((resolve) => setTimeout(resolve, 510));
+  }
+  connection.last = Date.now();
+  const id = crypto.randomUUID();
+  const socket = connection.socket;
+  return new Promise<Response>((resolve) => {
+    const receive = (event: MessageEvent) => {
+      const message = JSON.parse(String(event.data)) as { id?: string; type?: string; body?: unknown; error?: string };
+      if (message.id !== id) return;
+      socket.removeEventListener("message", receive);
+      const statuses: Record<string, number> = { stale_generation: 409, stale_sequence: 409, invalid_sequence: 400, invalid_clock_calibration: 400, message_rate_limited: 429 };
+      resolve(Response.json(message.type === "error" ? { error: message.error } : message.body, { status: message.type === "error" ? statuses[message.error!] ?? 400 : 200 }));
+    };
+    socket.addEventListener("message", receive);
+    socket.send(JSON.stringify({ v: 2, type: "update", id, body: {
       generation: agent.generation,
       sequence,
       connected: true,
@@ -87,7 +122,7 @@ async function update(
       observedAtServer: Date.now(),
       clockUncertaintyMs: 20,
       ...overrides,
-    },
+    } }));
   });
 }
 
@@ -695,9 +730,15 @@ async function control(relay: Relay | Agent, credential: string, body: unknown =
 }
 
 async function snapshotOf(relay: Relay | Agent, credential: string): Promise<{ activeBrowser: boolean; controlOccupied: boolean; job: Record<string, unknown> | null }> {
-  const response = await call(`/v1/relays/${relay.relayId}/snapshot`, { credential, bindings: relay.bindings });
-  expect(response.status).toBe(200);
-  return json(response);
+  const ticket = await json<{ ticket: string }>(await call(`/v1/relays/${relay.relayId}/ticket`, { body: {}, credential, bindings: relay.bindings }));
+  const response = await call(`/v1/relays/${relay.relayId}/stream?ticket=${ticket.ticket}`, { upgrade: true, bindings: relay.bindings });
+  expect(response.status).toBe(101);
+  const socket = response.webSocket!;
+  const result = new Promise<{ activeBrowser: boolean; controlOccupied: boolean; job: Record<string, unknown> | null }>((resolve) => socket.addEventListener("message", (event) => resolve(JSON.parse(String(event.data))), { once: true }));
+  socket.accept();
+  const value = await result;
+  socket.close();
+  return value;
 }
 
 async function queueJob(relay: Relay | Agent, credential: string): Promise<{ response: Response; id: string }> {
@@ -866,6 +907,200 @@ describe("browser control acquisition and takeover", () => {
     expect((await control(relay, first)).status).toBe(409);
   });
 
+  function observation(agent: Agent, sequence: number): Record<string, unknown> {
+    return { generation: agent.generation, sequence, connected: true, position: { x: 12, y: 34 },
+      context: { revision: "workspace-v1", size: { x: 600, y: 400 } }, observationAgeMs: 0,
+      observedAtServer: Date.now(), clockUncertaintyMs: 0, settled: true };
+  }
+
+  async function browserSocket(relay: Relay, credential: string): Promise<{ socket: WebSocket; messages: Record<string, unknown>[] }> {
+    const t = await json<{ ticket: string }>(await call(`/v1/relays/${relay.relayId}/ticket`, { credential, bindings: relay.bindings, body: {} }));
+    const response = await call(`/v1/relays/${relay.relayId}/stream?ticket=${t.ticket}`, { bindings: relay.bindings, upgrade: true });
+    expect(response.status).toBe(101);
+    const socket = response.webSocket!, messages: Record<string, unknown>[] = [];
+    socket.addEventListener("message", (event) => { messages.push(JSON.parse(String(event.data))); });
+    socket.accept();
+    await vi.waitFor(() => expect(messages.length).toBeGreaterThan(0));
+    return { socket, messages };
+  }
+
+  describe("v2 transport, fresh reads and enrollment", () => {
+    afterEach(() => { vi.useRealTimers(); vi.restoreAllMocks(); });
+
+    it("enforces explicit 5-second HTTP fallback updates and snapshots", async () => {
+      const relay = await register(), agent = await startAgent(relay), browser = await launchBrowser(relay);
+      const root = `/v1/relays/${relay.relayId}`;
+      expect((await call(`${root}/agent/update`, { credential: agent.credential, bindings: relay.bindings, body: observation(agent, 1) })).status).toBe(200);
+      expect((await call(`${root}/agent/update`, { credential: agent.credential, bindings: relay.bindings, body: observation(agent, 2) })).status).toBe(429);
+      expect((await call(`${root}/snapshot`, { credential: browser, bindings: relay.bindings })).status).toBe(200);
+      expect((await call(`${root}/snapshot`, { credential: browser, bindings: relay.bindings })).status).toBe(429);
+      vi.useFakeTimers(); vi.setSystemTime(Date.now() + 5001);
+      expect((await call(`${root}/agent/update`, { credential: agent.credential, bindings: relay.bindings, body: observation(agent, 2) })).status).toBe(200);
+      expect((await call(`${root}/snapshot`, { credential: browser, bindings: relay.bindings })).status).toBe(200);
+    });
+
+    it("keeps live coordinates out of SQL and does not revive them after hibernation", async () => {
+      const relay = await register(), agent = await startAgent(relay), browser = await launchBrowser(relay);
+      await update(agent, 1); await update(agent, 2); await update(agent, 3);
+      const stub = env.RELAYS.getByName(relay.relayId);
+      await runInDurableObject(stub, (_instance, state) => expect(state.storage.sql.exec<{ n: number }>("SELECT COUNT(*) AS n FROM snapshots").one().n).toBe(0));
+      const live = await json<{ settled: boolean; snapshot: unknown }>(await call(`/v1/relays/${relay.relayId}/snapshot`, { credential: browser, bindings: relay.bindings }));
+      expect(live.settled).toBe(true); expect(live.snapshot).not.toBeNull();
+      await evictDurableObject(stub);
+      const asleep = await json<{ snapshot: unknown }>(await call(`/v1/relays/${relay.relayId}/snapshot`, { credential: browser, bindings: relay.bindings }));
+      expect(asleep.snapshot).toBeNull();
+      expect((await update(agent, 3)).status).toBe(409);
+      expect((await update(agent, 4)).status).toBe(200);
+    });
+
+    it("atomically limits service-wide preview leases to two and recovers expired capacity", async () => {
+      const cp = env.CONTROL_PLANE.getByName(`preview-test-${crypto.randomUUID()}`);
+      const granted = await Promise.all(["a", "b", "c"].map((id) => cp.preview(id, true)));
+      expect(granted.filter(Boolean)).toHaveLength(2);
+      expect(await cp.preview("a", true)).toBe(true);
+      expect(await cp.preview("c", true)).toBe(false);
+      vi.useFakeTimers(); vi.setSystemTime(Date.now() + 45_001);
+      expect(await cp.preview("c", true)).toBe(true);
+    });
+
+    it("caps browser sockets, scopes roles, and releases hidden preview without taking control", async () => {
+      const relay = await register(), agent = await startAgent(relay), browser = await launchBrowser(relay);
+      const root = `/v1/relays/${relay.relayId}`;
+      expect((await call(`${root}/agent/stream?generation=${agent.generation}`, { credential: browser, bindings: relay.bindings, upgrade: true })).status).toBe(401);
+      expect((await call(`${root}/snapshot`, { credential: browser, bindings: relay.bindings })).status).toBe(200);
+      const first = await browserSocket(relay, browser), second = await browserSocket(relay, browser);
+      const ticket = await json<{ ticket: string }>(await call(`${root}/ticket`, { credential: browser, bindings: relay.bindings, body: {} }));
+      expect((await call(`${root}/stream?ticket=${ticket.ticket}`, { upgrade: true, bindings: relay.bindings, origin: null })).status).toBe(403);
+      expect((await call(`${root}/stream?ticket=${ticket.ticket}`, { upgrade: true, bindings: relay.bindings })).status).toBe(429);
+      first.socket.send(JSON.stringify({ v: 2, type: "heartbeat", watching: false }));
+      second.socket.send(JSON.stringify({ v: 2, type: "heartbeat", watching: false }));
+      await vi.waitFor(() => expect(second.messages.at(-1)).toMatchObject({ protocol: 2, previewActive: false, activeBrowser: false }));
+      first.socket.close(); second.socket.close();
+    });
+
+    it("long-polls fresh capture with measured wait, preserves observation age, and rejects replay", async () => {
+      const relay = await register(), agent = await startAgent(relay), browser = await launchBrowser(relay);
+      const root = `/v1/relays/${relay.relayId}`;
+      await control(relay, browser); await update(agent, 1);
+      const queued = await queueJob(relay, browser); expect(queued.response.status).toBe(200);
+      const id = crypto.randomUUID();
+      expect((await call(`${root}/capture`, { credential: browser, bindings: relay.bindings, body: { requestId: id } })).status).toBe(200);
+      expect((await call(`${root}/capture`, { credential: browser, bindings: relay.bindings, body: { requestId: crypto.randomUUID() } })).status).toBe(409);
+      const waiting = call(`${root}/capture/${id}`, { credential: browser, bindings: relay.bindings });
+      await new Promise((resolve) => setTimeout(resolve, 150));
+      expect((await call(`${root}/agent/capture/${id}`, { credential: agent.credential, bindings: relay.bindings, body: observation(agent, 2) })).status).toBe(200);
+      const result = await json<{ status: string; waitMs: number; body: { snapshot: { receivedAt: number } } }>(await waiting);
+      expect(result.status).toBe("complete"); expect(result.waitMs).toBeGreaterThanOrEqual(100);
+      expect((await call(`${root}/agent/capture/${id}`, { credential: agent.credential, bindings: relay.bindings, body: observation(agent, 3) })).status).toBe(409);
+      const claimed = await json<{ job: { id: string } | null }>(await update(agent, 3));
+      expect(claimed.job?.id).toBe(queued.id);
+      vi.useFakeTimers(); vi.setSystemTime(Date.now() + 5001);
+      const cached = await json<typeof result>(await call(`${root}/capture/${id}`, { credential: browser, bindings: relay.bindings }));
+      expect(cached.waitMs).toBe(0); expect(cached.body.snapshot.receivedAt).toBe(result.body.snapshot.receivedAt);
+    });
+
+    it("broadcasts queued and terminal jobs without renewing the browser's control lease", async () => {
+      const relay = await register(), agent = await startAgent(relay), browser = await launchBrowser(relay);
+      await control(relay, browser); await update(agent, 1);
+      const stream = await browserSocket(relay, browser), stub = env.RELAYS.getByName(relay.relayId);
+      const leaseBefore = await runInDurableObject(stub, (_instance, state) => state.storage.sql.exec<{ lease_expires_at: number }>("SELECT lease_expires_at FROM relay_meta").one().lease_expires_at);
+      const job = await queueJob(relay, browser); expect(job.response.status).toBe(200);
+      await vi.waitFor(() => expect(stream.messages.at(-1)).toMatchObject({ job: { id: job.id, status: "queued" } }));
+      await update(agent, 2);
+      for (const status of ["attempting", "confirmed"]) {
+        expect((await call(`/v1/relays/${relay.relayId}/agent/jobs/${job.id}/status`, { credential: agent.credential, bindings: relay.bindings, body: { generation: agent.generation, status } })).status).toBe(200);
+      }
+      await vi.waitFor(() => expect(stream.messages.at(-1)).toMatchObject({ job: { id: job.id, status: "confirmed" } }));
+      const leaseAfter = await runInDurableObject(stub, (_instance, state) => state.storage.sql.exec<{ lease_expires_at: number }>("SELECT lease_expires_at FROM relay_meta").one().lease_expires_at);
+      expect(leaseAfter).toBe(leaseBefore);
+      stream.socket.close();
+    });
+
+    it("does not renew an expired owner through outgoing snapshots or reconnect", async () => {
+      const relay = await register(), agent = await startAgent(relay), browser = await launchBrowser(relay);
+      await control(relay, browser); await update(agent, 1);
+      const stream = await browserSocket(relay, browser);
+      vi.useFakeTimers(); vi.setSystemTime(Date.now() + 45_001);
+      await update(agent, 2);
+      await vi.waitFor(() => expect(stream.messages.at(-1)).toMatchObject({ activeBrowser: false }));
+      stream.socket.close();
+      expect(await snapshotOf(relay, browser)).toMatchObject({ activeBrowser: false, controlOccupied: false });
+    });
+
+    it("fails capture on changed control or generation and rejects an old observation", async () => {
+      const relay = await register(), agent = await startAgent(relay), browser = await launchBrowser(relay), other = await launchBrowser(relay);
+      const root = `/v1/relays/${relay.relayId}`;
+      await control(relay, browser); await update(agent, 1);
+      const id = crypto.randomUUID();
+      await call(`${root}/capture`, { credential: browser, bindings: relay.bindings, body: { requestId: id } });
+      expect((await call(`${root}/agent/capture/${id}`, { credential: agent.credential, bindings: relay.bindings, body: { ...observation(agent, 2), observedAtServer: Date.now() - 1000 } })).status).toBe(409);
+      await control(relay, other, { takeover: true });
+      expect((await call(`${root}/agent/capture/${id}`, { credential: agent.credential, bindings: relay.bindings, body: observation(agent, 2) })).status).toBe(409);
+      const failed = await json<{ status: string }>(await call(`${root}/capture/${id}`, { credential: browser, bindings: relay.bindings }));
+      expect(failed.status).toBe("failed");
+    });
+
+    it("runs alarm cleanup while preserving credentials and replay tombstones", async () => {
+      const relay = await register(), agent = await startAgent(relay), browser = await launchBrowser(relay);
+      await control(relay, browser); await update(agent, 1);
+      const queued = await queueJob(relay, browser); expect(queued.response.status).toBe(200);
+      vi.useFakeTimers(); vi.setSystemTime(Date.now() + 24 * 60 * 60_000);
+      const stub = env.RELAYS.getByName(relay.relayId);
+      expect(await runDurableObjectAlarm(stub)).toBe(true);
+      await runInDurableObject(stub, async (_instance, state) => {
+        expect(state.storage.sql.exec<{ n: number }>("SELECT COUNT(*) AS n FROM jobs").one().n).toBe(0);
+        expect(state.storage.sql.exec<{ n: number }>("SELECT COUNT(*) AS n FROM job_tombstones WHERE id=?", queued.id).one().n).toBe(1);
+        expect(state.storage.sql.exec<{ n: number }>("SELECT COUNT(*) AS n FROM browsers").one().n).toBe(1);
+        expect(await state.storage.getAlarm()).toBeNull();
+      });
+      expect((await call(`/v1/relays/${relay.relayId}/ticket`, { credential: browser, bindings: relay.bindings, body: {} })).status).toBe(200);
+      expect((await startAgent(relay)).generation).toBe(agent.generation + 1);
+    });
+
+    it("keeps enrollment disabled without production configuration", async () => {
+      const runtime = bindings("unused-bootstrap-token");
+      expect(await json(await call("/v1/enrollment/config", { bindings: runtime }))).toEqual({ enabled: false, siteKey: "" });
+      expect((await call("/v1/enrollment/start", { bindings: runtime, body: { name: "test", verifier: "a".repeat(43) } })).status).toBe(503);
+    });
+
+    it("binds enrollment approval to code, Turnstile hostname/action and verifier ownership", async () => {
+      const runtime = Object.assign(bindings("unused-bootstrap-token"), { ENROLLMENT_CODE: "test-enrollment-code", TURNSTILE_SECRET: "test-secret-not-for-production", TURNSTILE_SITE_KEY: "0xTESTSITEKEYONLY" });
+      const verifier = "a".repeat(43);
+      const started = await json<{ requestId: string; phrase: string }>(await call("/v1/enrollment/start", { bindings: runtime, body: { name: "test enrollment", verifier } }));
+      const retry = await json<{ requestId: string }>(await call("/v1/enrollment/start", { bindings: runtime, body: { name: "test enrollment", verifier } }));
+      expect(retry.requestId).toBe(started.requestId);
+      const path = `/v1/enrollment/${started.requestId}`;
+      const publicStatus = await json<Record<string, unknown>>(await call(path, { bindings: runtime }));
+      expect(publicStatus.phrase).toBe(started.phrase); expect(publicStatus.credential).toBeUndefined(); expect(publicStatus.verifier).toBeUndefined();
+      expect((await call(`${path}/approve`, { bindings: runtime, body: { code: "wrong", turnstileToken: "test" } })).status).toBe(403);
+      const verify = vi.spyOn(globalThis, "fetch").mockResolvedValue(Response.json({ success: true, action: "enrollment", hostname: "localhost" }));
+      const approve = { code: "test-enrollment-code", turnstileToken: "test-token" };
+      expect((await call(`${path}/approve`, { bindings: runtime, body: approve })).status).toBe(403);
+      verify.mockResolvedValue(Response.json({ success: true, action: "wrong", hostname: "nicholas-a11y.github.io" }));
+      expect((await call(`${path}/approve`, { bindings: runtime, body: approve })).status).toBe(403);
+      verify.mockResolvedValue(Response.json({ success: true, action: "enrollment", hostname: "nicholas-a11y.github.io" }));
+      expect((await call(`${path}/approve`, { bindings: runtime, body: approve })).status).toBe(200);
+      expect((await call(`${path}/claim`, { bindings: runtime, body: { verifier: "b".repeat(43) } })).status).toBe(401);
+      const claimed = await json<{ status: string; relayId: string; credential: string }>(await call(`${path}/claim`, { bindings: runtime, body: { verifier } }));
+      expect(claimed.status).toBe("complete"); expect(claimed.credential).toHaveLength(43);
+      expect(await json(await call(`${path}/claim`, { bindings: runtime, body: { verifier } }))).toEqual(claimed);
+      expect((await startAgent({ ...claimed, bindings: runtime })).generation).toBe(1);
+    });
+
+    it("reserves the 50th enrollment atomically, includes known legacy inventory, and has no daily quota", async () => {
+      const cp = env.CONTROL_PLANE.getByName(`enrollment-cap-${crypto.randomUUID()}`);
+      await runInDurableObject(cp, (_instance, state) => {
+        for (let i = 0; i < 49; i++) state.storage.sql.exec("INSERT INTO consumed_invitations VALUES (?,?,?)", `legacy-token-${i}`, `legacy-relay-${i}`, Date.now());
+      });
+      await cp.enrollmentStart("last device", "verifier-hash-1", "ip1");
+      const denied = await runInDurableObject(cp, async (instance) => {
+        try { await instance.enrollmentStart("overflow", "verifier-hash-2", "ip2"); return ""; }
+        catch (error) { return error instanceof Error ? error.message : "unexpected"; }
+      });
+      expect(denied).toBe("registration_capacity");
+    });
+  });
+
   it("blocks takeover and lease-expiry claims while another browser has unresolved imports", async () => {
     const relay = await register();
     const agent = await startAgent(relay);
@@ -884,13 +1119,11 @@ describe("browser control acquisition and takeover", () => {
     expect((await control(relay, other, { takeover: true })).status).toBe(409);
 
     vi.useFakeTimers();
-    vi.setSystemTime(Date.now() + 15_001);
+    vi.setSystemTime(Date.now() + 45_001);
     expect((await snapshotOf(relay, other)).controlOccupied).toBe(false);
     const expiredLease = await control(relay, other);
     expect(expiredLease.status).toBe(409);
     expect(await json(expiredLease)).toEqual({ error: "unresolved_imports" });
-    vi.useRealTimers();
-
     const restarted = await startAgent(relay);
     expect(await json(await call(`/v1/relays/${relay.relayId}/jobs/${queued.id}`, { credential: owner, bindings: relay.bindings })))
       .toMatchObject({ id: queued.id, status: "unknown" });

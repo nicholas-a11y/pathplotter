@@ -10,48 +10,62 @@ PathPlotter does **not** move the machine, fire the laser or start a job. Sendin
 
 ## What you need
 
-- A Windows computer running LightBurn with its REST API available and enabled.
+- A computer running LightBurn with its REST API available and enabled (Windows is required for RAP; the direct Webtool option uses the embedded browser).
 - A connected machine for which LightBurn reports valid workpiece X/Y coordinates and workspace context. PathPlotter uses the API rather than a controller-specific connection; this does not guarantee support for every controller or LightBurn version.
-- The portable **RAP** connector running on that computer.
-- An internet connection on both the LightBurn computer and the browser device. A phone does not need to be on the same Wi-Fi.
-- For first-time RAP setup, an HTTPS relay address and a single-use registration invitation supplied by the relay operator.
+- For ordinary browsers and phones: the portable **RAP** connector running on the Windows LightBurn computer and internet on both devices. A phone does not need to be on the same Wi-Fi.
+- For first-time guided RAP setup: the hosted service's enrollment code and browser verification. Operator-issued single-use invitations remain supported.
+- Alternatively, when opened inside LightBurn's built-in **Webtool browser**, use the direct local API connection without RAP or relay enrollment. The embedded browser must permit loopback API access.
 
-This is a private development prototype, not an unrestricted public service. Opening the web app alone does not connect it to a laser. Real-machine placement and responsiveness must be checked with your setup; automated tests do not certify hardware behavior.
+PathPlotter is intended to be a **free service**, initially limited to 50 enrolled computers. Guided enrollment must be enabled by the operator before new users can register; existing paired computers remain usable when enrollment is disabled. Opening the web app alone does not connect it to a laser. Real-machine placement and responsiveness must be checked with your setup; automated tests do not certify hardware behavior.
 
 ### How the connection works
 
 ```text
 Browser (computer or phone)
           |
-       HTTPS
+    outbound WSS / HTTPS
           |
 Cloudflare relay
           |
-  outbound HTTPS from RAP
+  outbound WSS / HTTPS from RAP
           |
 RAP on the Windows computer
           |
    local LightBurn REST API
 ```
 
-The web interface is hosted on GitHub Pages. RAP reads LightBurn locally and passes observations through the authenticated relay; it also imports SVGs explicitly sent by an authorized browser. The phone never connects directly to LightBurn and never receives its API secret.
+The web interface is hosted on GitHub Pages. RAP and the browser maintain outbound secure WebSocket connections to the relay. RAP reads LightBurn locally, publishes moving previews only while a browser is watching, and imports SVGs explicitly sent by an authorized browser. The phone never connects directly to LightBurn and never receives its API secret. Ordinary networks need no inbound firewall rule; some corporate proxies can block WebSockets.
 
 Keep **Allow API Access From Network disabled** in LightBurn. RAP uses the local API, so no port forwarding or public LightBurn API is needed. Users do not need their own Cloudflare account.
 
 ## Connect for the first time
 
+### Inside LightBurn as a Webtool (no RAP)
+
+1. Open PathPlotter in LightBurn's built-in Webtool browser.
+2. Enable REST API in **Settings > Extensions**, leaving **Allow API Access From Network off**.
+3. Open **Connection** and select **LightBurn Webtool (direct API, no RAP)**.
+4. Keep the local API URL `http://localhost:19520` (adjust the loopback port if your API configuration differs).
+5. Click **Connect** with the secret blank, then approve the permission request in LightBurn. An existing API secret can also be used.
+
+Preview, capture, workspace verification and SVG imports call LightBurn directly. Live update uses the same import-confirmation and recovery safeguards; it does not send through the relay. The secret remains in memory, is excluded from session backups, and is cleared when changing connection modes. This mode needs neither RAP nor cloud pairing and is separate from the local development proxy.
+
+This is an explicit connection option, not automatic embedded-browser detection. LightBurn's actual embedded-browser CORS/mixed-content policy still needs testing; selecting this mode cannot bypass browser restrictions. If direct requests are blocked, use RAP in an ordinary browser rather than enabling network API access or disabling browser protections.
+
 ### On the LightBurn computer
 
-1. Obtain the complete RAP folder from the project/operator, or download the **PathPlotter-RAP-Windows** artifact from a successful [Check PathPlotter and RAP workflow](https://github.com/nicholas-a11y/pathplotter/actions/workflows/checks.yml). Extract it somewhere writable; do not run it from inside the ZIP.
+1. Open **Get started** in the web app and choose **Find Windows download**, or visit [public releases](https://github.com/nicholas-a11y/pathplotter/releases). Download **PathPlotter-RAP-Windows.zip** from a compatible `rap-v2.*` release. Extract the complete ZIP somewhere writable; do not run it from inside the ZIP. If no compatible release is published, the guide says so rather than offering an older connector.
 2. Open LightBurn and enable its REST API in **Settings > Extensions**. Leave network API access off.
 3. Double-click **Start RAP.cmd**. **Start RAP.vbs** is an alternative that avoids the brief command-window flash.
-4. In RAP's first-use setup, enter the operator-supplied relay address, a computer name and the registration invitation.
+4. Use RAP's guided setup. Compare its computer name and setup phrase with the opened browser, enter the enrollment code and complete verification. Approval authorizes only that matching RAP; the browser does not receive its agent credentials. Alternatively use an operator-issued registration invitation.
 5. Click **Request local LightBurn permission**. Bring LightBurn to the foreground and approve its permission dialog within 30 seconds.
-6. Once RAP has published a fresh, verified workpiece position, it opens PathPlotter automatically. Desktop authorization and capture control are automatic when control is free.
+6. Once RAP is ready, it opens PathPlotter automatically. Desktop authorization and capture control are automatic when control is free.
 
 Subsequent RAP launches reuse protected credentials and open PathPlotter automatically. Use **Open PathPlotter** in RAP to open it again. Closing the RAP status window leaves it running in the tray; choose **Quit** to stop it. Launching RAP a second time shows the existing instance rather than starting another connector.
 
 RAP is portable and uses Windows PowerShell 5.1 and .NET Framework; everyday use does not require Node, Python or administrator access. If Windows policy blocks its scripts, follow your organization's approved procedure rather than disabling security protections.
+
+The website cannot detect, install or silently start RAP. **Get started** provides the download and troubleshooting pathway when no connector is available. This version is Windows-only.
 
 ### On a phone or another browser
 
@@ -102,9 +116,13 @@ A full SVG export includes valid current geometry as well as finished groups; a 
 
 Coordinates are in **millimetres**, with **+X right and +Y up**. The plot has numbered rulers, an adaptive grid and equal X/Y scale. A bed outline is shown when workpiece dimensions are available; the visible range expands to include positions and captured geometry.
 
-The crosshair turns black after **three distinct, fresh readings with exactly the same X/Y**. It turns red when the coordinates change; stale or disconnected data clears the stable indication. Black means the *reported coordinates* are stable, not proof that the head has physically stopped.
+The crosshair turns black after RAP observes **three distinct readings with exactly the same X/Y**; it turns red when coordinates change, and disconnection clears the marker. The browser does not manufacture extra readings from heartbeat messages. Black means the *reported coordinates* are stable, not proof that the head has physically stopped.
 
-In cloud mode, Capture point copies the latest reported sample, rather than requesting a new measurement at the instant you tap. Samples must be no more than **2 seconds old**. RAP targets a 500 ms observation cycle, but network and API latency can make updates slower. A successful API observation is not proof of a newly measured physical position.
+In cloud mode, **Capture point requests a new local observation from RAP**, rather than copying a cached preview. The returned observation must be no more than **2 seconds old**, with valid workspace and capture control. Disconnects, changed control, stale responses and timeouts save no point. Imports also verify the current destination using a new observation. A successful API observation is not proof of a newly measured physical position.
+
+Moving preview is capped at **2 updates/second**, with at most two simultaneously previewing RAPs and two watching browser connections per RAP. Stationary or unwatched sessions reduce publication; idle health uses a slower 15-second cadence. Preview age is displayed honestly and is separate from connection health. A busy preview limit does not authorize a cached capture.
+
+If a network blocks WebSockets, explicitly select **Use slower HTTP connection** in Get started and select the corresponding mode in RAP. Regular polling is no faster than once every five seconds; it is never enabled silently. Setup and imports may take longer. Switching transport is blocked while unresolved imports/live work need reconciliation.
 
 ## Send once, or draw with Live update
 
@@ -194,9 +212,9 @@ Abandoning preserves captured points and never removes LightBurn artwork. Local 
 - RAP's LightBurn secret remains on the computer. RAP credentials and its import journal use current-user Windows protection.
 - Browser authorization is stored separately in browser storage. **Unlink this browser** removes the local pairing; use RAP's **Connected browsers** controls to revoke server authorization.
 - Relay snapshots overwrite the latest coordinates rather than retaining movement history. Captured collections remain in the browser and SVGs travel through the relay for import.
-- Terminal jobs discard their SVG payloads. Temporary records expire, but storage cleanup is request-driven; shutdown does not delete the whole Durable Object. Registration and browser authorization persist until revoked/reset as applicable.
+- Terminal jobs discard their SVG payloads. Durable Object alarms clean temporary coordinates, SVG jobs, results and requests after at most 24 hours of logical retention, including when devices are offline. Alarm delivery/retry timing can delay physical deletion; records are not usable after expiry. Registration and browser authorization persist until revoked/reset as applicable. Local import journals remain for safe recovery.
 - Pairing links are private grants. Scripts served from the same GitHub Pages origin are within the browser credential trust boundary.
-- The operator must budget for hosting. A 500 ms publication interval alone is about 172,800 updates/day, before browser polling and coordination. Free-tier limits can stop service; free hosting is not guaranteed.
+- The shared enrollment code is a service gate, not private computer authorization. Browser verification, enrollment caps, private RAP credentials and explicit phone approval provide separate protections. No public hosted service is risk-free.
 
 ## Development and deployment
 
@@ -223,9 +241,15 @@ npm run preview
 
 - **Web app:** [pages.yml](.github/workflows/pages.yml) builds and deploys `dist/` to GitHub Pages on pushes to `main`, or by manual workflow dispatch. GitHub Pages must be configured for Actions.
 - **Relay:** deployed separately; a Pages push does not redeploy it. See [relay setup and API contract](relay/README.md) for operator configuration and checks.
-- **RAP:** use the matching updated RAP files and restart the connector. [checks.yml](.github/workflows/checks.yml) tests all three components and packages the Windows RAP artifact.
+- **RAP:** use the matching updated RAP files and restart the connector. [checks.yml](.github/workflows/checks.yml) tests all three components. [rap-release.yml](.github/workflows/rap-release.yml) publishes a portable ZIP and SHA-256 checksum for `rap-v2.MINOR.PATCH` tags or explicit tag dispatch; the browser only offers compatible public releases. [Package-RAP.ps1](scripts/Package-RAP.ps1) uses an explicit distribution allowlist, excluding credentials, journals, test files and unrelated DLLs.
 
-No backend credentials belong in frontend source or Pages variables. Registration is operator-controlled, not public self-enrollment.
+No backend credentials belong in frontend source or Pages variables. Public self-enrollment stays disabled until the operator configures its code, Turnstile widget/secret and accepted website hostname, publishes a matching release, and verifies hosted behavior and usage. Download publication does not deploy the relay.
+
+### Hosting operations (operator only)
+
+Start the pilot on Cloudflare's Free account without an automatic billing upgrade. WebSockets reduce HTTP request overhead, but Durable Object active duration, message accounting, SQL operations, abuse and reconnects still matter; tiny messages do not imply zero cost. Measure a hosted idle session and an active session before enabling enrollment. There is a 50-computer enrollment cap and no daily registration quota; per-IP abuse protection is separate. Existing import limits and bounded payloads remain in force.
+
+Monitor provider usage and keep enrollment disabling/revocation available. The service is intended to stay free for users; hosting costs may require the operator to review its operation. No account configuration, deployment or release is performed just by building this repository.
 
 ### Real-machine check
 

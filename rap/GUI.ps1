@@ -188,7 +188,21 @@ function Handle-UiEvent($Event) {
     switch -CaseSensitive ($Event.kind) {
         'setup' {
             $d.busy = $false; $d.setup.Visible = $true; $d.register.Enabled = $true
-            $d.status.Text = 'First-time setup: enter the operator-provided relay origin and invitation.'
+            $d.enrollment.Visible = $false
+            if ($null -ne $Event.value) { $d.api.Text = $Event.value.apiRoot; $d.name.Text = $Event.value.name }
+            $d.status.Text = 'Guided setup: choose a computer name, then register in your browser. Leave invitation blank. Advanced relay override and existing operator invitations remain available.'
+            Show-RapWindow
+        }
+        'enrollment' {
+            $d.busy = $false; $d.setup.Visible = $false; $d.enrollment.Visible = $true
+            $d.enrollmentPhrase = $Event.value.phrase
+            $d.enrollmentText.Text = 'Enrollment phrase: ' + $Event.value.phrase + '. Compare it with the browser for this computer. Never approve a different phrase or an unsolicited request.'
+            $d.confirmEnrollment.Enabled = $true
+            $d.status.Text = 'Browser setup opened. Complete its verification and explicit approval. Confirm the matching phrase below to finish on this computer.'
+            if (-not $d.smoke) {
+                try { Start-Process -FilePath $Event.value.url }
+                catch { $d.notice.Text = 'Windows could not open your browser. Retry setup explicitly; the enrollment verifier is protected for recovery.' }
+            }
             Show-RapWindow
         }
         'consent' {
@@ -196,7 +210,7 @@ function Handle-UiEvent($Event) {
             $d.status.Text = 'Open LightBurn, enable REST API in Settings > Extensions, keep network API access disabled. Click below, bring LightBurn forward, then approve its own dialog within 30 seconds.'
             Show-RapWindow
         }
-        'configured' { $d.configured = $true; $d.busy = $false; $d.setup.Visible = $false; $d.consent.Visible = $false; $d.status.Text = 'Connecting to LightBurn and relay...' }
+        'configured' { $d.configured = $true; $d.busy = $false; $d.setup.Visible = $false; $d.enrollment.Visible = $false; $d.consent.Visible = $false; $d.status.Text = 'Connecting to LightBurn and relay...' }
         'recovery' {
             $d.busy = $false; $d.recovery.Visible = $true
             $d.status.Text = 'Saved registration is invalid or unreadable. Replace only local credentials with explicit consent below. The import journal is preserved; ask the operator to revoke the old agent credential and revoke the old LightBurn entry.'
@@ -282,15 +296,20 @@ function Start-RapDesktop {
         $d.list = New-UiButton 'Connected browsers' @{ action = 'browsers' }
         foreach ($button in @($d.open, $d.pair, $d.list)) { $button.Enabled = $false; $actions.Controls.Add($button) }
         $d.setup = New-Object Windows.Forms.FlowLayoutPanel
-        $d.setup.Size = New-Object Drawing.Size(580, 205); $d.setup.FlowDirection = 'TopDown'; $d.setup.WrapContents = $false; $d.setup.Visible = $false
+        $d.setup.Size = New-Object Drawing.Size(580, 255); $d.setup.FlowDirection = 'TopDown'; $d.setup.WrapContents = $false; $d.setup.Visible = $false
         $layout.Controls.Add($d.setup)
-        foreach ($field in @(@('HTTPS relay API origin (operator supplied)', 'api'), @('Computer name', 'name'), @('Private registration invitation', 'invitation'))) {
+        foreach ($field in @(@('HTTPS relay origin (advanced override)', 'api'), @('Computer name', 'name'), @('Optional existing operator invitation (blank for guided setup)', 'invitation'))) {
             $label = New-Object Windows.Forms.Label
             $label.Text = $field[0]; $label.AutoSize = $true; $d.setup.Controls.Add($label)
             $box = New-Object Windows.Forms.TextBox
             $box.Width = 560; $d[$field[1]] = $box; $d.setup.Controls.Add($box)
         }
         $d.name.Text = $env:COMPUTERNAME; $d.invitation.UseSystemPasswordChar = $true
+        $d.api.Text = 'https://pathplotter-relay-test.nicholas-leqeta.workers.dev'; $d.api.ReadOnly = $true
+        $d.override = New-Object Windows.Forms.CheckBox
+        $d.override.Text = 'Advanced: override relay origin'; $d.override.AutoSize = $true
+        $d.override.Add_CheckedChanged({ $script:Desktop.api.ReadOnly = -not $script:Desktop.override.Checked })
+        $d.setup.Controls.Add($d.override)
         $d.register = New-Object Windows.Forms.Button
         $d.register.Text = 'Register this computer'; $d.register.AutoSize = $true
         $d.register.Add_Click({
@@ -300,6 +319,36 @@ function Start-RapDesktop {
             }
         })
         $d.setup.Controls.Add($d.register)
+        $discard = New-Object Windows.Forms.Button
+        $discard.Text = 'Discard expired enrollment setup...'; $discard.AutoSize = $true
+        $discard.Add_Click({
+            if ([Windows.Forms.MessageBox]::Show('Discard only the protected pending enrollment verifier? Any ambiguous completed registration will no longer be recoverable through this verifier. Use only for expired or cancelled setup. Existing credentials and import journal are untouched.', 'Discard pending setup', 'YesNo', 'Warning') -eq 'Yes') {
+                [void](Submit-Ui @{ action = 'discard-enrollment' })
+            }
+        })
+        $d.setup.Controls.Add($discard)
+        $d.enrollment = New-Object Windows.Forms.FlowLayoutPanel
+        $d.enrollment.Size = New-Object Drawing.Size(580, 120); $d.enrollment.Visible = $false
+        $d.enrollmentText = New-Object Windows.Forms.Label
+        $d.enrollmentText.Size = New-Object Drawing.Size(560, 65); $d.enrollment.Controls.Add($d.enrollmentText)
+        $d.confirmEnrollment = New-Object Windows.Forms.Button
+        $d.confirmEnrollment.Text = 'Confirm exact matching enrollment phrase'; $d.confirmEnrollment.AutoSize = $true
+        $d.confirmEnrollment.Add_Click({
+            $s = $script:Desktop
+            if ([Windows.Forms.MessageBox]::Show('Only continue if your browser shows "' + $s.enrollmentPhrase + '" for this computer and you explicitly approved that request. Never approve an unsolicited enrollment.', 'Confirm enrollment', 'YesNo', 'Warning') -eq 'Yes') {
+                if (Submit-Ui @{ action = 'confirm-enrollment'; phrase = $s.enrollmentPhrase }) { $s.confirmEnrollment.Enabled = $false; $s.status.Text = 'Waiting for browser approval (setup checks at least 5 seconds apart)...' }
+            }
+        })
+        $d.enrollment.Controls.Add($d.confirmEnrollment); $layout.Controls.Add($d.enrollment)
+        $fallback = New-Object Windows.Forms.Button
+        $fallback.Text = 'Connection mode: socket / explicit slow HTTP fallback...'; $fallback.AutoSize = $true
+        $fallback.Add_Click({
+            $choice = [Windows.Forms.MessageBox]::Show('Enable reduced-rate HTTP fallback? Updates, capture and approval work are slower (at least 5 seconds). No automatic import retries. Choose No to restore normal sockets.', 'Connection mode', 'YesNoCancel', 'Warning')
+            if ($choice -eq 'Yes') {
+                [void](Submit-Ui @{ action = 'slow-http' })
+            } elseif ($choice -eq 'No') { [void](Submit-Ui @{ action = 'socket' }) }
+        })
+        $layout.Controls.Add($fallback)
         $d.consent = New-UiButton 'Request local LightBurn permission (state, project, upload)' @{ action = 'consent' }
         $d.consent.Visible = $false; $layout.Controls.Add($d.consent)
         $d.recovery = New-Object Windows.Forms.Button
@@ -416,8 +465,9 @@ function Step-GuiSmoke {
     $s = $script:Desktop
     if ($s.clock.ElapsedMilliseconds -gt 20000) { $s.failed = $true; Request-RapQuit; return }
     switch ($s.smokeStage) {
-        0 { if ($s.setup.Visible) { [void](Submit-Ui @{ action = 'register'; api = 'https://fixture.invalid'; name = 'Fixture PC'; invitation = 'fixture-registration' }); $s.smokeStage = 1 } }
-        1 { if ($s.consent.Visible) { [void](Submit-Ui @{ action = 'consent' }); $s.smokeStage = 2 } }
+        0 { if ($s.setup.Visible) { [void](Submit-Ui @{ action = 'register'; api = 'https://fixture.invalid'; name = 'Fixture PC'; invitation = '' }); $s.smokeStage = 1 } }
+        1 { if ($s.enrollment.Visible -and -not $s.busy) { [void](Submit-Ui @{ action = 'confirm-enrollment'; phrase = $s.enrollmentPhrase }); $s.smokeStage = 8 } }
+        8 { if ($s.consent.Visible) { [void](Submit-Ui @{ action = 'consent' }); $s.smokeStage = 2 } }
         2 {
             if ($s.consent.Visible -and -not $s.busy -and $s.fixtureEvents.Contains('consent-denied')) {
                 [void](Submit-Ui @{ action = 'consent' })
@@ -453,11 +503,11 @@ function Assert-GuiSmoke {
     $s = $script:Desktop
     if ($s.failed -or $s.smokeStage -ne 7 -or $s.smokeOpens -ne 1 -or $s.smokePhones -ne 1 -or
         $s.fixtureEvents.Contains('approve') -or -not $s.fixtureEvents.Contains('reject') -or -not $s.fixtureEvents.Contains('disconnected') -or
-        -not $s.fixtureEvents.Contains('consent-denied') -or -not $s.fixtureEvents.Contains('consent-granted') -or $s.smokeConsentTicks -lt 10) {
+        -not $s.fixtureEvents.Contains('enrollment-confirmed') -or -not $s.fixtureEvents.Contains('consent-denied') -or -not $s.fixtureEvents.Contains('consent-granted') -or $s.smokeConsentTicks -lt 10) {
         throw ('GUI fixture smoke checks failed: stage=' + $s.smokeStage + ', failed=' + $s.failed +
             ', opens=' + $s.smokeOpens + ', phones=' + $s.smokePhones + ', fixture=' + ($s.fixtureEvents -join ','))
     }
-    Write-Host 'PASS GUI: STA form/tray, registration, denied/explicitly retried consent, UI timer continues during slow worker, desktop auto-open once, local phone QR expiry, exact phrase rejection, duplicate activation and graceful disconnected shutdown.'
+    Write-Host 'PASS GUI: STA form/tray, guided verifier enrollment + matching phrase + >=5s pending claim, denied/explicitly retried consent, responsive UI timer, desktop auto-open once, phone QR expiry, exact pairing phrase rejection, duplicate activation and graceful disconnected shutdown.'
 }
 
 if (-not $LibraryOnly) {

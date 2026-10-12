@@ -33,6 +33,136 @@ $script:StopRequested = $false
 $script:ActiveImport = $null
 $script:LightBurnRoot = 'http://127.0.0.1:19520'
 $script:UiBridge = $null
+$script:SlowHttp = $false
+$script:Socket = $null
+$script:PreviewActive = $false
+$script:LastObservationHealth = ''
+$script:DefaultRelay = 'https://pathplotter-relay-test.nicholas-leqeta.workers.dev'
+
+function New-AgentSocket {
+    $url = $script:Config.apiRoot -replace '^https:', 'wss:'
+    return New-Object PathPlotterRap.AgentSocket(($url + '/v1/relays/' + [Uri]::EscapeDataString($script:Config.relayId) + '/agent/stream?generation=' + $script:Generation), $script:Config.credential)
+}
+
+function Send-AgentMessage([string]$Type, [string]$Id, $Body) {
+    $script:Socket.Enqueue((@{ v = 2; type = $Type; id = $Id; body = $Body } | ConvertTo-Json -Depth 25 -Compress))
+}
+
+function Publish-ObservationHealth($Observation, $Body) {
+    $health = $Observation.error + ' Cloud connected.'
+    if ($Observation.connected) { $health = 'LightBurn workpiece/context verified; cloud connected.' }
+    if ($script:SlowHttp) { $health += ' Slow HTTP fallback (at least 5 seconds); capture and approvals respond more slowly.' }
+    $fresh = $Body.connected -and ($Observation.observationAgeMs + $script:Clock.ElapsedMilliseconds - $Observation.tick -le 2000)
+    Publish-RapHealth $health ([bool]$fresh)
+    if ($health -cne $script:LastObservationHealth) { Write-Host $health; $script:LastObservationHealth = $health }
+}
+
+function Invoke-AgentWork($Result, [switch]$FreshRequest) {
+    if (-not (Test-Field $Result 'job') -or (Get-Field $Result 'pairings') -isnot [array] -or
+        (Get-Field $Result 'previewActive') -isnot [bool]) { throw 'Invalid cloud work envelope.' }
+    if ($FreshRequest -or $script:PreviewActive -ne $Result.previewActive) { $script:ForcePublish = $true }
+    $script:PreviewActive = $Result.previewActive
+    Show-PendingPairings $Result.pairings
+    if ($null -ne $Result.job) { Invoke-Import $Result.job (Get-Observation) }
+}
+
+function New-FreshCapture {
+    $observation = Get-Observation
+    $script:Sequence++
+    return New-ObservationUpdate $observation
+}
+
+function Receive-AgentMessages {
+    for ($i = 0; $i -lt 32; $i++) {
+        $text = $script:Socket.Take()
+        if ($null -eq $text) { break }
+        $message = $text | ConvertFrom-Json
+        if ((Get-Field $message 'v') -ne 2) { throw 'Unsupported socket protocol.' }
+        switch -CaseSensitive (Get-Field $message 'type') {
+            'update-result' {
+                $id = Get-Field $message 'id'
+                if ($id -isnot [string] -or -not $script:OutstandingUpdates.ContainsKey($id)) { throw 'Uncorrelated update response.' }
+                $pending = $script:OutstandingUpdates[$id]
+                Set-ClockCalibration $message.body $pending.tick
+                $script:OutstandingUpdates.Remove($id)
+                Publish-ObservationHealth $pending.observation $pending.body
+                Invoke-AgentWork $message.body
+            }
+            'work' { Invoke-AgentWork $message.body -FreshRequest }
+            'capture' {
+                $id = Get-Field $message 'id'
+                $parsed = [Guid]::Empty
+                if ($id -isnot [string] -or -not [Guid]::TryParse($id, [ref]$parsed) -or $script:CaptureIds.ContainsKey($id)) { throw 'Invalid or repeated capture request.' }
+                if ($script:CaptureIds.Count -ge 64) { $script:CaptureIds.Clear() }
+                $script:CaptureIds[$id] = $true
+                Send-AgentMessage 'capture-result' $id (New-FreshCapture)
+            }
+            'error' { throw ('Cloud socket rejected request: ' + [string](Get-Field $message 'error')) }
+            default { throw 'Unexpected agent socket envelope.' }
+        }
+    }
+}
+
+function Get-ObservationSignature($Observation) {
+    return (@{ connected = $Observation.connected; position = $Observation.position; context = $Observation.context; error = $Observation.error } | ConvertTo-Json -Depth 20 -Compress)
+}
+
+function Set-RapTransport([bool]$Slow) {
+    Stop-Import
+    if ($null -ne $script:Socket) { $script:Socket.Dispose(); $script:Socket = $null }
+    $script:SlowHttp = $Slow
+    $script:Generation = $null
+    $script:ServerTime = $null
+    $script:ClockUncertainty = $null
+    $script:PendingPairings = @{}
+}
+
+function Start-Enrollment([string]$Api, [string]$Name) {
+    $api = Assert-CloudRoot $Api
+    if ([string]::IsNullOrWhiteSpace($Name) -or $Name.Length -gt 80 -or $Name -match '[\x00-\x1f]') { throw 'Invalid computer name.' }
+    $pending = Read-Protected 'enrollment.dpapi'
+    if ($null -ne $pending) {
+        if ($pending.apiRoot -cne $api -or $pending.name -cne $Name) { throw 'Resume the saved enrollment using the same relay and computer name.' }
+    } else {
+        $bytes = New-Object byte[] 32
+        $rng = [Security.Cryptography.RandomNumberGenerator]::Create()
+        try { $rng.GetBytes($bytes) } finally { $rng.Dispose() }
+        $verifier = [Convert]::ToBase64String($bytes).TrimEnd('=').Replace('+', '-').Replace('/', '_')
+        $pending = @{ apiRoot = $api; name = $Name; verifier = $verifier; requestId = $null; phrase = $null; expiresAt = $null }
+        Write-Protected 'enrollment.dpapi' $pending
+    }
+    if ($null -eq $pending.requestId) {
+        $result = Invoke-Http ($api + '/v1/enrollment/start') 'POST' '' @{ name = $Name; verifier = $pending.verifier }
+        $id = Get-Field $result 'requestId'
+        $phrase = Get-Field $result 'phrase'
+        if ($id -isnot [string] -or $id -notmatch '^[A-Za-z0-9_-]{1,128}$' -or $phrase -isnot [string] -or
+            $phrase -notmatch '^[A-Za-z0-9 -]{1,120}$') { throw 'Invalid enrollment response.' }
+        $expiry = Convert-Time (Get-Field $result 'expiresAt')
+        $pending.requestId = $id; $pending.phrase = $phrase; $pending.expiresAt = $expiry
+        Write-Protected 'enrollment.dpapi' $pending
+    }
+    return $pending
+}
+
+function Get-EnrollmentUrl($Pending) {
+    return 'https://nicholas-a11y.github.io/pathplotter/#enroll=' + [Uri]::EscapeDataString($Pending.requestId) +
+        '&relay=' + [Uri]::EscapeDataString($Pending.apiRoot)
+}
+
+function Complete-Enrollment($Pending) {
+    # Claim is verifier-bound and idempotent. A lost reply is recovered with
+    # the same DPAPI verifier, never by creating a second computer.
+    $result = Invoke-Http ($Pending.apiRoot + '/v1/enrollment/' + $Pending.requestId + '/claim') 'POST' '' @{ verifier = $Pending.verifier }
+    if ((Get-Field $result 'status') -ceq 'pending') { return $false }
+    if ((Get-Field $result 'status') -cne 'complete' -or (Get-Field $result 'relayId') -isnot [string] -or
+        [string]::IsNullOrEmpty($result.relayId) -or (Get-Field $result 'credential') -isnot [string] -or
+        [string]::IsNullOrEmpty($result.credential)) { throw 'Invalid enrollment claim.' }
+    $registration = @{ apiRoot = $Pending.apiRoot; relayId = $result.relayId; credential = $result.credential; lightBurnSecret = '' }
+    Write-Protected 'credentials.dpapi' $registration
+    $script:Config = $registration
+    [IO.File]::Delete((Join-Path $script:DataDirectory 'enrollment.dpapi'))
+    return $true
+}
 
 function Publish-RapHealth([string]$Message, [bool]$Connected) { }
 
@@ -583,16 +713,33 @@ function Read-Secret([string]$Prompt) {
 function Initialize-Config {
     $script:Config = Read-Protected 'credentials.dpapi'
     if ($null -eq $script:Config) {
-        $api = Assert-CloudRoot (Read-Host 'HTTPS relay API origin (operator supplied)')
+        $apiInput = Read-Host ('HTTPS relay origin (Enter for ' + $script:DefaultRelay + '; advanced override)')
+        if ([string]::IsNullOrWhiteSpace($apiInput)) { $apiInput = $script:DefaultRelay }
+        $api = Assert-CloudRoot $apiInput
         $name = Read-Host 'Computer name shown by the relay'
         if ([string]::IsNullOrWhiteSpace($name) -or $name.Length -gt 80 -or $name -match '[\x00-\x1f]') { throw 'Computer name must be 1-80 printable characters.' }
-        $bootstrap = Read-Secret 'Single-use registration invitation (hidden)'
-        try { $result = Invoke-Http ($api + '/v1/register') 'POST' '' @{ bootstrapToken = $bootstrap; name = $name } }
+        $bootstrap = Read-Secret 'Optional single-use invitation (Enter for guided browser enrollment)'
+        try {
+            if ([string]::IsNullOrWhiteSpace($bootstrap)) {
+                $pending = Start-Enrollment $api $name
+                Write-Host ('Compare this phrase in your browser: ' + $pending.phrase)
+                Start-Process (Get-EnrollmentUrl $pending)
+                if ((Read-Host 'Only if the browser shows that exact phrase for this computer, type CONFIRM; then explicitly approve there') -cne 'CONFIRM') { throw 'Enrollment not confirmed.' }
+                $deadline = $script:Clock.ElapsedMilliseconds + 600000
+                while ($script:Clock.ElapsedMilliseconds -lt $deadline) {
+                    if (Complete-Enrollment $pending) { break }
+                    Start-Sleep -Milliseconds 5000
+                }
+                if ($null -eq $script:Config) { throw 'Enrollment timed out; resume explicitly using protected verifier.' }
+            } else {
+                $result = Invoke-Http ($api + '/v1/register') 'POST' '' @{ bootstrapToken = $bootstrap; name = $name }
+                if ((Get-Field $result 'relayId') -isnot [string] -or [string]::IsNullOrEmpty($result.relayId) -or
+                    (Get-Field $result 'credential') -isnot [string] -or [string]::IsNullOrEmpty($result.credential)) { throw 'Registration returned no identity; no automatic retry.' }
+                $script:Config = @{ apiRoot = $api; relayId = $result.relayId; credential = $result.credential; lightBurnSecret = '' }
+                Write-Protected 'credentials.dpapi' $script:Config
+            }
+        }
         finally { $bootstrap = $null }
-        if ((Get-Field $result 'relayId') -isnot [string] -or [string]::IsNullOrEmpty($result.relayId) -or
-            (Get-Field $result 'credential') -isnot [string] -or [string]::IsNullOrEmpty($result.credential)) { throw 'Registration returned no relay identity/credential; request operator help, do not assume registration succeeded.' }
-        $script:Config = @{ apiRoot = $api; relayId = $result.relayId; credential = $result.credential; lightBurnSecret = '' }
-        Write-Protected 'credentials.dpapi' $script:Config
     } else {
         $script:Config.apiRoot = Assert-CloudRoot $script:Config.apiRoot
         if ((Get-Field $script:Config 'relayId') -isnot [string] -or [string]::IsNullOrEmpty($script:Config.relayId) -or
@@ -644,7 +791,9 @@ function Invoke-ConsoleCommand([string]$Command) {
     $argument = ''
     if ($parts.Count -gt 1) { $argument = $parts[1] }
     switch ($parts[0].ToLowerInvariant()) {
-        'help' { Write-Host 'Commands: pair | open | approve ID | reject ID | browsers | revoke ID | forget-lightburn | forget-relay | quit' }
+        'help' { Write-Host 'Commands: pair | open | approve ID | reject ID | browsers | revoke ID | slow-http (explicit >=5s fallback) | socket | forget-lightburn | forget-relay | quit' }
+        'slow-http' { Set-RapTransport $true }
+        'socket' { Set-RapTransport $false }
         'pair' { Show-PairingUrl }
         'open' {
             if (-not (Get-Variable PairingUrl -Scope Script -ErrorAction SilentlyContinue)) { throw 'Create an invitation with pair first.' }
@@ -708,6 +857,8 @@ function Read-ConsoleCommand {
 function Start-Rap {
     Initialize-Storage
     $lock = $null
+    $lastPush = -15000L
+    $script:LastObservationHealth = ''
     try {
         try { $lock = New-Object IO.FileStream((Join-Path $script:DataDirectory 'instance.lock'), [IO.FileMode]::OpenOrCreate, [IO.FileAccess]::ReadWrite, [IO.FileShare]::None) }
         catch { throw 'Another RAP instance is running, or the local state directory cannot be locked.' }
@@ -721,16 +872,31 @@ function Start-Rap {
         $backoff = 500
         $lastHealth = ''
         $nextRead = 0L
+        $nextConnect = 0L
+        $nextPush = 0L
+        $signature = ''
+        $publishedSignature = ''
+        $sameReadings = 0
+        $publishedSettled = $false
+        $observation = $null
+        $script:OutstandingUpdates = @{}
+        $script:CaptureIds = @{}
+        $script:ForcePublish = $true
+        $script:PreviewActive = $false
         while (-not $script:StopRequested) {
             Read-ConsoleCommand
             Update-Import
             if ($script:StopRequested) { break }
-            $delay = $nextRead - $script:Clock.ElapsedMilliseconds
-            if ($delay -gt 0) { Start-Sleep -Milliseconds ([int][Math]::Min(50, $delay)); continue }
-            $cycleStart = $script:Clock.ElapsedMilliseconds
-            $observation = Get-Observation
+            $now = $script:Clock.ElapsedMilliseconds
+            if ($now -ge $nextRead) {
+                $observation = Get-Observation
+                $newSignature = Get-ObservationSignature $observation
+                if ($newSignature -ceq $signature) { $sameReadings++ }
+                else { $signature = $newSignature; $sameReadings = 1 }
+                $nextRead = [Math]::Max($now + 500, $script:Clock.ElapsedMilliseconds)
+            }
             try {
-                if ($null -eq $script:Generation) {
+                if ($null -eq $script:Generation -and $now -ge $nextConnect) {
                     $requestTick = $script:Clock.ElapsedMilliseconds
                     $start = Invoke-Cloud '/agent/start'
                     Set-ClockCalibration $start $requestTick
@@ -738,46 +904,81 @@ function Start-Rap {
                     if (-not (Test-Number $generation) -or $generation -lt 1 -or [Math]::Floor($generation) -ne $generation) { throw 'Invalid cloud generation.' }
                     $script:Generation = $generation
                     $script:Sequence = 0L
+                    $script:ForcePublish = $true
+                    $script:OutstandingUpdates.Clear()
+                    $script:CaptureIds.Clear()
+                    $nextPush = 0L
+                    if (-not $script:SlowHttp) { $script:Socket = New-AgentSocket }
                 }
-                $script:Sequence++
-                $body = New-ObservationUpdate $observation
-                $requestTick = $script:Clock.ElapsedMilliseconds
-                $result = Invoke-Cloud '/agent/update' $body
-                Set-ClockCalibration $result $requestTick
-                if (-not (Test-Field $result 'job') -or (Get-Field $result 'pairings') -isnot [array]) { throw 'Cloud returned an invalid update envelope.' }
-                Show-PendingPairings (Get-Field $result 'pairings')
-                foreach ($id in @($script:Journal.Keys)) {
-                    if ($script:Journal[$id].pending) {
-                        try { Send-Record $id } catch { Write-Host 'Saved import state not acknowledged by cloud; retained for reconciliation.' }
+                if ($null -ne $script:Generation) {
+                    if (-not $script:SlowHttp) {
+                        if ($script:Socket.IsFinished) { throw $script:Socket.Failure }
+                        Receive-AgentMessages
+                        foreach ($id in @($script:OutstandingUpdates.Keys)) {
+                            if ($script:Clock.ElapsedMilliseconds - $script:OutstandingUpdates[$id].tick -gt 5000) { throw 'Socket update acknowledgment timed out.' }
+                        }
+                    }
+                    $now = $script:Clock.ElapsedMilliseconds
+                    $settled = $observation.connected -and $sameReadings -ge 3
+                    $due = $script:SlowHttp -or $script:ForcePublish -or $now - $lastPush -ge 15000 -or
+                        ($script:PreviewActive -and ($signature -cne $publishedSignature -or $settled -ne $publishedSettled))
+                    if ($due -and $now -ge $nextPush -and ($script:SlowHttp -or $script:Socket.IsOpen)) {
+                        $script:Sequence++
+                        $body = New-ObservationUpdate $observation
+                        $body.settled = [bool]$settled
+                        $requestTick = $script:Clock.ElapsedMilliseconds
+                        $script:ForcePublish = $false
+                        if ($script:SlowHttp) {
+                            # Set the deadline before HTTP so even failures cannot accelerate polling.
+                            $nextPush = $requestTick + 5000
+                            $result = Invoke-Cloud '/agent/update' $body
+                            Set-ClockCalibration $result $requestTick
+                            Publish-ObservationHealth $observation $body
+                            Invoke-AgentWork $result
+                            foreach ($capture in @((Get-Field $result 'captures'))) {
+                                if ($null -eq $capture) { continue }
+                                $parsed = [Guid]::Empty
+                                if ($capture -isnot [string] -or -not [Guid]::TryParse($capture, [ref]$parsed)) { throw 'Invalid fallback capture ID.' }
+                                $null = Invoke-Cloud ('/agent/capture/' + $capture) (New-FreshCapture)
+                            }
+                        } else {
+                            $id = [Guid]::NewGuid().ToString()
+                            $script:OutstandingUpdates[$id] = @{ tick = $requestTick; observation = $observation; body = $body }
+                            Send-AgentMessage 'update' $id $body
+                            $nextPush = $requestTick + 500
+                        }
+                        $lastPush = $requestTick
+                        $publishedSignature = $signature
+                        $publishedSettled = $settled
+                        foreach ($id in @($script:Journal.Keys)) {
+                            if ($script:Journal[$id].pending) {
+                                try { Send-Record $id } catch { Write-Host 'Saved import state not acknowledged by cloud; retained for reconciliation.' }
+                            }
+                        }
+                        $backoff = 500
                     }
                 }
-                $job = Get-Field $result 'job'
-                if ($null -ne $job) { Invoke-Import $job $observation }
-                $health = $observation.error + ' Cloud connected.'
-                if ($observation.connected) { $health = 'LightBurn workpiece/context verified; cloud connected.' }
-                $verifiedFresh = $body.connected -and
-                    ($observation.observationAgeMs + $script:Clock.ElapsedMilliseconds - $observation.tick -le 2000)
-                Publish-RapHealth $health ([bool]$verifiedFresh)
-                if ($health -ne $lastHealth) { Write-Host $health; $lastHealth = $health }
-                $backoff = 500
-                $nextRead = [Math]::Max($cycleStart + 500, $script:Clock.ElapsedMilliseconds)
             } catch {
                 # Failed cloud publications never preserve a visible live snapshot locally.
                 $script:Generation = $null
                 $script:ServerTime = $null
                 $script:ClockUncertainty = $null
                 $script:PendingPairings = @{}
+                if ($null -ne $script:Socket) { $script:Socket.Dispose(); $script:Socket = $null }
                 Stop-Import
-                $health = 'Cloud disconnected, unauthorized, fenced, or invalid response. Fresh samples withheld; reconnecting.'
+                $health = 'Cloud disconnected, unauthorized, fenced, or invalid response. Fresh samples withheld; reconnecting. Slow HTTP fallback requires explicit opt-in.'
                 Publish-RapHealth $health $false
                 if ($lastHealth -ne $health) { Write-Host $health; $lastHealth = $health }
-                $nextRead = $script:Clock.ElapsedMilliseconds + $backoff
+                $nextConnect = $script:Clock.ElapsedMilliseconds + [Math]::Max($backoff, $(if ($script:SlowHttp) { 5000 } else { 0 }))
                 $backoff = [Math]::Min(30000, $backoff * 2)
             }
+            Start-Sleep -Milliseconds 25
         }
     } finally {
         try { Stop-Import } finally {
-            if ($null -ne $script:Generation -and $null -ne $script:Config -and -not [string]::IsNullOrEmpty($script:Config.credential)) {
+            if ($null -ne $script:Socket) { $script:Socket.Dispose(); $script:Socket = $null }
+            if ($script:SlowHttp -and $null -ne $script:Generation -and $null -ne $script:Config -and -not [string]::IsNullOrEmpty($script:Config.credential) -and
+                $script:Clock.ElapsedMilliseconds - $lastPush -ge 5000) {
                 try {
                     $script:Sequence++
                     $null = Invoke-Cloud '/agent/update' @{ generation = $script:Generation; sequence = $script:Sequence; connected = $false; position = $null; context = $null; observationAgeMs = 0; observedAtServer = $null; clockUncertaintyMs = $null; error = 'RAP stopped.' }

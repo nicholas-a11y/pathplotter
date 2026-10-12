@@ -69,7 +69,7 @@ test('pairing invitation is separate from durable credentials', () => {
     const original = globalThis.fetch
     let controlled = false, occupied = false, claims = 0
     let notify: () => void = () => {}
-    const client = new RelayClient({ baseUrl: 'https://relay.example', relayId: 'test', credential: 'test-only' }, () => notify())
+    const client = new RelayClient({ baseUrl: 'https://relay.example', relayId: 'test', credential: 'test-only' }, () => notify(), 'http')
     globalThis.fetch = async url => {
       if (String(url).endsWith('/control')) {
         claims++
@@ -103,7 +103,7 @@ test('pairing invitation is separate from durable credentials', () => {
     const original = globalThis.fetch
     let occupied = true, claims = 0
     let notify: () => void = () => {}
-    const client = new RelayClient({ baseUrl: 'https://relay.example', relayId: 'test', credential: 'test-only' }, () => notify())
+    const client = new RelayClient({ baseUrl: 'https://relay.example', relayId: 'test', credential: 'test-only' }, () => notify(), 'http')
     globalThis.fetch = async url => {
       if (String(url).endsWith('/control')) {
         claims++
@@ -159,7 +159,7 @@ test('import acceptance is not confirmation and invalid job states are rejected'
   assert.throws(() => parseJob({ id: 'job', status: 'success' }))
 })
 
-test('client enables latest-sample capture, rejects stale records and clears state on stop', async () => {
+test('HTTP client allows fresh verification while healthy but never treats an old preview as fresh', async () => {
     const originalFetch = globalThis.fetch
     let age = 0
     globalThis.fetch = async () => Response.json({
@@ -167,19 +167,21 @@ test('client enables latest-sample capture, rejects stale records and clears sta
     })
     let changed!: () => void
     let update = new Promise<void>(resolve => { changed = resolve })
-    const client = new RelayClient({ baseUrl: 'https://relay.example', relayId: 'test', credential: 'test-only' }, () => changed())
+    const client = new RelayClient({ baseUrl: 'https://relay.example', relayId: 'test', credential: 'test-only' }, () => changed(), 'http')
     try {
       client.start()
       await update
       assert.equal(client.canCapture(), true)
       client.stop()
       assert.equal(client.canCapture(), false)
+      assert.equal(client.hasFreshPosition(), false)
       assert.equal(client.snapshot, null)
       age = 2001
       update = new Promise<void>(resolve => { changed = resolve })
       client.start()
       await update
-      assert.equal(client.canCapture(), false)
+      assert.equal(client.canCapture(), true)
+      assert.equal(client.hasFreshPosition(), false)
     } finally {
       client.stop()
       globalThis.fetch = originalFetch
@@ -191,7 +193,7 @@ test('client fails closed on malformed or failed relay responses', async () => {
     globalThis.fetch = async () => Response.json({ error: 'Relay access revoked' }, { status: 403 })
     let changed!: () => void
     const update = new Promise<void>(resolve => { changed = resolve })
-    const client = new RelayClient({ baseUrl: 'https://relay.example', relayId: 'test', credential: 'test-only' }, changed)
+    const client = new RelayClient({ baseUrl: 'https://relay.example', relayId: 'test', credential: 'test-only' }, changed, 'http')
     try {
       client.start()
       await update
