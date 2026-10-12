@@ -116,7 +116,7 @@ app.innerHTML = `
       <label>LightBurn base URL
         <input id="baseUrl" type="url" value="http://localhost:19520" />
       </label>
-      <label>Shared secret
+      <label id="secretField">Shared secret
         <input id="secret" type="password" placeholder="Optional: paste an existing secret" />
       </label>
       <label>Application name
@@ -124,7 +124,7 @@ app.innerHTML = `
       </label>
     </div>
     <p id="directConnectionHint" class="hint"></p>
-    <p class="hint">Connect uses the entered secret, or pairs locally if blank. For pairing, bring LightBurn to the foreground (click its window or use Alt+Tab) and approve within 30 seconds. Clear an invalid secret to pair again. Live preview starts automatically.</p>
+    <p id="apiPairingHint" class="hint"></p>
     <div class="row">
       <button id="connectBtn" class="primary">Connect</button>
     </div>
@@ -607,6 +607,10 @@ function updateConnectionMode(): void {
   sessionReleaseFailed = false
   must<HTMLElement>('relayConnection').hidden = mode !== 'relay'
   must<HTMLElement>('localConnection').hidden = mode === 'relay'
+  must<HTMLElement>('secretField').hidden = mode === 'webtool'
+  must<HTMLElement>('apiPairingHint').textContent = mode === 'webtool'
+    ? 'Click Connect and approve the permission request in LightBurn within 30 seconds. Authentication is handled automatically; no secret needs to be entered. The permission stays in memory until End session or a connection-mode change.'
+    : 'Connect uses the entered secret, or pairs locally if blank. Bring LightBurn to the foreground and approve within 30 seconds. Clear an invalid secret to pair again. Live preview starts automatically.'
   must<HTMLElement>('directConnectionHint').textContent = mode === 'webtool'
     ? 'For PathPlotter opened inside LightBurn as a Webtool. Connect directly to the local LightBurn API; RAP and the cloud relay are not used. Enable REST API in LightBurn; leave network access off. Ordinary browsers may block this connection through CORS or mixed-content restrictions.'
     : 'For local development using the loopback Vite proxy. Ordinary hosted and phone browsers need RAP; the development proxy is not included in the hosted app.'
@@ -1060,7 +1064,12 @@ function updateDiameterVisibility(): void {
 must<HTMLButtonElement>('connectBtn').addEventListener('click', async () => {
   if (mode === 'relay' || connectionInFlight || endingSession) return
   if (liveEnabled || liveDispatching) { setStatus('Turn live mode off and wait for import completion before connecting again.'); return }
-  if (liveQueue().items.length && !secretInput.value.trim()) { setStatus('Enter the existing LightBurn secret to check queued work; new pairing is blocked until reconciliation.'); return }
+  if (liveQueue().items.length && !secretInput.value.trim()) {
+    setStatus(mode === 'webtool'
+      ? 'Saved live work needs reconciliation before requesting new LightBurn permission. Inspect LightBurn and acknowledge the import outcome or abandon safe unsent work first.'
+      : 'Enter the existing LightBurn secret to check queued work; new pairing is blocked until reconciliation.')
+    return
+  }
   const appName = appNameInput.value.trim() || 'PathPlotter'
   const connectButton = must<HTMLButtonElement>('connectBtn')
   connectButton.disabled = true

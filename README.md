@@ -46,7 +46,7 @@ Keep **Allow API Access From Network disabled** in LightBurn. RAP uses the local
 2. Enable REST API in **Settings > Extensions**, leaving **Allow API Access From Network off**.
 3. Open **Connection** and select **LightBurn Webtool (direct API, no RAP)**.
 4. Keep the local API URL `http://localhost:19520` (adjust the loopback port if your API configuration differs).
-5. Click **Connect** with the secret blank, then approve the permission request in LightBurn. An existing API secret can also be used.
+5. Click **Connect**, then approve the permission request in LightBurn. Webtool mode obtains and uses the API secret automatically; there is no manual shared-secret field.
 
 Preview, capture, workspace verification and SVG imports call LightBurn directly. Live update uses the same import-confirmation and recovery safeguards; it does not send through the relay. The secret remains in memory, is excluded from session backups, and is cleared when changing connection modes. This mode needs neither RAP nor cloud pairing and is separate from the local development proxy.
 
