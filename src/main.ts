@@ -1705,6 +1705,9 @@ function renderAll(): void {
   renderPlot()
 }
 
+const OPERATION_HINT_DELAY_MS = 1500
+let operationBusySince: number | null = null
+
 function captureBlockReason(): { label: string; hint: string } | null {
   if (handoverPending || handoverStopping) return { label: 'Transferring live control', hint: 'Wait for the current operation and safe tab handover to finish.' }
   if (otherTabOwnsLive) return { label: 'Another tab owns Live update', hint: 'Click Pair or enable Live update here to request a safe transfer.' }
@@ -1733,8 +1736,16 @@ function renderControls(): void {
   must<HTMLButtonElement>('quickControlBtn').hidden = sessionEnded || mode !== 'relay' || !relay || relay.activeBrowser
   must<HTMLButtonElement>('quickControlBtn').disabled = busy || uploadInFlight || !relay?.isOnline()
   const contextMatches = mode !== 'relay' || !allPoints(state).length || state.coordinateContext === contextKey()
-  const captureBlock = captureBlockReason()
-  must<HTMLButtonElement>('captureBtn').disabled = sessionEnded || endingSession || captureBlock !== null
+  const blockReason = captureBlockReason()
+  must<HTMLButtonElement>('captureBtn').disabled = sessionEnded || endingSession || blockReason !== null
+  // Routine captures finish quickly; only announce an in-progress operation once it lingers.
+  if (blockReason?.label !== 'Operation in progress') {
+    operationBusySince = null
+  } else if (operationBusySince === null) {
+    operationBusySince = Date.now()
+    window.setTimeout(renderControls, OPERATION_HINT_DELAY_MS + 50)
+  }
+  const captureBlock = operationBusySince !== null && Date.now() - operationBusySince < OPERATION_HINT_DELAY_MS ? null : blockReason
   const captureHint = must<HTMLParagraphElement>('captureBlockHint')
   captureHint.hidden = !captureBlock
   captureHint.textContent = captureBlock?.hint ?? ''
