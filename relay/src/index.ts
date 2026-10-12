@@ -699,6 +699,9 @@ export class RelayDO extends DurableObject<Env> {
           status TEXT NOT NULL, claim_id TEXT UNIQUE, browser_id TEXT
         );
       `);
+      if (!ctx.storage.sql.exec<{ name: string }>("PRAGMA table_info(browser_launches)").toArray().some((column) => column.name === "replace_browser_ids")) {
+        ctx.storage.sql.exec("ALTER TABLE browser_launches ADD COLUMN replace_browser_ids TEXT");
+      }
       // Retire pending code requests without revoking previously approved browsers.
       ctx.storage.sql.exec("UPDATE pairings SET status='rejected' WHERE status='pending' AND id IN (SELECT claim_id FROM code_pairings)");
       ctx.storage.sql.exec("DELETE FROM code_pairings");
@@ -1140,7 +1143,8 @@ export class RelayDO extends DurableObject<Env> {
   private async pairingDecide(request: Request): Promise<Response> {
     this.requireMethod(request, "POST");
     const body = requiredObject(await readJson(request));
-    jsonBody(body, ["pairingId", "approve"]);
+    jsonBody(body, ["pairingId", "approve", "replaceBrowserIds"]);
+    const replacing = this.replacementIds(body.replaceBrowserIds);
     const pairingId = requireUuid(body.pairingId);
     if (typeof body.approve !== "boolean") throw new HttpError(400, "invalid_request");
     const now = Date.now();
@@ -1164,6 +1168,7 @@ export class RelayDO extends DurableObject<Env> {
         throw new HttpError(410, "pairing_expired");
       }
       if (body.approve) {
+        if (this.singleBrowser()) this.replaceBrowsers(replacing);
         this.ctx.storage.sql.exec(
           "INSERT INTO browsers (id, credential_hash, created_at, revoked) VALUES (?, ?, ?, 0)",
           pairing.browser_id,
@@ -1173,6 +1178,7 @@ export class RelayDO extends DurableObject<Env> {
       }
       this.ctx.storage.sql.exec("UPDATE pairings SET status = ? WHERE id = ?", body.approve ? "approved" : "rejected", pairingId);
     });
+    this.closeRevokedBrowsers();
     this.notifyWork();
     return jsonResponse({});
   }
@@ -1180,13 +1186,15 @@ export class RelayDO extends DurableObject<Env> {
   private async browserLaunchNew(request: Request): Promise<Response> {
     this.requireMethod(request, "POST");
     const body = requiredObject(await readJson(request));
-    jsonBody(body, []);
+    jsonBody(body, ["replaceBrowserIds"]);
+    const replacing = this.replacementIds(body.replaceBrowserIds);
     const launchToken = randomToken();
     const tokenHash = await hashToken(launchToken);
     const now = Date.now();
     const expiresAt = now + LAUNCH_TOKEN_LIFETIME_MS;
     this.ctx.storage.transactionSync(() => {
       this.reapLaunches(now);
+      if (this.singleBrowser() && replacing !== null) this.checkReplacement(replacing);
       const outstanding = this.ctx.storage.sql.exec<{ count: number }>(
         "SELECT COUNT(*) AS count FROM browser_launches WHERE used = 0 AND expires_at > ?",
         now,
@@ -1198,10 +1206,11 @@ export class RelayDO extends DurableObject<Env> {
       ).one().count;
       if (recent >= LAUNCH_RATE_LIMIT) throw new HttpError(429, "launch_rate_limited");
       this.ctx.storage.sql.exec(
-        "INSERT INTO browser_launches (token_hash, expires_at, created_at, used) VALUES (?, ?, ?, 0)",
+        "INSERT INTO browser_launches (token_hash, expires_at, created_at, used, replace_browser_ids) VALUES (?, ?, ?, 0, ?)",
         tokenHash,
         expiresAt,
         now,
+        replacing === null ? null : JSON.stringify(replacing),
       );
     });
     return jsonResponse({ launchToken, expiresAt });
@@ -1221,8 +1230,8 @@ export class RelayDO extends DurableObject<Env> {
     const mintedId = crypto.randomUUID();
     const now = Date.now();
     const reused = this.ctx.storage.transactionSync((): boolean => {
-      const launch = this.ctx.storage.sql.exec<{ expires_at: number; used: number }>(
-        "SELECT expires_at, used FROM browser_launches WHERE token_hash = ?",
+      const launch = this.ctx.storage.sql.exec<{ expires_at: number; used: number; replace_browser_ids: string | null }>(
+        "SELECT expires_at, used,replace_browser_ids FROM browser_launches WHERE token_hash = ?",
         tokenHash,
       ).toArray()[0];
       if (!launch) throw new HttpError(404, "launch_token_not_found");
@@ -1237,6 +1246,7 @@ export class RelayDO extends DurableObject<Env> {
         for (const row of rows) valid = constantTimeEqual(suppliedHash, row.credential_hash) || valid;
         if (valid) return true;
       }
+      if (this.singleBrowser()) this.replaceBrowsers(launch.replace_browser_ids === null ? null : this.replacementIds(JSON.parse(launch.replace_browser_ids)));
       const launchBrowsers = this.ctx.storage.sql.exec<{ count: number }>(
         `SELECT COUNT(*) AS count FROM launch_browsers
          JOIN browsers ON browsers.id = launch_browsers.browser_id WHERE browsers.revoked = 0`,
@@ -1251,7 +1261,54 @@ export class RelayDO extends DurableObject<Env> {
       this.ctx.storage.sql.exec("INSERT INTO launch_browsers (browser_id, created_at) VALUES (?, ?)", mintedId, now);
       return false;
     });
+    this.closeRevokedBrowsers();
     return jsonResponse({ credential: reused ? supplied : minted });
+  }
+
+  private singleBrowser(): boolean {
+    return envString(this.env, "SINGLE_BROWSER_ENABLED") === "true";
+  }
+
+  private replacementIds(value: unknown): string[] | null {
+    if (value === undefined) return null;
+    if (!Array.isArray(value) || value.length > 50) throw new HttpError(400, "invalid_request");
+    const ids = value.map(requireUuid);
+    if (new Set(ids).size !== ids.length) throw new HttpError(400, "invalid_request");
+    return ids.sort();
+  }
+
+  private checkReplacement(expected: string[] | null): string[] {
+    const current = this.ctx.storage.sql.exec<{ id: string }>("SELECT id FROM browsers WHERE revoked=0 ORDER BY id").toArray().map((row) => row.id);
+    if (current.length && expected === null) throw new HttpError(409, "browser_replacement_required");
+    if (expected !== null && JSON.stringify(current) !== JSON.stringify(expected)) throw new HttpError(409, "browser_changed");
+    this.reapJobs(Date.now());
+    if (current.length && this.hasBlockingJobs("")) throw new HttpError(409, "unresolved_imports");
+    return current;
+  }
+
+  private replaceBrowsers(expected: string[] | null): void {
+    for (const id of this.checkReplacement(expected)) this.revokeBrowserState(id);
+    this.ctx.storage.sql.exec("UPDATE browser_launches SET used=1 WHERE used=0");
+  }
+
+  private revokeBrowserState(id: string): void {
+    this.ctx.storage.sql.exec("UPDATE browsers SET revoked=1 WHERE id=?", id);
+    this.ctx.storage.sql.exec("DELETE FROM tickets WHERE browser_id=?", id);
+    this.ctx.storage.sql.exec("DELETE FROM launch_browsers WHERE browser_id=?", id);
+    this.ctx.storage.sql.exec("UPDATE relay_meta SET lease_browser_id=NULL,lease_expires_at=NULL WHERE lease_browser_id=?", id);
+  }
+
+  private closeRevokedBrowsers(): void {
+    const active = new Set(this.ctx.storage.sql.exec<{ id: string }>("SELECT id FROM browsers WHERE revoked=0").toArray().map((row) => row.id));
+    this.failCaptures("revoked", (capture) => !active.has(capture.browserId));
+    for (const socket of this.ctx.getWebSockets()) {
+      const attachment = this.attachment(socket);
+      if (attachment?.role === "browser" && attachment.browserId &&
+          !active.has(attachment.browserId)) {
+        socket.close(1008, "revoked");
+      }
+    }
+    this.broadcast();
   }
 
   private reapLaunches(now: number): void {
@@ -1280,13 +1337,7 @@ export class RelayDO extends DurableObject<Env> {
         browserId,
       ).toArray()[0];
       if (!row) return false;
-      this.ctx.storage.sql.exec("UPDATE browsers SET revoked = 1 WHERE id = ?", browserId);
-      this.ctx.storage.sql.exec("DELETE FROM tickets WHERE browser_id = ?", browserId);
-      this.ctx.storage.sql.exec("DELETE FROM launch_browsers WHERE browser_id = ?", browserId);
-      this.ctx.storage.sql.exec(
-        "UPDATE relay_meta SET lease_browser_id = NULL, lease_expires_at = NULL WHERE lease_browser_id = ?",
-        browserId,
-      );
+      this.revokeBrowserState(browserId);
       return true;
     });
     if (!revoked) throw new HttpError(404, "browser_not_found");

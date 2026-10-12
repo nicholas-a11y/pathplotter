@@ -39,6 +39,21 @@ test('pairing invitation is separate from durable credentials', () => {
   assert.throws(() => pairingInvitation('#invite=once'))
 })
 
+test('browser switching errors explain confirmation, stale consent and unresolved imports', async () => {
+  const original = globalThis.fetch
+  const link = { baseUrl: 'https://relay.example', relayId: 'test', token: 'once', kind: 'launch' as const }
+  try {
+    for (const [code, expected] of [
+      ['browser_replacement_required', /explicitly replace/],
+      ['browser_changed', /confirm replacement again/],
+      ['unresolved_imports', /resolve unknown outcomes/],
+    ] as const) {
+      globalThis.fetch = async () => Response.json({ error: code }, { status: 409 })
+      await assert.rejects(exchangeBrowserLink(link, null, () => {}, () => true), expected)
+    }
+  } finally { globalThis.fetch = original }
+})
+
   test('desktop links distinguish launch grants from phone invitations and reject ambiguity', () => {
     assert.deepEqual(browserLink('#relay=https%3A%2F%2Frelay.example&relayId=abc&launch=once'), {
       baseUrl: 'https://relay.example', relayId: 'abc', token: 'once', kind: 'launch',

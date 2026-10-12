@@ -117,7 +117,14 @@ export async function relayRequest(baseUrl: string, relayId: string, path: strin
   if (!response.ok) {
     let message = `Relay request failed (${response.status}).`
     const payload: unknown = await response.json().catch(() => null)
-    if (record(payload) && typeof payload.error === 'string') message = payload.error
+    if (record(payload) && typeof payload.error === 'string') {
+      const pairingErrors: Record<string, string> = {
+        browser_replacement_required: 'A browser is already paired. Use RAP to explicitly replace it.',
+        browser_changed: 'The paired browser changed. Open a fresh RAP link and confirm replacement again.',
+        unresolved_imports: 'Finish pending imports or resolve unknown outcomes in the paired browser before switching.',
+      }
+      message = pairingErrors[payload.error] ?? payload.error
+    }
     throw new RelayRequestError(message, response.status)
   }
   return response.json()

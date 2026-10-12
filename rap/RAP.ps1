@@ -359,6 +359,20 @@ function Invoke-Cloud([string]$Path, $Body = @{}, [string]$Method = 'POST') {
     return Invoke-Http ($script:Config.apiRoot + '/v1/relays/' + $relay + $Path) $Method $script:Config.credential $Body -TimeoutMs $timeout
 }
 
+function Get-ApprovedBrowserIds {
+    $result = Invoke-Cloud '/browsers' -Body $null -Method 'GET'
+    $rows = Get-Field $result 'browsers'
+    if ($rows -isnot [array]) { throw 'Invalid browser list.' }
+    $ids = @()
+    foreach ($row in $rows) {
+        $id = Get-Field $row 'id'
+        $parsed = [Guid]::Empty
+        if ($id -isnot [string] -or -not [Guid]::TryParseExact($id, 'D', [ref]$parsed)) { throw 'Invalid browser.' }
+        $ids += $id
+    }
+    return ,$ids
+}
+
 function Invoke-Local([string]$Path) {
     return Invoke-Http ($script:LightBurnRoot + $Path) 'GET' (Get-LightBurnToken $script:Config.lightBurnSecret) -TimeoutMs 1500
 }
@@ -801,7 +815,18 @@ function Invoke-ConsoleCommand([string]$Command) {
         }
         { $_ -in @('approve', 'reject') } {
             if (-not $script:PendingPairings.ContainsKey($argument)) { throw 'No matching pending pairing. Refresh and compare its phrase first.' }
-            $null = Invoke-Cloud '/pairing/decide' @{ pairingId = $argument; approve = ($parts[0].ToLowerInvariant() -eq 'approve') }
+            $decision = @{ pairingId = $argument; approve = ($parts[0].ToLowerInvariant() -eq 'approve') }
+            if ($decision.approve) {
+                $ids = Get-ApprovedBrowserIds
+                if ($ids.Count -gt 0) {
+                    if ((Read-Host 'Replace the paired browser? Its access will end; finish or resolve imports first. Type REPLACE to confirm') -cne 'REPLACE') {
+                        Write-Host 'Replacement cancelled; existing browser remains paired.'
+                        return
+                    }
+                    $decision.replaceBrowserIds = $ids
+                }
+            }
+            $null = Invoke-Cloud '/pairing/decide' $decision
             $script:PendingPairings.Remove($argument)
             Write-Host 'Pairing decision sent.'
         }

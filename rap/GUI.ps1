@@ -138,6 +138,8 @@ function Show-Approvals($Pairings) {
     $d = $script:Desktop
     $signature = ($Pairings.Keys | Sort-Object | ForEach-Object { $_ + ':' + $Pairings[$_] }) -join '|'
     $d.pairings = $Pairings
+    $d.approvals.Visible = $Pairings.Count -gt 0
+    $d.approvals.Height = [Math]::Min(250, $Pairings.Count * 96)
     if ($signature -ceq $d.pairingSignature) { return }
     $d.pairingSignature = $signature
     while ($d.approvals.Controls.Count -gt 0) { $d.approvals.Controls[0].Dispose() }
@@ -161,7 +163,7 @@ function Show-Browsers($Rows) {
     $d = $script:Desktop
     if ($null -ne $d.browsers) { $d.browsers.Dispose() }
     $d.browsers = New-Object Windows.Forms.Form
-    $d.browsers.Text = 'Connected browsers'; $d.browsers.ClientSize = New-Object Drawing.Size(440, 300)
+    $d.browsers.Text = 'Paired browser'; $d.browsers.ClientSize = New-Object Drawing.Size(440, 300)
     $panel = New-Object Windows.Forms.FlowLayoutPanel
     $panel.Dock = 'Fill'; $panel.AutoScroll = $true; $panel.FlowDirection = 'TopDown'; $panel.WrapContents = $false
     $d.browsers.Controls.Add($panel)
@@ -190,7 +192,7 @@ function Handle-UiEvent($Event) {
             $d.busy = $false; $d.setup.Visible = $true; $d.register.Enabled = $true
             $d.enrollment.Visible = $false
             if ($null -ne $Event.value) { $d.api.Text = $Event.value.apiRoot; $d.name.Text = $Event.value.name }
-            $d.status.Text = 'Guided setup: choose a computer name, then register in your browser. Leave invitation blank. Advanced relay override and existing operator invitations remain available.'
+            $d.status.Text = 'Not registered.'
             Show-RapWindow
         }
         'enrollment' {
@@ -243,9 +245,16 @@ function Handle-UiEvent($Event) {
         'phone' { Show-Phone $Event.value; $d.smokePhones++ }
         'pairings' { Show-Approvals $Event.value }
         'browsers' { Show-Browsers $Event.value }
+        'confirm-switch' { $d.switchRequest = $Event.value }
         'action-complete' {
             $d.busy = $false; $d.pairingSignature = $null
             Show-Approvals $d.pairings
+            if ($null -ne $d.switchRequest) {
+                $command = $d.switchRequest; $d.switchRequest = $null
+                if ([Windows.Forms.MessageBox]::Show('Replace the paired browser? Its access will stop. Pending or unresolved imports must be reconciled before switching.', 'Switch browser', 'YesNo', 'Warning') -eq 'Yes') {
+                    [void](Submit-Ui $command)
+                }
+            }
         }
         'notice' { $d.notice.Text = $Event.value; Show-RapWindow }
         'fatal' { $d.status.Text = $Event.value; $d.failed = $true; Show-RapWindow }
@@ -280,7 +289,7 @@ function Start-RapDesktop {
     $d = @{
         bridge = (New-Object PathPlotterRap.UiBridge); clock = [Diagnostics.Stopwatch]::StartNew()
         activation = $activation; configured = $false; healthy = $false; busy = $false; closing = $false; stopped = $false; failed = $false
-        phone = $null; phoneImage = $null; phoneUrl = ''; phoneDeadline = 0L; browsers = $null
+        phone = $null; phoneImage = $null; phoneUrl = ''; phoneDeadline = 0L; browsers = $null; switchRequest = $null
         pairings = @{}; pairingSignature = ''; smoke = [bool]$SmokeTest; smokeOpens = 0; smokePhones = 0; smokeStage = 0; smokeConsentTicks = 0
         fixtureEvents = (New-Object 'Collections.Generic.List[string]')
     }
@@ -288,41 +297,52 @@ function Start-RapDesktop {
     $worker = $null; $runspace = $null; $async = $null
     try {
         $d.form = New-Object Windows.Forms.Form
-        $d.form.Text = 'PathPlotter RAP'; $d.form.ClientSize = New-Object Drawing.Size(610, 680)
+        $d.form.Text = 'PathPlotter RAP'; $d.form.ClientSize = New-Object Drawing.Size(610, 470)
         $d.form.StartPosition = 'CenterScreen'; $d.form.MinimumSize = New-Object Drawing.Size(630, 500)
         $layout = New-Object Windows.Forms.FlowLayoutPanel
         $layout.Dock = 'Fill'; $layout.FlowDirection = 'TopDown'; $layout.WrapContents = $false; $layout.AutoScroll = $true
         $d.form.Controls.Add($layout)
         $d.status = New-Object Windows.Forms.Label
-        $d.status.Text = 'Starting RAP...'; $d.status.Size = New-Object Drawing.Size(585, 100); $layout.Controls.Add($d.status)
+        $d.status.Text = 'Starting RAP...'; $d.status.Size = New-Object Drawing.Size(585, 65); $layout.Controls.Add($d.status)
         $d.notice = New-Object Windows.Forms.Label
-        $d.notice.Size = New-Object Drawing.Size(585, 70); $d.notice.ForeColor = [Drawing.Color]::DarkRed; $layout.Controls.Add($d.notice)
+        $d.notice.Size = New-Object Drawing.Size(585, 55); $d.notice.ForeColor = [Drawing.Color]::DarkRed; $layout.Controls.Add($d.notice)
         $actions = New-Object Windows.Forms.FlowLayoutPanel
         $actions.Size = New-Object Drawing.Size(585, 45); $layout.Controls.Add($actions)
         $d.open = New-UiButton 'Open PathPlotter' @{ action = 'open' }
         $d.pair = New-UiButton 'Pair phone' @{ action = 'phone' }
-        $d.list = New-UiButton 'Connected browsers' @{ action = 'browsers' }
-        foreach ($button in @($d.open, $d.pair, $d.list)) { $button.Enabled = $false; $actions.Controls.Add($button) }
+        $d.list = New-UiButton 'Paired browser' @{ action = 'browsers' }
+        foreach ($button in @($d.open, $d.pair)) { $button.Enabled = $false; $actions.Controls.Add($button) }
+        $d.list.Enabled = $false
         $d.setup = New-Object Windows.Forms.FlowLayoutPanel
-        $d.setup.Size = New-Object Drawing.Size(580, 255); $d.setup.FlowDirection = 'TopDown'; $d.setup.WrapContents = $false; $d.setup.Visible = $false
+        $d.setup.Size = New-Object Drawing.Size(580, 90); $d.setup.FlowDirection = 'TopDown'; $d.setup.WrapContents = $false; $d.setup.Visible = $false
         $layout.Controls.Add($d.setup)
-        foreach ($field in @(@('HTTPS relay origin (advanced override)', 'api'), @('Computer name', 'name'), @('Optional existing operator invitation (blank for guided setup)', 'invitation'))) {
+        $d.registrationAdvanced = New-Object Windows.Forms.FlowLayoutPanel
+        $d.registrationAdvanced.Size = New-Object Drawing.Size(560, 180)
+        $d.registrationAdvanced.FlowDirection = 'TopDown'; $d.registrationAdvanced.WrapContents = $false
+        foreach ($field in @(@('Relay origin', 'api'), @('Computer name', 'name'), @('Invitation ID', 'invitation'))) {
+            $parent = $(if ($field[1] -ceq 'invitation') { $d.setup } else { $d.registrationAdvanced })
             $label = New-Object Windows.Forms.Label
-            $label.Text = $field[0]; $label.AutoSize = $true; $d.setup.Controls.Add($label)
+            $label.Text = $field[0]; $label.AutoSize = $true; $parent.Controls.Add($label)
             $box = New-Object Windows.Forms.TextBox
-            $box.Width = 560; $d[$field[1]] = $box; $d.setup.Controls.Add($box)
+            $box.Width = 540; $d[$field[1]] = $box; $parent.Controls.Add($box)
         }
         $d.name.Text = $env:COMPUTERNAME; $d.invitation.UseSystemPasswordChar = $true
         $d.api.Text = 'https://pathplotter-relay-v2.nicholas-leqeta.workers.dev'; $d.api.ReadOnly = $true
         $d.override = New-Object Windows.Forms.CheckBox
-        $d.override.Text = 'Advanced: override relay origin'; $d.override.AutoSize = $true
+        $d.override.Text = 'Override relay origin'; $d.override.AutoSize = $true
         $d.override.Add_CheckedChanged({ $script:Desktop.api.ReadOnly = -not $script:Desktop.override.Checked })
-        $d.setup.Controls.Add($d.override)
+        $d.registrationAdvanced.Controls.Add($d.override)
+        $d.guided = New-Object Windows.Forms.CheckBox
+        $d.guided.Text = 'Use guided enrollment instead of an invitation'; $d.guided.AutoSize = $true
+        $d.guided.Add_CheckedChanged({ $script:Desktop.invitation.Enabled = -not $script:Desktop.guided.Checked })
+        $d.registrationAdvanced.Controls.Add($d.guided)
         $d.register = New-Object Windows.Forms.Button
         $d.register.Text = 'Register this computer'; $d.register.AutoSize = $true
         $d.register.Add_Click({
             $s = $script:Desktop
-            if (Submit-Ui @{ action = 'register'; api = $s.api.Text.Trim(); name = $s.name.Text.Trim(); invitation = $s.invitation.Text }) {
+            if (-not $s.guided.Checked -and [string]::IsNullOrWhiteSpace($s.invitation.Text)) { $s.notice.Text = 'Enter your Invitation ID.'; return }
+            $invitation = $(if ($s.guided.Checked) { '' } else { $s.invitation.Text })
+            if (Submit-Ui @{ action = 'register'; api = $s.api.Text.Trim(); name = $s.name.Text.Trim(); invitation = $invitation }) {
                 $s.invitation.Clear(); $s.register.Enabled = $false; $s.status.Text = 'Registering... Do not repeat an ambiguous request automatically.'
             }
         })
@@ -334,7 +354,7 @@ function Start-RapDesktop {
                 [void](Submit-Ui @{ action = 'discard-enrollment' })
             }
         })
-        $d.setup.Controls.Add($discard)
+        $d.registrationAdvanced.Controls.Add($discard)
         $d.enrollment = New-Object Windows.Forms.FlowLayoutPanel
         $d.enrollment.Size = New-Object Drawing.Size(580, 120); $d.enrollment.Visible = $false
         $d.enrollmentText = New-Object Windows.Forms.Label
@@ -352,11 +372,13 @@ function Start-RapDesktop {
         $advanced = New-Object Windows.Forms.CheckBox
         $advanced.Text = 'Advanced connection settings'; $advanced.AutoSize = $true
         $d.transportPanel = New-Object Windows.Forms.FlowLayoutPanel
-        $d.transportPanel.Size = New-Object Drawing.Size(580, 155)
+        $d.transportPanel.AutoSize = $true; $d.transportPanel.MaximumSize = New-Object Drawing.Size(580, 0)
         $d.transportPanel.FlowDirection = 'TopDown'; $d.transportPanel.WrapContents = $false
         $d.transportPanel.Visible = $false
         $advanced.Add_CheckedChanged({ param($sender, $eventArgs) $script:Desktop.transportPanel.Visible = $sender.Checked })
         $layout.Controls.Add($advanced)
+        $d.transportPanel.Controls.Add($d.registrationAdvanced)
+        $d.transportPanel.Controls.Add($d.list)
         $d.socketChoice = New-Object Windows.Forms.RadioButton
         $d.socketChoice.Text = 'WebSockets (recommended; reconnects automatically)'
         $d.socketChoice.AutoSize = $true; $d.socketChoice.Checked = $true
@@ -387,7 +409,8 @@ function Start-RapDesktop {
         })
         $layout.Controls.Add($d.recovery)
         $d.approvals = New-Object Windows.Forms.FlowLayoutPanel
-        $d.approvals.Size = New-Object Drawing.Size(585, 250); $d.approvals.FlowDirection = 'TopDown'; $d.approvals.WrapContents = $false; $d.approvals.AutoScroll = $true
+        $d.approvals.Size = New-Object Drawing.Size(585, 0); $d.approvals.Visible = $false
+        $d.approvals.FlowDirection = 'TopDown'; $d.approvals.WrapContents = $false; $d.approvals.AutoScroll = $true
         $layout.Controls.Add($d.approvals)
         $safety = New-Object Windows.Forms.Label
         $safety.Text = 'Send imports SVG only. RAP never jogs, fires or starts the laser. Closing this window keeps RAP in the tray. Choose Quit to stop.'
@@ -396,7 +419,7 @@ function Start-RapDesktop {
         $d.tray.Icon = [Drawing.SystemIcons]::Application; $d.tray.Text = 'PathPlotter RAP - Starting'; $d.tray.Visible = $true
         $menu = New-Object Windows.Forms.ContextMenuStrip
         $d.tray.ContextMenuStrip = $menu
-        foreach ($item in @(@('Open PathPlotter', 'open'), @('Pair phone', 'phone'), @('Connected browsers', 'browsers'))) {
+        foreach ($item in @(@('Open PathPlotter', 'open'), @('Pair phone', 'phone'), @('Paired browser', 'browsers'))) {
             $entry = $menu.Items.Add($item[0]); $entry.Tag = @{ action = $item[1] }
             $entry.Add_Click({ param($sender, $eventArgs) [void](Submit-Ui $sender.Tag) })
             $d['menu-' + $item[1]] = $entry; $entry.Enabled = $false
@@ -494,7 +517,15 @@ function Step-GuiSmoke {
     $s = $script:Desktop
     if ($s.clock.ElapsedMilliseconds -gt 20000) { $s.failed = $true; Request-RapQuit; return }
     switch ($s.smokeStage) {
-        0 { if ($s.setup.Visible) { [void](Submit-Ui @{ action = 'register'; api = 'https://fixture.invalid'; name = 'Fixture PC'; invitation = '' }); $s.smokeStage = 1 } }
+        0 {
+            if ($s.setup.Visible) {
+                if ($s.transportPanel.Visible -or $s.api.Visible -or $s.name.Visible -or $s.setup.Controls.Count -ne 3) { throw 'Advanced setup is not hidden by default.' }
+                $s.register.PerformClick()
+                if ($s.busy -or -not $s.bridge.Commands.IsEmpty -or $s.notice.Text -cne 'Enter your Invitation ID.' -or -not $s.invitation.UseSystemPasswordChar) { throw 'Blank invitation was not refused explicitly.' }
+                $s.guided.Checked = $true
+                [void](Submit-Ui @{ action = 'register'; api = 'https://fixture.invalid'; name = 'Fixture PC'; invitation = '' }); $s.smokeStage = 1
+            }
+        }
         1 { if ($s.enrollment.Visible -and -not $s.busy) { [void](Submit-Ui @{ action = 'confirm-enrollment'; phrase = $s.enrollmentPhrase }); $s.smokeStage = 8 } }
         8 { if ($s.consent.Visible) { [void](Submit-Ui @{ action = 'consent' }); $s.smokeStage = 2 } }
         2 {

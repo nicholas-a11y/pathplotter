@@ -155,6 +155,139 @@ describe("operator batch invitations", () => {
   });
 });
 
+describe("single saved browser policy", () => {
+  const enabled: string[] = [];
+  afterEach(async () => {
+    for (const id of enabled.splice(0)) {
+      await runInDurableObject(env.RELAYS.getByName(id), (instance) => {
+        Reflect.set(Reflect.get(instance, "env"), "SINGLE_BROWSER_ENABLED", "false");
+      });
+    }
+  });
+  async function agent() {
+    const value = await startAgent(await register());
+    await runInDurableObject(env.RELAYS.getByName(value.relayId), (instance) => {
+      Reflect.set(Reflect.get(instance, "env"), "SINGLE_BROWSER_ENABLED", "true");
+    });
+    enabled.push(value.relayId);
+    return value;
+  }
+  async function ids(value: Agent) {
+    const response = await call(`/v1/relays/${value.relayId}/browsers`, { bindings: value.bindings, credential: value.credential });
+    return (await json<{ browsers: { id: string }[] }>(response)).browsers.map((row) => row.id);
+  }
+  async function launch(value: Agent, replacing?: string[]) {
+    const response = await call(`/v1/relays/${value.relayId}/agent/browser-launch`, {
+      bindings: value.bindings, credential: value.credential,
+      body: replacing === undefined ? {} : { replaceBrowserIds: replacing },
+    });
+    expect(response.status).toBe(200);
+    return (await json<{ launchToken: string }>(response)).launchToken;
+  }
+  async function redeem(value: Agent, token: string, credential?: string) {
+    return call(`/v1/relays/${value.relayId}/browser/launch`, {
+      bindings: value.bindings, body: credential === undefined ? { launchToken: token } : { launchToken: token, credential },
+    });
+  }
+  async function pending(value: Agent) {
+    const invite = await json<{ invitation: string }>(await call(`/v1/relays/${value.relayId}/pairing/new`, { credential: value.credential, bindings: value.bindings, body: {} }));
+    return json<Browser>(await call(`/v1/relays/${value.relayId}/pairing/request`, { bindings: value.bindings, body: { invitation: invite.invitation } }));
+  }
+  async function decide(value: Agent, id: string, replacing?: string[]) {
+    return call(`/v1/relays/${value.relayId}/pairing/decide`, {
+      credential: value.credential, bindings: value.bindings,
+      body: { pairingId: id, approve: true, ...(replacing === undefined ? {} : { replaceBrowserIds: replacing }) },
+    });
+  }
+
+  it("reuses a saved browser but refuses new grants without explicit replacement", async () => {
+    const value = await agent();
+    const first = await json<{ credential: string }>(await redeem(value, await launch(value)));
+    const original = await ids(value);
+    expect(await json(await redeem(value, await launch(value), first.credential))).toEqual(first);
+    const denied = await redeem(value, await launch(value));
+    expect(denied.status).toBe(409); await denied.text();
+    const qr = await pending(value);
+    const approval = await decide(value, qr.pairingId);
+    expect(approval.status).toBe(409); await approval.text();
+    expect(await ids(value)).toEqual(original);
+  });
+
+  it("switches to a phone only with exact confirmation and revokes old credentials and sockets", async () => {
+    const value = await agent();
+    const old = await json<{ credential: string }>(await redeem(value, await launch(value)));
+    const oldIds = await ids(value);
+    const ticket = await json<{ ticket: string }>(await call(`/v1/relays/${value.relayId}/ticket`, { bindings: value.bindings, credential: old.credential, body: {} }));
+    const response = await call(`/v1/relays/${value.relayId}/stream?ticket=${ticket.ticket}`, { bindings: value.bindings, upgrade: true });
+    const socket = response.webSocket!;
+    socket.accept();
+    const closed = new Promise<void>((resolve) => socket.addEventListener("close", () => resolve()));
+    const stale = await launch(value, oldIds);
+    const qr = await pending(value);
+    const approved = await decide(value, qr.pairingId, oldIds);
+    expect(approved.status).toBe(200); await approved.text();
+    await closed;
+    expect((await call(`/v1/relays/${value.relayId}/ticket`, { bindings: value.bindings, credential: old.credential, body: {} })).status).toBe(401);
+    expect((await redeem(value, stale)).status).toBe(409);
+    const current = await ids(value);
+    expect(current).toHaveLength(1); expect(current).not.toEqual(oldIds);
+    const replay = await decide(value, qr.pairingId, oldIds);
+    expect(replay.status).toBe(200); await replay.text();
+    expect(await ids(value)).toEqual(current);
+  });
+
+  it("fences concurrent desktop replacements and refuses outdated consent", async () => {
+    const value = await agent();
+    await (await redeem(value, await launch(value))).text();
+    const oldIds = await ids(value);
+    const a = await launch(value, oldIds), b = await launch(value, oldIds);
+    expect(await ids(value)).toEqual(oldIds);
+    const results = await Promise.all([redeem(value, a), redeem(value, b)]);
+    expect(results.map((r) => r.status).sort()).toEqual([200, 409]);
+    for (const result of results) await result.text();
+    expect(await ids(value)).toHaveLength(1);
+    const qr = await pending(value);
+    const outdated = await decide(value, qr.pairingId, oldIds);
+    expect(outdated.status).toBe(409); await outdated.text();
+    expect(await ids(value)).toHaveLength(1);
+  });
+
+  it("grants only one identity when first desktop and phone approvals race", async () => {
+    const value = await agent();
+    const token = await launch(value), qr = await pending(value);
+    const results = await Promise.all([redeem(value, token), decide(value, qr.pairingId)]);
+    expect(results.map((r) => r.status).sort()).toEqual([200, 409]);
+    for (const result of results) await result.text();
+    expect(await ids(value)).toHaveLength(1);
+  });
+
+  it("blocks replacement for pending and unacknowledged imports, including after restart", async () => {
+    const value = await agent();
+    await (await redeem(value, await launch(value))).text();
+    const oldIds = await ids(value), qr = await pending(value);
+    const token = await launch(value, oldIds);
+    const stub = env.RELAYS.getByName(value.relayId), jobId = crypto.randomUUID();
+    await runInDurableObject(stub, (_instance, state) => {
+      state.storage.sql.exec(`INSERT INTO jobs
+        (id,checksum,filename,anchor,context_revision,expires_at,status,browser_id,created_at,updated_at)
+        VALUES (?,'test','test.svg','{}','workspace',?,'queued',?,?,?)`, jobId, Date.now() + 60000, oldIds[0], Date.now(), Date.now());
+    });
+    const queued = await decide(value, qr.pairingId, oldIds);
+    expect(queued.status).toBe(409); await queued.text();
+    const desktop = await redeem(value, token);
+    expect(desktop.status).toBe(409); await desktop.text();
+    await runInDurableObject(stub, (_instance, state) => state.storage.sql.exec("UPDATE jobs SET status='unknown' WHERE id=?", jobId));
+    await evictDurableObject(stub, { webSockets: "close" });
+    const blocked = await decide(value, qr.pairingId, oldIds);
+    expect(blocked.status).toBe(409); await blocked.text();
+    expect(await ids(value)).toEqual(oldIds);
+    await runInDurableObject(stub, (_instance, state) => state.storage.sql.exec("INSERT INTO job_resolutions VALUES (?,?)", jobId, Date.now()));
+    const approved = await decide(value, qr.pairingId, oldIds);
+    expect(approved.status).toBe(200); await approved.text();
+    expect(await ids(value)).toHaveLength(1);
+  });
+});
+
 describe("retired code pairing", () => {
   it("returns 404 for old public and authenticated agent routes even with stale enablement", async () => {
     const agent = await startAgent(await register());
@@ -243,7 +376,7 @@ afterEach(async () => {
 });
 
 function bindings(token: string): TestBindings {
-  return Object.assign({}, env, { BOOTSTRAP_TOKEN: token }) as TestBindings;
+  return Object.assign({}, env, { BOOTSTRAP_TOKEN: token, SINGLE_BROWSER_ENABLED: "false" }) as TestBindings;
 }
 
 async function call(

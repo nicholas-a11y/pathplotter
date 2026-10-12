@@ -4,6 +4,7 @@
   "main": "src/index.ts",
   "compatibility_date": "2026-10-11",
   "vars": {
+    "SINGLE_BROWSER_ENABLED": "true",
     "TURNSTILE_SITE_KEY": "",
     "RAP_DOWNLOAD_URL": "",
   },

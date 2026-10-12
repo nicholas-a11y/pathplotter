@@ -43,6 +43,7 @@ function Invoke-Cloud([string]$Path, $Body = @{}, [string]$Method = 'POST') {
             return @{ serverTime = $now; job = $null; pairings = $pending; previewActive = $true }
         }
         '/agent/browser-launch' { return @{ launchToken = 'fixture-launch-never-display'; expiresAt = $now + 60000 } }
+        '/browsers' { return @{ browsers = @() } }
         '/pairing/new' { return @{ invitation = 'fixture-phone'; expiresAt = $now + 300000 } }
         '/pairing/decide' {
             if ($Body.pairingId -cne 'fixture-pair') { throw 'Wrong pairing target.' }

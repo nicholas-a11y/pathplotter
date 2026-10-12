@@ -63,9 +63,9 @@ try {
     $admin = [Runtime.InteropServices.Marshal]::PtrToStringBSTR($pointer)
     $result = Invoke-OperatorInvitations $Action $Relay $admin $Count $Label $InvitationId
     if ($Action -ceq 'Generate') {
-        Write-Host ('Batch: ' + $result.batchId + '. Each invitation expires after seven days and registers one RAP.')
+        Write-Host ('Batch: ' + $result.batchId + '. Each invitation expires after seven days and registers one RAP. Hand out InvitationID for RAP; CancellationId is operator-only.')
         foreach ($item in $result.invitations) {
-            [pscustomobject]@{ InvitationId = $item.id; Label = $item.label; ExpiresUtc = [DateTimeOffset]::FromUnixTimeMilliseconds([long]$item.expiresAt).UtcDateTime; Invitation = $item.token } | Format-List
+            [pscustomobject]@{ CancellationId = $item.id; Label = $item.label; ExpiresUtc = [DateTimeOffset]::FromUnixTimeMilliseconds([long]$item.expiresAt).UtcDateTime; InvitationID = $item.token } | Format-List
         }
     } elseif ($Action -ceq 'List') {
         if ((Get-Field $result 'truncated') -eq $true) { Write-Warning 'Only the latest 1000 invitations are shown. Metadata is retained until 30 days after expiry.' }

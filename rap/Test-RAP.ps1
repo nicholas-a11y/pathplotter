@@ -298,10 +298,11 @@ try {
     }
 
     $script:CommandCalls = New-Object 'Collections.Generic.List[object]'
+    $script:ConsoleBrowsers = @()
     function Invoke-Cloud([string]$Path, $Body = @{}, [string]$Method = 'POST') {
         $script:CommandCalls.Add(@{ path = $Path; body = $Body; method = $Method })
         switch ($Path) {
-            '/browsers' { return @{ browsers = @(@{ id = 'browser-test' }) } }
+            '/browsers' { return @{ browsers = $script:ConsoleBrowsers } }
             '/pairing/new' { return @{ invitation = 'synthetic-invitation'; expiresAt = (Get-ServerNow) + 60000 } }
             default { return @{} }
         }
@@ -312,12 +313,31 @@ try {
         Assert ($script:CommandCalls.Count -eq 0)
         Show-PendingPairings @(@{ id = 'pairing-test'; phrase = 'calm river 123' })
         Invoke-ConsoleCommand 'approve pairing-test'
-        Assert ($script:CommandCalls[0].path -eq '/pairing/decide' -and $script:CommandCalls[0].body.approve -eq $true)
+        Assert ($script:CommandCalls[1].path -eq '/pairing/decide' -and $script:CommandCalls[1].body.approve -eq $true)
         Assert ($script:PendingPairings.Count -eq 0)
         Invoke-ConsoleCommand 'browsers'
         Invoke-ConsoleCommand 'revoke browser-test'
-        Assert ($script:CommandCalls[2].path -eq '/browsers/revoke' -and $script:CommandCalls[2].body.browserId -ceq 'browser-test')
+        Assert ($script:CommandCalls[3].path -eq '/browsers/revoke' -and $script:CommandCalls[3].body.browserId -ceq 'browser-test')
         Must-Throw { Invoke-ConsoleCommand 'revoke ../bad' }
+    }
+    Check 'Console browser replacement requires explicit consent and sends only reviewed IDs' {
+        $script:ConsoleBrowsers = @(@{ id = [Guid]::NewGuid().ToString('D') })
+        $script:ConsoleReply = ''
+        function script:Read-Host([string]$Prompt) { return $script:ConsoleReply }
+        try {
+            Show-PendingPairings @(@{ id = 'switch-test'; phrase = 'EXACT SWITCH' })
+            $before = $script:CommandCalls.Count
+            Invoke-ConsoleCommand 'approve switch-test'
+            Assert ($script:CommandCalls.Count -eq $before + 1 -and $script:PendingPairings.ContainsKey('switch-test'))
+            $script:ConsoleReply = 'REPLACE'
+            Invoke-ConsoleCommand 'approve switch-test'
+            $decision = $script:CommandCalls[$script:CommandCalls.Count - 1]
+            Assert ($decision.path -ceq '/pairing/decide' -and $decision.body.replaceBrowserIds[0] -ceq $script:ConsoleBrowsers[0].id)
+            Assert (-not $script:PendingPairings.ContainsKey('switch-test'))
+        } finally {
+            Remove-Item Function:\Read-Host
+            $script:ConsoleBrowsers = @()
+        }
     }
     Check 'Private pairing URL uses fragment; forget commands preserve journal and do not claim remote agent revocation' {
         $null = Show-PairingUrl 6>$null

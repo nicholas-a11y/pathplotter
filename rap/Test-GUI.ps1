@@ -48,9 +48,11 @@ try {
     $script:ServerTime = 100000; $script:ServerTick = $script:Clock.ElapsedMilliseconds; $script:ClockUncertainty = 0
     $script:WireCalls = New-Object 'Collections.Generic.List[object]'
     $script:ExpiredLaunch = $false
+    $script:ApprovedBrowserIds = @()
     function Invoke-Cloud([string]$Path, $Body = @{}, [string]$Method = 'POST') {
         $script:WireCalls.Add(@{ path = $Path; body = $Body; method = $Method })
         switch ($Path) {
+            '/browsers' { return @{ browsers = @($script:ApprovedBrowserIds | ForEach-Object { @{ id = $_ } }) } }
             '/agent/browser-launch' {
                 $expiry = (Get-ServerNow) + 60000
                 if ($script:ExpiredLaunch) { $expiry = 1 }
@@ -67,16 +69,16 @@ try {
     Publish-RapHealth 'disconnected' $false
     Publish-RapHealth 'reconnected' $true
     Publish-RapHealth 'verified' $true
-    if ($script:WireCalls.Count -ne 1 -or $script:WireCalls[0].path -cne '/agent/browser-launch' -or $script:WireCalls[0].body.Count -ne 0) { throw 'Desktop launch is not once-only or uses the wrong endpoint/body.' }
+    if ($script:WireCalls.Count -ne 2 -or $script:WireCalls[1].path -cne '/agent/browser-launch' -or $script:WireCalls[1].body.Count -ne 0) { throw 'Desktop launch is not once-only or uses the wrong endpoint/body.' }
     Invoke-UiCommand @{ action = 'open' }
-    if ($script:WireCalls.Count -ne 2 -or $script:WireCalls[1].path -cne '/agent/browser-launch') { throw 'Explicit open did not create a fresh launch.' }
+    if ($script:WireCalls.Count -ne 4 -or $script:WireCalls[3].path -cne '/agent/browser-launch') { throw 'Explicit open did not create a fresh launch.' }
     $script:ExpiredLaunch = $true
     $rejected = $false
     try { Invoke-UiCommand @{ action = 'open' } } catch { $rejected = $true }
     if (-not $rejected) { throw 'Expired desktop launch accepted.' }
     $script:ExpiredLaunch = $false
     Invoke-UiCommand @{ action = 'phone' }
-    if ($script:WireCalls[3].path -cne '/pairing/new') { throw 'Phone incorrectly used desktop authorization.' }
+    if ($script:WireCalls[6].path -cne '/pairing/new') { throw 'Phone incorrectly used desktop authorization.' }
     $before = $script:WireCalls.Count
     Show-PendingPairings @(@{ id = 'fixture-request'; phrase = 'EXACT PHRASE' })
     if ($script:WireCalls.Count -ne $before) { throw 'An ordinary pending request was automatically approved.' }
@@ -89,7 +91,7 @@ try {
         if (-not $rejected -or $script:WireCalls.Count -ne $before) { throw 'Mismatched request or phrase reached cloud approval.' }
     }
     Invoke-UiCommand @{ action = 'decide'; id = 'fixture-request'; phrase = 'EXACT PHRASE'; approve = $true }
-    if ($script:WireCalls[$before].body.pairingId -cne 'fixture-request' -or $script:WireCalls[$before].body.approve -ne $true) { throw 'GUI approval targeted the wrong request.' }
+    if ($script:WireCalls[$before + 1].body.pairingId -cne 'fixture-request' -or $script:WireCalls[$before + 1].body.approve -ne $true) { throw 'GUI approval targeted the wrong request.' }
     Show-PendingPairings @()
     $rejected = $false
     try { Invoke-UiCommand @{ action = 'decide'; id = 'fixture-request'; phrase = 'EXACT PHRASE'; approve = $false } } catch { $rejected = $true }
@@ -113,6 +115,21 @@ try {
         if (-not $rejected -or $script:WireCalls.Count -ne $before) { throw 'Removed code pairing action reached the relay.' }
     }
     Write-Host 'PASS removed code pairing commands cannot reach the relay.'
+    $script:ApprovedBrowserIds = @([Guid]::NewGuid().ToString('D'))
+    $script:AutoOpened = $false
+    $before = $script:WireCalls.Count
+    Publish-RapHealth 'verified' $true
+    if ($script:WireCalls.Count -ne $before + 1 -or $script:WireCalls[$before].path -cne '/browsers') { throw 'Auto-open attempted to replace a saved browser.' }
+    Invoke-UiCommand @{ action = 'open' }
+    if ($script:WireCalls[$script:WireCalls.Count - 1].path -cne '/browsers') { throw 'Open did not wait for confirmation.' }
+    Invoke-UiCommand @{ action = 'open-replace'; replaceBrowserIds = $script:ApprovedBrowserIds }
+    if ($script:WireCalls[$script:WireCalls.Count - 1].body.replaceBrowserIds[0] -cne $script:ApprovedBrowserIds[0]) { throw 'Replacement did not carry exact reviewed browser IDs.' }
+    Show-PendingPairings @(@{ id = 'replacement-phone'; phrase = 'EXACT SWITCH' })
+    Invoke-UiCommand @{ action = 'decide'; id = 'replacement-phone'; phrase = 'EXACT SWITCH'; approve = $true }
+    if ($script:WireCalls[$script:WireCalls.Count - 1].path -cne '/browsers') { throw 'Phone approval silently replaced a browser.' }
+    Invoke-UiCommand @{ action = 'decide-replace'; id = 'replacement-phone'; phrase = 'EXACT SWITCH'; approve = $true; replaceBrowserIds = $script:ApprovedBrowserIds }
+    if ($script:WireCalls[$script:WireCalls.Count - 1].body.replaceBrowserIds[0] -cne $script:ApprovedBrowserIds[0]) { throw 'Phone switch omitted replacement IDs.' }
+    Write-Host 'PASS one-browser GUI protocol: restart preserves existing pairing, explicit desktop/phone replacement confirmation and exact identity fencing.'
     & (Join-Path $PSScriptRoot 'GUI.ps1') -SmokeTest -DataDirectory $state
     $lock = New-Object IO.FileStream((Join-Path $state 'instance.lock'), 'OpenOrCreate', 'ReadWrite', 'None')
     $lock.Dispose()

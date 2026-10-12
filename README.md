@@ -57,11 +57,11 @@ This is an explicit connection option, not automatic embedded-browser detection.
 1. Open **Get started** in the web app and choose **Find Windows download**, or visit [public releases](https://github.com/nicholas-a11y/pathplotter/releases). Download **PathPlotter-RAP-Windows.zip** from a compatible `rap-v2.*` release. Extract the complete ZIP somewhere writable; do not run it from inside the ZIP. If no compatible release is published, the guide says so rather than offering an older connector.
 2. Open LightBurn and enable its REST API in **Settings > Extensions**. Leave network API access off.
 3. Double-click **Start RAP.cmd**. **Start RAP.vbs** is an alternative that avoids the brief command-window flash.
-4. Paste your operator-issued registration invitation into RAP's **Operator invitation** field and choose **Register this computer**. Each invitation registers one computer and batch invitations expire after seven days. If your operator has enabled guided setup instead, leave the invitation blank, compare its computer name/phrase with the opened browser, enter the enrollment code and complete verification.
+4. Paste your operator-issued secret into RAP's **Invitation ID** field and choose **Register this computer**. Each invitation registers one computer and batch invitations expire after seven days. Relay origin and computer name use defaults hidden under **Advanced connection settings**. If your operator has enabled guided setup instead, explicitly select it under Advanced, compare its computer name/phrase with the opened browser, enter the enrollment code and complete verification.
 5. Click **Request local LightBurn permission**. Bring LightBurn to the foreground and approve its permission dialog within 30 seconds.
-6. Once RAP is ready, it opens PathPlotter automatically. Desktop authorization and capture control are automatic when control is free.
+6. Once RAP is ready, it opens PathPlotter automatically if no browser is paired. Desktop authorization and capture control are automatic when control is free.
 
-Subsequent RAP launches reuse protected credentials and open PathPlotter automatically. Use **Open PathPlotter** in RAP to open it again. Closing the RAP status window leaves it running in the tray; choose **Quit** to stop it. Launching RAP a second time shows the existing instance rather than starting another connector.
+Subsequent RAP launches reuse protected credentials. PathPlotter opens automatically only when no browser is paired; restarting never replaces a paired phone. Use **Open PathPlotter** in RAP to explicitly open it again, confirming replacement if a browser is already paired. Closing the RAP status window leaves it running in the tray; choose **Quit** to stop it. Launching RAP a second time shows the existing instance rather than starting another connector.
 
 RAP is portable and uses Windows PowerShell 5.1 and .NET Framework; everyday use does not require Node, Python or administrator access. If Windows policy blocks its scripts, follow your organization's approved procedure rather than disabling security protections.
 
@@ -72,14 +72,14 @@ The website cannot detect, install or silently start RAP. **Get started** provid
 1. In RAP, choose **Pair phone**.
 2. Scan the QR code or open its private, expiring link.
 3. The browser requests pairing automatically. Compare its phrase with the approval card in RAP.
-4. Click **Approve matching phrase** on the computer.
-5. Wait for fresh coordinates and capture control. If another browser has control, use **Take control** and confirm the switch.
+4. Click **Approve matching phrase** on the computer. If a browser is already paired, explicitly confirm replacing it.
+5. Wait for fresh coordinates and capture control. One browser identity is remembered per RAP; switching ends the previous browser's access. Finish pending imports or acknowledge unknown outcomes in the existing browser before switching.
 
 QR/link pairing always requires desktop approval. Do not share pairing links or screenshots of the QR code.
 
 New browsers must open **Open PathPlotter** from RAP, or scan/open the QR/link from **Pair phone**. These links contain all pairing details; there are no short codes or manual relay/invitation fields. Phone QR/link requests still require matching-phrase approval in RAP. Browser pairing does not require Turnstile; guided enrollment of new computers still does.
 
-An already paired browser can use **Connection > Reconnect saved browser** without another invitation. Saved same-RAP authorization is reused; reopening a same-RAP link closes Connection immediately and puts any outstanding-work reminder in the main status area. Browser access remains saved until revoked through RAP's **Connected browsers**; **End session** does not revoke it.
+An already paired browser can use **Connection > Reconnect saved browser** without another invitation. Saved same-RAP authorization is reused; reopening a same-RAP link closes Connection immediately and puts any outstanding-work reminder in the main status area. Browser access remains saved until replaced or revoked through RAP's **Paired browser** under Advanced; **End session** does not revoke it.
 
 For detailed startup, tray controls and credential recovery, see [RAP instructions](rap/README.md).
 
@@ -216,7 +216,7 @@ Abandoning preserves captured points and never removes LightBurn artwork. Local 
 ## Privacy and operational limits
 
 - RAP's LightBurn secret remains on the computer. RAP credentials and its import journal use current-user Windows protection.
-- Browser authorization is stored separately in browser storage. **Unlink this browser** removes the local pairing; use RAP's **Connected browsers** controls to revoke server authorization.
+- Browser authorization is stored separately in browser storage. **Unlink this browser** removes the local pairing; use RAP's **Paired browser** controls under Advanced to revoke server authorization.
 - Relay snapshots overwrite the latest coordinates rather than retaining movement history. Captured collections remain in the browser and SVGs travel through the relay for import.
 - Terminal jobs discard their SVG payloads. Durable Object alarms clean temporary coordinates, SVG jobs, results and requests after at most 24 hours of logical retention, including when devices are offline. Alarm delivery/retry timing can delay physical deletion; records are not usable after expiry. Registration and browser authorization persist until revoked/reset as applicable. Local import journals remain for safe recovery.
 - Pairing links are private grants. Scripts served from the same GitHub Pages origin are within the browser credential trust boundary.

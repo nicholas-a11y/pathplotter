@@ -44,13 +44,13 @@ function Initialize-Config {
     while ($null -eq $script:Config -and -not $Bridge.StopRequested) {
         $savedEnrollment = $null
         try { $savedEnrollment = Read-Protected 'enrollment.dpapi' }
-        catch { Send-Ui 'notice' 'Pending enrollment is unreadable. Explicitly discard expired setup below, or restore its protected file to recover an ambiguous registration.' }
+        catch { Send-Ui 'notice' 'Pending enrollment is unreadable. Use Advanced connection settings to explicitly discard expired setup, or restore its protected file to recover an ambiguous registration.' }
         Send-Ui 'setup' $savedEnrollment
         $command = Wait-Ui 'register'
         try {
             $api = Assert-CloudRoot $command.api
             $name = $command.name
-            if ([string]::IsNullOrWhiteSpace($name) -or $name.Length -gt 80 -or $name -match '[\x00-\x1f]') { throw 'Invalid computer name.' }
+            if ([string]::IsNullOrWhiteSpace($name) -or $name.Length -gt 64 -or $name -match '[\x00-\x1f]') { throw 'Invalid computer name.' }
             if ([string]::IsNullOrWhiteSpace($command.invitation)) {
                 $pending = Start-Enrollment $api $name
                 Send-Ui 'enrollment' @{ phrase = $pending.phrase; url = (Get-EnrollmentUrl $pending) }
@@ -91,9 +91,11 @@ function Initialize-Config {
     Send-Ui 'configured'
 }
 
-function Get-DesktopLaunchUrl {
+function Get-DesktopLaunchUrl($ReplacementIds = $null) {
     if (-not $script:Healthy) { throw 'Wait for a healthy connection.' }
-    $launch = Invoke-Cloud '/agent/browser-launch' @{}
+    $body = @{}
+    if ($null -ne $ReplacementIds) { $body.replaceBrowserIds = @($ReplacementIds) }
+    $launch = Invoke-Cloud '/agent/browser-launch' $body
     $token = Get-Field $launch 'launchToken'
     if ($token -isnot [string] -or [string]::IsNullOrWhiteSpace($token) -or $token.Length -gt 2048 -or
         (Convert-Time (Get-Field $launch 'expiresAt')) -le (Get-ServerNow)) { throw 'Invalid or expired desktop launch.' }
@@ -107,7 +109,10 @@ function Publish-RapHealth([string]$Message, [bool]$Connected) {
     if ($Connected -and -not $script:AutoOpened -and -not $Bridge.StopRequested) {
         # One attempt per normal launch, never on a reconnect or ordinary invitation.
         $script:AutoOpened = $true
-        try { Send-Ui 'desktop' (Get-DesktopLaunchUrl) }
+        try {
+            if ((Get-ApprovedBrowserIds).Count -eq 0) { Send-Ui 'desktop' (Get-DesktopLaunchUrl) }
+            else { Send-Ui 'notice' 'A browser is already paired. Use it, or Open PathPlotter to explicitly replace it.' }
+        }
         catch { Send-Ui 'notice' 'Desktop authorization could not be created. Check the updated relay is deployed, then use Open PathPlotter to retry explicitly.' }
     }
 }
@@ -139,7 +144,15 @@ function Invoke-UiCommand($Command) {
             Send-Ui 'transport' $false
             Send-Ui 'notice' 'WebSockets selected. Reconnecting; select WebSockets in PathPlotter too. HTTP fallback is never automatic.'
         }
-        'open' { Send-Ui 'desktop' (Get-DesktopLaunchUrl) }
+        'open' {
+            $ids = Get-ApprovedBrowserIds
+            if ($ids.Count) { Send-Ui 'confirm-switch' @{ action = 'open-replace'; replaceBrowserIds = $ids } }
+            else { Send-Ui 'desktop' (Get-DesktopLaunchUrl) }
+        }
+        'open-replace' {
+            if ($Command.replaceBrowserIds -isnot [array]) { throw 'Missing replacement confirmation.' }
+            Send-Ui 'desktop' (Get-DesktopLaunchUrl $Command.replaceBrowserIds)
+        }
         'phone' {
             if (-not $script:Healthy) { throw 'Wait for a healthy connection.' }
             $pair = Invoke-Cloud '/pairing/new'
@@ -150,10 +163,23 @@ function Invoke-UiCommand($Command) {
                 '&relayId=' + [Uri]::EscapeDataString($script:Config.relayId) + '&invite=' + [Uri]::EscapeDataString($token)
             Send-Ui 'phone' @{ url = $url; remainingMs = [Math]::Min(300000, $expiry - (Get-ServerNow)) }
         }
-        'decide' {
+        { $_ -in @('decide', 'decide-replace') } {
             if ($Command.approve -isnot [bool] -or -not $script:PendingPairings.ContainsKey($Command.id) -or
                 $script:PendingPairings[$Command.id] -cne $Command.phrase) { throw 'Request expired or phrase changed.' }
-            $null = Invoke-Cloud '/pairing/decide' @{ pairingId = $Command.id; approve = $Command.approve }
+            $body = @{ pairingId = $Command.id; approve = $Command.approve }
+            if ($Command.approve) {
+                if ($Command.action -ceq 'decide-replace') {
+                    if ($Command.replaceBrowserIds -isnot [array]) { throw 'Missing replacement confirmation.' }
+                    $body.replaceBrowserIds = @($Command.replaceBrowserIds)
+                } else {
+                    $ids = Get-ApprovedBrowserIds
+                    if ($ids.Count) {
+                        Send-Ui 'confirm-switch' @{ action = 'decide-replace'; id = $Command.id; phrase = $Command.phrase; approve = $true; replaceBrowserIds = $ids }
+                        return
+                    }
+                }
+            }
+            $null = Invoke-Cloud '/pairing/decide' $body
             $script:PendingPairings.Remove($Command.id)
             Send-Ui 'pairings' ([hashtable]$script:PendingPairings.Clone())
         }
@@ -175,7 +201,7 @@ function Invoke-UiCommand($Command) {
         'revoke' {
             if ($Command.id -isnot [string] -or $Command.id -notmatch '^[A-Za-z0-9_-]{1,128}$') { throw 'Invalid browser.' }
             $null = Invoke-Cloud '/browsers/revoke' @{ browserId = $Command.id }
-            Send-Ui 'notice' 'Browser access revoked. Refresh Connected browsers.'
+            Send-Ui 'notice' 'Browser access revoked. Refresh Paired browser.'
         }
         'forget-lightburn' {
             $script:Config.lightBurnSecret = ''
@@ -198,7 +224,13 @@ function Read-ConsoleCommand {
     $command = $null
     if ($Bridge.Commands.TryDequeue([ref]$command)) {
         try { Invoke-UiCommand $command }
-        catch { Send-Ui 'notice' 'Action failed or request expired. Check connection/permissions and refresh before an explicit retry; no automatic approval, revocation or enrollment retry.' }
+        catch {
+            if ($command.action -cin @('open-replace', 'decide-replace')) {
+                Send-Ui 'notice' 'Browser switch failed or expired. Finish pending imports or resolve unknown outcomes in the paired browser, check the connection, then refresh and confirm the switch again.'
+            } else {
+                Send-Ui 'notice' 'Action failed or request expired. Check connection/permissions and refresh before an explicit retry; no automatic approval, revocation or enrollment retry.'
+            }
+        }
         finally { Send-Ui 'action-complete' }
     }
 }

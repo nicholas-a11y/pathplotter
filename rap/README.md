@@ -13,14 +13,17 @@ and the Windows .NET Framework are used.
    **Start RAP.cmd** (or **Start RAP.vbs** to avoid even a brief command-window
    flash). RAP starts a small Windows Forms status window and tray icon, with no
    everyday console. A second launch activates the existing status window.
-2. On first use, choose a computer name and **Register this computer**. The
-   current relay is prefilled. If given an individual invitation, paste it into
-   **Operator invitation** before registering. Otherwise leave it blank for guided browser
-   enrollment. RAP opens the hosted setup page and displays a comparison phrase.
+2. On first use, paste your individual **Invitation ID** and choose **Register
+   this computer**. This is the secret handout value, not the operator's cancellation
+   UUID. The current relay and Windows computer name are used automatically.
+   **Advanced connection settings** contains the relay override, computer name,
+   **Use guided enrollment instead of an invitation**, and expired-enrollment
+   recovery. A blank Invitation ID does not silently start guided setup.
+   If guided setup is enabled by your operator, explicitly select it under
+   Advanced. RAP opens the hosted setup page and displays a comparison phrase.
    Verify the exact phrase for this computer, complete the browser verification
    and explicitly approve there, then confirm the matching phrase in RAP.
-   Setup checks are at least five seconds apart. **Advanced: override relay
-   origin** and an optional masked operator invitation retain existing setup paths.
+   Setup checks are at least five seconds apart.
    The service must have enrollment enabled; unavailable/full setup is not a
    reason to approve a different phrase or silently register another computer.
 3. Open LightBurn, enable its REST API in Settings > Extensions, and keep
@@ -28,17 +31,21 @@ and the Windows .NET Framework are used.
    permission** to consent to `state`, `project`, and `upload`. Bring
    LightBurn to the foreground and approve its dialog within 30 seconds.
 4. Once a fresh verified LightBurn workpiece/context has been published
-   successfully, RAP automatically opens hosted PathPlotter **once per launch**.
+   successfully, RAP automatically opens hosted PathPlotter **once per launch
+   only if no browser is paired**.
    Saved current-user DPAPI credentials are reused on subsequent launches.
    **Open PathPlotter** creates a fresh, short-lived desktop authorization each
    time you explicitly click it. It does not consume a phone invitation.
-   The updated relay and browser handle single-use authorization, reuse valid
-   browser identity and claim capture control if free; occupied control requires
-   the browser's explicit Take control confirmation.
+   If a browser is already paired, opening asks before replacing it. No
+   authorization changes until the new desktop link is redeemed successfully.
+   Reopening in the same authorized browser reuses its identity.
 5. To pair another browser/phone, select **Pair phone**. Scan the locally
    generated expiring QR or copy its private link. Compare the exact browser
    phrase with its approval card in RAP, then click **Approve matching phrase**
-   or **Reject**. Ordinary phone requests are never automatically approved.
+   or **Reject**. If a browser is already paired, approval also asks to replace
+   it. Cancel keeps the existing pairing. Only one browser identity is remembered
+   per RAP; switching revokes the previous one's access. Pending or unresolved
+   imports must be finished or acknowledged before switching.
 6. Browser **Send** is authorization to import that SVG. Inspect the project
    and placement before independently deciding to operate the laser.
 
@@ -52,8 +59,8 @@ or close; RAP clears its copied link only if the clipboard still contains that
 exact link. Desktop launch URLs are never displayed, copied or QR encoded.
 
 Closing the status window keeps RAP running in the tray. Tray actions are
-**Open PathPlotter**, **Pair phone**, **Connected browsers**, **Status**, explicit
-local permission resets, and **Quit**. Connected browsers provides revocation
+**Open PathPlotter**, **Pair phone**, **Paired browser**, **Status**, explicit
+local permission resets, and **Quit**. Paired browser, also under Advanced, provides revocation
 buttons. Local resets preserve the journal and are not remote revocation:
 also use LightBurn **Manage API Security** and ask the relay operator to revoke
 old agent credentials. Invalid/unreadable saved registration requires explicit
@@ -84,7 +91,7 @@ New registrations default to `https://pathplotter-relay-v2.nicholas-leqeta.worke
 
 Finish/reconcile any pending import first. In the tray menu choose **Forget local registration...** and confirm, then restart the updated RAP. This preserves the import journal but removes local relay and LightBurn credentials. Revoke the old RAP permission in LightBurn's **Manage API Security**, then request and approve local permission again when prompted.
 
-The v2 relay initially uses operator invitations, not guided enrollment. Set a fresh private `BOOTSTRAP_TOKEN` secret on `pathplotter-relay-v2`, enter that same value in RAP's **Operator invitation** field, and choose **Register this computer**. A value registers only one computer; replace it before registering another. Browser pairing still uses **Open PathPlotter** or **Pair phone**, never the operator secret.
+The v2 relay uses operator invitations unless guided enrollment is explicitly configured. Generate a batch as described below and enter each individual secret in RAP's **Invitation ID** field, then choose **Register this computer**. The legacy `BOOTSTRAP_TOKEN` path is still supported, but needs a fresh value per computer; batches avoid that rotation. Browser pairing still uses **Open PathPlotter** or **Pair phone**, never the operator secret.
 
 ### Operator batch invitations
 
@@ -98,9 +105,9 @@ From the extracted RAP folder in Windows PowerShell 5.1:
 .\Operator-Invitations.ps1 -Action Cancel -InvitationId 'paste-the-id-from-List'
 ```
 
-Each command prompts for the admin secret with hidden input. It is sent only in an HTTPS authorization header, never saved or included in a URL. An explicit `-Relay` HTTPS origin override is available for an operator-managed relay. Generate accepts 1-20 invitations per batch, defaulting to 10; each expires after **seven days** and registers **one computer**. Hand each person just their `Invitation` value to paste into RAP's **Operator invitation** field. They then register and approve LightBurn's local permission normally.
+Each command prompts for the admin secret with hidden input. It is sent only in an HTTPS authorization header, never saved or included in a URL. An explicit `-Relay` HTTPS origin override is available for an operator-managed relay. Generate accepts 1-20 invitations per batch, defaulting to 10; each expires after **seven days** and registers **one computer**. Hand each person just their `InvitationID` secret value to paste into RAP's **Invitation ID** field. They then register and approve LightBurn's local permission normally.
 
-Generation displays secrets once in your private terminal. Do not use PowerShell transcripts, recordings or shared terminals, and store handouts securely. List shows IDs, labels, batches, expiry and status but never the secrets. Cancellation requires the invitation **ID**, not its secret value, and cannot revoke already-registered computers. If generation times out, List identifies the uncertain batch by label/time so you can cancel it before generating replacements. The tool never automatically retries generation.
+Generation displays secrets once in your private terminal. Do not use PowerShell transcripts, recordings or shared terminals, and store handouts securely. List shows IDs, labels, batches, expiry and status but never the secrets. Cancellation uses Generate's **CancellationId** or List's **id** UUID via `-InvitationId`, not the secret entered in RAP, and cannot revoke already-registered computers. If generation times out, List identifies the uncertain batch by label/time so you can cancel it before generating replacements. The tool never automatically retries generation.
 
 The service permits 100 outstanding unused invitations, five operator requests/IP/minute, and 50 registered computers total. Invites do not reserve slots. Metadata remains available until 30 days after expiry; very large histories explicitly report a truncated list.
 
@@ -220,7 +227,7 @@ Use **Open PathPlotter** for this computer's browser. For a phone or another bro
 
 Browser pairing does not require Turnstile. Guided registration of a new RAP computer is separate and still requires its enrollment configuration or an operator invitation.
 
-Saved browser access remains valid until revoked through **Connected browsers**. Closing the status window merely hides RAP in the tray and is not Quit. Existing registrations and already-approved browser credentials are preserved when upgrading.
+Saved browser access remains valid until explicitly replaced or revoked through **Paired browser**. Restarting RAP does not replace a saved phone with the desktop browser. Closing the status window merely hides RAP in the tray and is not Quit. Existing registrations and already-approved browser credentials are preserved when upgrading; the next confirmed switch replaces all previously authorized browsers. Multiple tabs in the same browser profile still share one identity and use the existing exclusive capture-control rules.
 
 ## Import safety and limitations
 
@@ -274,6 +281,10 @@ desktop launch requires the updated authenticated
 only in the default browser. The grant expires after two minutes and is
 single-use; it is a bearer grant, not proof of physical locality.
 Ordinary phones continue using `/pairing/new` and explicit `/pairing/decide`.
+Confirmed switches send `replaceBrowserIds` containing the exact reviewed saved
+IDs on launch issuance or phone approval. Stale confirmations fail instead of
+revoking a newly paired device. Diagnostic console approval similarly requires
+typing `REPLACE` before switching.
 The local SVG allowlist is intentionally narrow and
 matches the current app exporter; unsupported future SVG variants are rejected,
 not silently imported.
