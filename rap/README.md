@@ -77,6 +77,14 @@ execution policy, unblock files, install certificates, or modify global policy.
 
 ## Console commands and revocation
 
+### Switching to the fresh v2 relay
+
+New registrations default to `https://pathplotter-relay-v2.nicholas-leqeta.workers.dev`. Existing protected registrations keep their original relay; upgrading RAP does not silently switch them.
+
+Finish/reconcile any pending import first. In the tray menu choose **Forget local registration...** and confirm, then restart the updated RAP. This preserves the import journal but removes local relay and LightBurn credentials. Revoke the old RAP permission in LightBurn's **Manage API Security**, then request and approve local permission again when prompted.
+
+The v2 relay initially uses operator invitations, not guided enrollment. Set a fresh private `BOOTSTRAP_TOKEN` secret on `pathplotter-relay-v2`, enter that same value in RAP's **Operator invitation** field, and choose **Register this computer**. A value registers only one computer; replace it before registering another. Browser pairing still uses **Open PathPlotter** or **Pair phone**, never the operator secret.
+
 Use **Start RAP diagnostics.cmd** for the original typed console workflow.
 Quit the tray instance before starting diagnostics (both retain the same durable
 instance lock and protected state). Diagnostics intentionally keeps manual

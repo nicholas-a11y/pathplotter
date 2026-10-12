@@ -37,7 +37,7 @@ $script:SlowHttp = $false
 $script:Socket = $null
 $script:PreviewActive = $false
 $script:LastObservationHealth = ''
-$script:DefaultRelay = 'https://pathplotter-relay-test.nicholas-leqeta.workers.dev'
+$script:DefaultRelay = 'https://pathplotter-relay-v2.nicholas-leqeta.workers.dev'
 
 function New-AgentSocket {
     $url = $script:Config.apiRoot -replace '^https:', 'wss:'

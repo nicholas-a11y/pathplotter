@@ -313,7 +313,7 @@ function Start-RapDesktop {
             $box.Width = 560; $d[$field[1]] = $box; $d.setup.Controls.Add($box)
         }
         $d.name.Text = $env:COMPUTERNAME; $d.invitation.UseSystemPasswordChar = $true
-        $d.api.Text = 'https://pathplotter-relay-test.nicholas-leqeta.workers.dev'; $d.api.ReadOnly = $true
+        $d.api.Text = 'https://pathplotter-relay-v2.nicholas-leqeta.workers.dev'; $d.api.ReadOnly = $true
         $d.override = New-Object Windows.Forms.CheckBox
         $d.override.Text = 'Advanced: override relay origin'; $d.override.AutoSize = $true
         $d.override.Add_CheckedChanged({ $script:Desktop.api.ReadOnly = -not $script:Desktop.override.Checked })

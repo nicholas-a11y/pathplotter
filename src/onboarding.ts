@@ -1,6 +1,6 @@
 import { relayBaseUrl } from './relay.ts'
 
-export const HOSTED_RELAY = 'https://pathplotter-relay-test.nicholas-leqeta.workers.dev'
+export const HOSTED_RELAY = 'https://pathplotter-relay-v2.nicholas-leqeta.workers.dev'
 const RELEASES = 'https://github.com/nicholas-a11y/pathplotter/releases'
 const RELEASE_API = 'https://api.github.com/repos/nicholas-a11y/pathplotter/releases/latest'
 

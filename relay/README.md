@@ -2,6 +2,19 @@
 
 This package implements the HTTPS relay API and its per-relay SQLite Durable Object. It does not serve or modify the frontend or RAP.
 
+## Hosted deployment
+
+The current Worker is `pathplotter-relay-v2`, at `https://pathplotter-relay-v2.nicholas-leqeta.workers.dev`. It has fresh Durable Object namespaces; registrations on the earlier test Worker are not copied. The website and RAP defaults target this address.
+
+```powershell
+npm run check
+npm test
+npx wrangler deploy --config .\wrangler.jsonc --keep-vars --dry-run
+npx wrangler deploy --config .\wrangler.jsonc --keep-vars
+```
+
+Operator registration requires a private `BOOTSTRAP_TOKEN` Worker secret. Set it in the Cloudflare dashboard or using `npx wrangler secret put BOOTSTRAP_TOKEN`; never put the value in a command argument or chat. Each invitation is single-use. Replace it with a new random value before registering another computer. Guided enrollment remains unavailable unless separately configured below.
+
 ## Local development and checks
 
 ```powershell
