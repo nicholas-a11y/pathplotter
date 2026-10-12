@@ -41,7 +41,7 @@ h2 { font-size: 1.2rem; }
 .live-update-bar { display: flex; flex-wrap: wrap; align-items: center; gap: 8px 12px; padding: 8px; background: #fff; border-radius: 8px; }
 #liveUpdateStatus { font-size: 12px; flex: 1; min-width: 220px; }
 .workspace-status { display: flex; justify-content: space-between; flex-wrap: wrap; gap: 4px 12px; font-size: 12px; padding: 0 4px; }
-#liveText { font-variant-numeric: tabular-nums; color: #596676; }
+#liveText { flex-basis: 100%; font-variant-numeric: tabular-nums; color: #596676; }
 .hint { color: #667384; font-size: 12px; }
 
 button, input, select { font: inherit; }

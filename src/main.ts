@@ -215,6 +215,7 @@ const connectionStateEl = must<HTMLDivElement>('connectionState')
 const statusTextEl = must<HTMLParagraphElement>('statusText')
 const liveTextEl = must<HTMLParagraphElement>('liveText')
 const plotEl = must<SVGSVGElement>('plot')
+let lastPlotMarkup = ''
 const pointsTableEl = must<HTMLTableSectionElement>('pointsTable')
 const exportStatusEl = must<HTMLParagraphElement>('exportStatus')
 
@@ -1948,7 +1949,7 @@ function renderPlot(): void {
     ? `<g class="head-marker${settled ? ' settled' : ''}" transform="translate(${screenX(livePosition.x)} ${screenY(livePosition.y)})"><title>${settled ? 'Reported position unchanged for three readings' : 'Reported position not yet settled'}</title><circle r="5" /><path d="M -9 0 H 9 M 0 -9 V 9" /></g>` : ''
   const workspace = workspaceSize
     ? `<rect class="bed-outline" x="${screenX(0)}" y="${screenY(workspaceSize.y)}" width="${workspaceSize.x * scale}" height="${workspaceSize.y * scale}" />` : ''
-  plotEl.innerHTML = `
+  const markup = `
     <defs><clipPath id="workspaceClip"><rect x="${marginX}" y="${marginY}" width="${innerWidth}" height="${innerHeight}" /></clipPath></defs>
     <rect class="plot-background" x="${marginX}" y="${marginY}" width="${innerWidth}" height="${innerHeight}" />
     <g clip-path="url(#workspaceClip)">
@@ -1959,6 +1960,10 @@ function renderPlot(): void {
       ${pointDots}${head}
     </g>
     <g class="rulers">${rulers}</g>`
+  // The relay tick re-renders every 200 ms; skip DOM rebuilds when nothing visible changed.
+  if (markup === lastPlotMarkup) return
+  lastPlotMarkup = markup
+  plotEl.innerHTML = markup
 }
 
 function chooseGridStep(minimum: number): number {
