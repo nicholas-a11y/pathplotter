@@ -373,6 +373,11 @@ export class RelayClient {
     this.start()
   }
 
+  async endSession(): Promise<void> {
+    this.stop()
+    await this.request('/control/release', {})
+  }
+
   useWebSocket(): void {
     this.stop()
     this.transport = 'socket'

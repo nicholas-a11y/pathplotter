@@ -43,6 +43,7 @@ app.innerHTML = `
     <span id="collectionSummary"></span>
     <div class="status-chip" id="connectionState">Disconnected</div>
     <button id="connectionBtn" class="secondary">Connection</button>
+    <button id="endSessionBtn" class="secondary">End session</button>
     <button id="getStartedBtn" class="secondary">Get started</button>
   </header>
 
@@ -72,7 +73,6 @@ app.innerHTML = `
     <svg id="plot" role="img" aria-label="Workpiece coordinates plot"></svg>
   </section>
   <footer class="export-bar">
-    <span class="hint">mm · +X right · +Y up</span>
     <button id="downloadSvgBtn" class="secondary">Download SVG</button>
     <button id="sendBtn" class="primary">Send to LightBurn</button>
     <button id="sessionBtn" class="secondary">Session</button>
@@ -241,6 +241,9 @@ let pollHandle: number | null = null
 let requestInFlight = false
 let uploadInFlight = false
 let connectionInFlight = false
+let sessionEnded = false
+let endingSession = false
+let sessionReleaseFailed = false
 let workspaceSize: { x: number; y: number } | null = null
 let connectionCloseTimer: number | null = null
 let relay: RelayClient | null = null
@@ -432,6 +435,7 @@ async function verifyImportTarget(target: ImportTarget): Promise<void> {
 
 must<HTMLInputElement>('liveUpdateToggle').addEventListener('change', async event => {
   const toggle = event.currentTarget as HTMLInputElement
+  if (sessionEnded || endingSession) { toggle.checked = false; return }
   if (toggle.checked) {
     try {
       if (await takeLiveOwnership()) return
@@ -599,6 +603,8 @@ window.addEventListener('storage', async event => {
 })
 
 function updateConnectionMode(): void {
+  sessionEnded = false
+  sessionReleaseFailed = false
   must<HTMLElement>('relayConnection').hidden = mode !== 'relay'
   must<HTMLElement>('localConnection').hidden = mode === 'relay'
   must<HTMLElement>('directConnectionHint').textContent = mode === 'webtool'
@@ -621,7 +627,7 @@ function updateConnectionMode(): void {
 }
 
 function relayChanged(): void {
-  if (mode !== 'relay') return
+  if (mode !== 'relay' || sessionEnded) return
   const snapshot = relay?.snapshot
   const fresh = relay?.canCapture() === true
   if (!otherTabOwnsLive && !handoverPending && (liveEnabled || (liveQueue().items.length > 0 && !liveQueue().paused)) && relay?.controlError && !relay.activeBrowser) {
@@ -726,6 +732,8 @@ async function connectBrowserLink(link: BrowserLink, requestControl = false): Pr
 must<HTMLButtonElement>('pairRelayBtn').addEventListener('click', async () => {
   const button = must<HTMLButtonElement>('pairRelayBtn')
   try {
+    if (endingSession) return
+    if (sessionEnded) { sessionEnded = false; relay?.start(); renderControls() }
     const baseUrl = relayBaseUrl(must<HTMLInputElement>('relayUrl').value)
     const relayId = must<HTMLInputElement>('relayId').value.trim()
     const token = must<HTMLInputElement>('relayInvitation').value.trim()
@@ -742,6 +750,7 @@ must<HTMLButtonElement>('pairRelayBtn').addEventListener('click', async () => {
 })
 async function takeCaptureControl(): Promise<boolean> {
   try {
+    if (sessionEnded || endingSession) throw new Error('Session ended. Use Connection > Pair to reconnect.')
     if (!relay) throw new Error('Pair with RAP first.')
     if (relay.activeBrowser && relay.canCapture()) { setStatus('Already paired and ready to capture.'); return true }
     if (!relay.isOnline() || !relay.snapshot?.context) throw new Error('RAP is offline or its workspace is unavailable. Check LightBurn and RAP, then click Pair again.')
@@ -755,6 +764,48 @@ async function takeCaptureControl(): Promise<boolean> {
   } catch (error) { must<HTMLParagraphElement>('relayMessage').textContent = errorToMessage(error); setStatus(errorToMessage(error)); return false }
 }
 must<HTMLButtonElement>('quickControlBtn').addEventListener('click', () => { void takeCaptureControl() })
+must<HTMLButtonElement>('endSessionBtn').addEventListener('click', async () => {
+  if (endingSession) return
+  if (requestInFlight || uploadInFlight || connectionInFlight || liveDispatching || liveRecoveryInFlight ||
+      handoverPending || handoverStopping || pendingImport || liveQueue().items.length || liveQueue().paused ||
+      otherTabOwnsLive || must<HTMLButtonElement>('pairRelayBtn').disabled) {
+    setStatus('Cannot end session yet. Wait for current operations, turn off Live update, and reconcile pending imports or tab ownership first. No connection was closed.')
+    return
+  }
+  if (!sessionEnded && !window.confirm('End this session? Points and saved pairing will be kept. Preview and connections will stop; RAP and LightBurn will keep running.')) return
+  endingSession = true
+  renderControls()
+  try {
+    const next = structuredClone(state)
+    for (const group of captureGroups(next)) delete group.liveLocked
+    commitCollection(next)
+    liveEnabled = false
+    sessionEnded = true
+    ++pairingEpoch
+    cancelConnectionClose()
+    if (pollHandle !== null) { window.clearInterval(pollHandle); pollHandle = null }
+    secretInput.value = ''
+    localContextRevision = null
+    liveTarget = null
+    livePosition = null
+    workspaceSize = null
+    settledPosition.reset()
+    settledRelayContext = null
+    releaseLiveLock?.()
+    renderPlot()
+    liveTextEl.textContent = 'Preview stopped.'
+    if (relay && mode === 'relay') await relay.endSession()
+    else relay?.stop()
+    sessionReleaseFailed = false
+    setStatus('Session ended. Your points and pairing are saved; you can close this tab. Use Connection to reconnect.')
+    window.close()
+  } catch (error) {
+    sessionReleaseFailed = sessionEnded
+    setStatus(sessionEnded
+      ? `Session disconnected, but capture control release could not be confirmed: ${errorToMessage(error)}. It expires without heartbeats. Retry End session or close this tab; no artwork was resent.`
+      : `Session was not ended because points could not be saved: ${errorToMessage(error)}`)
+  } finally { endingSession = false; renderControls() }
+})
 must<HTMLButtonElement>('unlinkRelayBtn').addEventListener('click', async () => {
   if (liveOwnsWork() || uploadInFlight) { setStatus('Finish or reconcile live updates before unlinking.'); return }
   if (!window.confirm('Remove this browser’s local pairing? Revoke its grant in RAP to remove server access.')) return
@@ -861,7 +912,7 @@ window.setInterval(() => {
 renderAll()
 updateConnectionMode()
 setupOnboarding({
-  canChangeTransport: () => !liveOwnsWork() && !requestInFlight && !uploadInFlight && !pendingImport,
+  canChangeTransport: () => !sessionEnded && !endingSession && !liveOwnsWork() && !requestInFlight && !uploadInFlight && !pendingImport,
   fallback: () => {
     if (!relay || mode !== 'relay') { setStatus('Pair with RAP in cloud mode first.'); return }
     relay.useHttpFallback()
@@ -1007,7 +1058,7 @@ function updateDiameterVisibility(): void {
 }
 
 must<HTMLButtonElement>('connectBtn').addEventListener('click', async () => {
-  if (mode === 'relay' || connectionInFlight) return
+  if (mode === 'relay' || connectionInFlight || endingSession) return
   if (liveEnabled || liveDispatching) { setStatus('Turn live mode off and wait for import completion before connecting again.'); return }
   if (liveQueue().items.length && !secretInput.value.trim()) { setStatus('Enter the existing LightBurn secret to check queued work; new pairing is blocked until reconciliation.'); return }
   const appName = appNameInput.value.trim() || 'PathPlotter'
@@ -1016,6 +1067,7 @@ must<HTMLButtonElement>('connectBtn').addEventListener('click', async () => {
   connectionInFlight = true
   cancelConnectionClose()
   try {
+    sessionEnded = false
     const baseUrl = normalizeBaseUrl(baseUrlInput.value)
     if (!secretInput.value.trim()) {
       setStatus('Pairing requested. Bring LightBurn to the foreground (click its window or Alt+Tab) and approve within 30 seconds.')
@@ -1264,7 +1316,7 @@ async function fetchStatus(): Promise<void> {
 }
 
 async function refreshLivePosition(): Promise<void> {
-  if (mode === 'relay') return
+  if (mode === 'relay' || sessionEnded) return
   const requestedMode = mode, requestedBaseUrl = baseUrlInput.value, requestedSecret = secretInput.value
   try {
     const response = await authorizedFetch('/api/position')
@@ -1272,7 +1324,7 @@ async function refreshLivePosition(): Promise<void> {
       throw new Error(`Position request failed (${response.status})`)
     }
     const payload = (await response.json()) as { workpiece?: { x?: number; y?: number } }
-    if (mode !== requestedMode || baseUrlInput.value !== requestedBaseUrl || secretInput.value !== requestedSecret) return
+    if (sessionEnded || mode !== requestedMode || baseUrlInput.value !== requestedBaseUrl || secretInput.value !== requestedSecret) return
     const x = payload.workpiece?.x
     const y = payload.workpiece?.y
     if (typeof x !== 'number' || typeof y !== 'number' || !Number.isFinite(x) || !Number.isFinite(y)) {
@@ -1287,7 +1339,7 @@ async function refreshLivePosition(): Promise<void> {
     liveTextEl.textContent = `Live workpiece position: X ${x.toFixed(3)} mm, Y ${y.toFixed(3)} mm`
     renderPlot()
   } catch (error) {
-    if (mode !== requestedMode || baseUrlInput.value !== requestedBaseUrl || secretInput.value !== requestedSecret) return
+    if (sessionEnded || mode !== requestedMode || baseUrlInput.value !== requestedBaseUrl || secretInput.value !== requestedSecret) return
     settledPosition.reset()
     livePosition = null
     renderPlot()
@@ -1309,7 +1361,7 @@ function startPreview(): void {
 }
 
 async function capturePoint(): Promise<void> {
-  if (requestInFlight || (uploadInFlight && !liveDispatching) || liveCaptureBlocked()) {
+  if (sessionEnded || endingSession || requestInFlight || (uploadInFlight && !liveDispatching) || liveCaptureBlocked()) {
     return
   }
   if (state.finished) {
@@ -1416,7 +1468,7 @@ async function bearerToken(secret: string): Promise<string> {
 }
 
 async function sendToLightBurn(): Promise<void> {
-  if (otherTabOwnsLive || uploadInFlight || requestInFlight || liveEnabled || liveQueue().items.length || liveQueue().paused) return
+  if (sessionEnded || endingSession || otherTabOwnsLive || uploadInFlight || requestInFlight || liveEnabled || liveQueue().items.length || liveQueue().paused) return
   const built = buildSvgForCollection()
   if (!built) {
     setExportStatus('Capture enough points for the selected shape before sending.')
@@ -1668,16 +1720,21 @@ function renderControls(): void {
   const busy = otherTabOwnsLive || handoverStopping || handoverPending || requestInFlight || (uploadInFlight && !liveDispatching)
   must<HTMLSpanElement>('collectionSummary').textContent =
     `${state.type} · ${allPoints(state).length} points · ${state.groups.length} finished groups`
-  const relayReady = mode !== 'relay' || relay?.canCapture() === true
-  must<HTMLButtonElement>('quickControlBtn').hidden = mode !== 'relay' || !relay || relay.activeBrowser
+  const relayReady = !sessionEnded && !endingSession && (mode !== 'relay' || relay?.canCapture() === true)
+  must<HTMLButtonElement>('endSessionBtn').disabled = (sessionEnded && !sessionReleaseFailed) || endingSession
+  must<HTMLButtonElement>('connectionBtn').disabled = endingSession
+  must<HTMLButtonElement>('quickControlBtn').hidden = sessionEnded || mode !== 'relay' || !relay || relay.activeBrowser
   must<HTMLButtonElement>('quickControlBtn').disabled = busy || uploadInFlight || !relay?.isOnline()
   const contextMatches = mode !== 'relay' || !allPoints(state).length || state.coordinateContext === contextKey()
   const captureBlock = captureBlockReason()
-  must<HTMLButtonElement>('captureBtn').disabled = captureBlock !== null
+  must<HTMLButtonElement>('captureBtn').disabled = sessionEnded || endingSession || captureBlock !== null
   const captureHint = must<HTMLParagraphElement>('captureBlockHint')
   captureHint.hidden = !captureBlock
   captureHint.textContent = captureBlock?.hint ?? ''
-  if (mode === 'relay') {
+  if (sessionEnded) {
+    connectionStateEl.textContent = 'Session ended'
+    connectionStateEl.classList.remove('ok')
+  } else if (mode === 'relay') {
     connectionStateEl.textContent = captureBlock?.label ?? 'Ready to capture'
     connectionStateEl.classList.toggle('ok', !captureBlock)
   }
@@ -1692,7 +1749,7 @@ function renderControls(): void {
   must<HTMLButtonElement>('downloadSvgBtn').disabled = busy || !hasExportGeometry()
   const queue = liveQueue()
   if (!requestInFlight) must<HTMLInputElement>('liveUpdateToggle').checked = liveEnabled
-  must<HTMLInputElement>('liveUpdateToggle').disabled = handoverPending || handoverStopping || requestInFlight || (!otherTabOwnsLive && !liveEnabled && (uploadInFlight || !!queue.items.length || !!queue.paused))
+  must<HTMLInputElement>('liveUpdateToggle').disabled = sessionEnded || endingSession || handoverPending || handoverStopping || requestInFlight || (!otherTabOwnsLive && !liveEnabled && (uploadInFlight || !!queue.items.length || !!queue.paused))
   must<HTMLElement>('liveUpdateStatus').textContent = handoverPending ? 'Waiting for safe Live update transfer…' : handoverStopping ? 'Stopping for safe transfer…' : otherTabOwnsLive ? 'Another tab owns Live update. Use Pair or enable Live update here to take over safely.' : queue.paused ? `Paused: ${queue.paused} · ${queue.items.length} pending` :
     `${liveEnabled ? 'On' : queue.items.length ? 'Off · draining' : 'Off'} · ${queue.items.length}/${LIVE_QUEUE_LIMIT} pending · ${queue.confirmed} confirmed${queue.items.length >= LIVE_QUEUE_LIMIT ? ' · Queue full; wait for imports' : ''}`
   const head = queue.items[0]
@@ -1704,7 +1761,7 @@ function renderControls(): void {
   must<HTMLInputElement>('loadSessionInput').disabled = busy || liveOwnsWork()
   baseUrlInput.disabled = liveEnabled || liveDispatching
   secretInput.disabled = liveEnabled || liveDispatching
-  modeInput.disabled = liveOwnsWork() || pendingImport !== null || busy || uploadInFlight
+  modeInput.disabled = endingSession || liveOwnsWork() || pendingImport !== null || busy || uploadInFlight
 }
 
 function renderEditor(): void {

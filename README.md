@@ -182,6 +182,10 @@ Workspace confirmation associates saved coordinates with the current context; it
 
 ### Switching tabs or devices
 
+**End session** saves your points, stops preview and browser connections, clears the in-memory direct API secret, and releases relay capture control. Saved pairing is kept; RAP and LightBurn remain running. It refuses while operations, pending imports or live recovery/tab ownership need reconciliation. If release fails, the browser stays disconnected and reports it explicitly; control expires without heartbeats and End session can be retried.
+
+The app then attempts to close the tab. Browsers and LightBurn's embedded browser may refuse closure; in that case the page shows **Session ended** and can be closed manually. Use **Connection** to reconnect. This is not Unlink, Clear points or a cancellation of artwork already imported.
+
 Only one browser holds relay capture control at a time. An explicit takeover stops the previous browser from capturing; it does not automatically take control back.
 
 For Live update tabs in the **same browser profile and site**, click **Pair** or enable Live update in the tab you want to use. The old owner stops new captures and subsequent imports, settles its current operation, saves the queue and releases its exclusive lock. The new tab checks the original destination/workspace before continuing safe unsent work; live capture continues if it was enabled.

@@ -83,6 +83,33 @@ test('socket transport consumes events without HTTP snapshot polling or durable 
   } finally { env.cleanup() }
 })
 
+test('ending session stops the socket before releasing control and retains browser pairing', async () => {
+  const env = await setup()
+  const originalFetch = globalThis.fetch
+  try {
+    globalThis.fetch = async (url, init) => {
+      assert.ok(String(url).endsWith('/control/release'))
+      assert.equal(init?.method, 'POST')
+      assert.equal(env.socket.closed, true)
+      assert.equal(env.client.canCapture(), false)
+      return Response.json({})
+    }
+    await env.client.endSession()
+    assert.equal(env.client.identity.credential, 'test-only')
+    assert.equal(env.client.snapshot, null)
+  } finally { globalThis.fetch = originalFetch; env.cleanup() }
+})
+
+test('failed control release is explicit and leaves the socket stopped', async () => {
+  const env = await setup()
+  try {
+    globalThis.fetch = async () => Response.json({ error: 'unavailable' }, { status: 503 })
+    await assert.rejects(env.client.endSession(), /unavailable/)
+    assert.equal(env.socket.closed, true)
+    assert.equal(env.client.canCapture(), false)
+  } finally { env.cleanup() }
+})
+
 test('fresh capture accepts only matched fresh results and never resolves from cached preview', async () => {
   const env = await setup()
   try {
