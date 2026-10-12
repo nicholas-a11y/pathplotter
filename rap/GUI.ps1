@@ -241,17 +241,6 @@ function Handle-UiEvent($Event) {
             $Event.value = $null
         }
         'phone' { Show-Phone $Event.value; $d.smokePhones++ }
-        'code-window' {
-            $d.codeId = $Event.value.id; $d.codeDeadline = $d.clock.ElapsedMilliseconds + $Event.value.remainingMs
-            $d.codeText.Text = $Event.value.code
-            $d.codeStatus.Text = 'Code window requested. Cancel is best effort; completed browser access must be revoked separately.'
-        }
-        'code-status' {
-            if ($d.codeId -ceq $Event.value.id -and $Event.value.status -cne 'waiting') {
-                $d.codeText.Text = ''; $d.codeId = ''
-                $d.codeStatus.Text = $(if ($Event.value.status -ceq 'claimed') { 'Code used. Compare the browser phrase and approve or reject below.' } elseif ($Event.value.status -ceq 'complete') { 'Browser approved. Access persists until revoked in Connected browsers.' } else { 'Code window ' + $Event.value.status + '.' })
-            }
-        }
         'pairings' { Show-Approvals $Event.value }
         'browsers' { Show-Browsers $Event.value }
         'action-complete' {
@@ -292,7 +281,6 @@ function Start-RapDesktop {
         bridge = (New-Object PathPlotterRap.UiBridge); clock = [Diagnostics.Stopwatch]::StartNew()
         activation = $activation; configured = $false; healthy = $false; busy = $false; closing = $false; stopped = $false; failed = $false
         phone = $null; phoneImage = $null; phoneUrl = ''; phoneDeadline = 0L; browsers = $null
-        codeId = ''; codeDeadline = 0L
         pairings = @{}; pairingSignature = ''; smoke = [bool]$SmokeTest; smokeOpens = 0; smokePhones = 0; smokeStage = 0; smokeConsentTicks = 0
         fixtureEvents = (New-Object 'Collections.Generic.List[string]')
     }
@@ -315,23 +303,6 @@ function Start-RapDesktop {
         $d.pair = New-UiButton 'Pair phone' @{ action = 'phone' }
         $d.list = New-UiButton 'Connected browsers' @{ action = 'browsers' }
         foreach ($button in @($d.open, $d.pair, $d.list)) { $button.Enabled = $false; $actions.Controls.Add($button) }
-        $codePanel = New-Object Windows.Forms.FlowLayoutPanel
-        $codePanel.Size = New-Object Drawing.Size(580, 165); $codePanel.FlowDirection = 'TopDown'; $codePanel.WrapContents = $false
-        $codeHelp = New-Object Windows.Forms.Label
-        $codeHelp.Text = 'Website-first pairing: allow a 60-second code window, then enter its three letters in PathPlotter Connection. Compare the phrase in the browser with the request below before approving. A code alone never grants access.'
-        $codeHelp.Size = New-Object Drawing.Size(560, 60); $codePanel.Controls.Add($codeHelp)
-        $codeActions = New-Object Windows.Forms.FlowLayoutPanel
-        $codeActions.Size = New-Object Drawing.Size(560, 35)
-        $d.codeNew = New-UiButton 'Allow code pairing' @{ action = 'code-new' }
-        $d.codeCancel = New-UiButton 'Cancel code' @{ action = 'code-cancel' }
-        $d.codeNew.Enabled = $false; $d.codeCancel.Enabled = $false
-        $codeActions.Controls.Add($d.codeNew); $codeActions.Controls.Add($d.codeCancel); $codePanel.Controls.Add($codeActions)
-        $d.codeText = New-Object Windows.Forms.Label
-        $d.codeText.Size = New-Object Drawing.Size(560, 25); $d.codeText.Font = New-Object Drawing.Font('Segoe UI', 14, [Drawing.FontStyle]::Bold)
-        $codePanel.Controls.Add($d.codeText)
-        $d.codeStatus = New-Object Windows.Forms.Label
-        $d.codeStatus.Size = New-Object Drawing.Size(560, 35); $d.codeStatus.Text = 'Requires operator opt-in. Every browser request needs approval in RAP.'
-        $codePanel.Controls.Add($d.codeStatus); $layout.Controls.Add($codePanel)
         $d.setup = New-Object Windows.Forms.FlowLayoutPanel
         $d.setup.Size = New-Object Drawing.Size(580, 255); $d.setup.FlowDirection = 'TopDown'; $d.setup.WrapContents = $false; $d.setup.Visible = $false
         $layout.Controls.Add($d.setup)
@@ -480,14 +451,6 @@ function Start-RapDesktop {
                 }
                 $s.applyTransport.Enabled = $s.configured -and -not $s.importing -and -not $s.busy -and
                     -not $s.closing -and -not $s.stopped -and ($s.httpChoice.Checked -ne $s.activeSlowHttp)
-                $s.codeNew.Enabled = $s.healthy -and -not $s.importing -and -not $s.busy -and -not $s.closing -and -not $s.stopped
-                $s.codeCancel.Enabled = [bool]$s.codeId -and -not $s.busy -and -not $s.closing -and -not $s.stopped
-                if ($s.codeId) {
-                    $remaining = $s.codeDeadline - $s.clock.ElapsedMilliseconds
-                    if ($remaining -le 0) { $s.codeText.Text = ''; $s.codeId = ''; $s.codeStatus.Text = 'Code window expired. No new code was generated.' }
-                    elseif (-not $s.healthy) { $s.codeText.Text = ''; $s.codeStatus.Text = 'Disconnected; cancellation unconfirmed. Server expiry remains in effect.' }
-                    else { $s.codeStatus.Text = 'Expires in ' + [Math]::Ceiling($remaining / 1000) + ' seconds. Pairing saves access until revoked.' }
-                }
                 if ($null -ne $s.phone -and $s.phoneUrl) {
                     $remaining = $s.phoneDeadline - $s.clock.ElapsedMilliseconds
                     if ($remaining -le 0) { Clear-Phone }
@@ -588,24 +551,7 @@ function Step-GuiSmoke {
             if ($s.applyTransport.Enabled) { $s.applyTransport.PerformClick(); $s.smokeStage = 12 }
         }
         12 {
-            if (-not $s.activeSlowHttp -and -not $s.busy -and $s.codeNew.Enabled) {
-                $s.codeNew.PerformClick(); $s.smokeStage = 13
-            }
-        }
-        13 {
-            if ($s.codeText.Text -ceq 'ABC' -and $s.codeCancel.Enabled -and -not $s.busy) {
-                if ($s.codeDeadline - $s.clock.ElapsedMilliseconds -gt 60000) { throw 'Code countdown exceeds 60 seconds.' }
-                $s.codeCancel.PerformClick(); $s.smokeStage = 14
-            }
-        }
-        14 {
-            if (-not $s.codeId -and -not $s.busy -and $s.fixtureEvents.Contains('code-cancelled')) {
-                Handle-UiEvent @{ kind = 'code-window'; value = @{ id = 'expired-fixture'; code = 'XYZ'; remainingMs = 0 } }
-                $s.smokeStage = 15
-            }
-        }
-        15 {
-            if (-not $s.codeId -and -not $s.codeText.Text) { Request-RapQuit; $s.smokeStage = 7 }
+            if (-not $s.activeSlowHttp -and -not $s.busy) { Request-RapQuit; $s.smokeStage = 7 }
         }
     }
 }
@@ -615,11 +561,11 @@ function Assert-GuiSmoke {
     if ($s.failed -or $s.smokeStage -ne 7 -or $s.smokeOpens -ne 1 -or $s.smokePhones -ne 1 -or
         $s.fixtureEvents.Contains('approve') -or -not $s.fixtureEvents.Contains('reject') -or -not $s.fixtureEvents.Contains('disconnected') -or
         -not $s.fixtureEvents.Contains('enrollment-confirmed') -or -not $s.fixtureEvents.Contains('consent-denied') -or -not $s.fixtureEvents.Contains('consent-granted') -or
-        -not $s.fixtureEvents.Contains('code-created') -or -not $s.fixtureEvents.Contains('code-cancelled') -or $s.smokeConsentTicks -lt 10) {
+        $s.smokeConsentTicks -lt 10) {
         throw ('GUI fixture smoke checks failed: stage=' + $s.smokeStage + ', failed=' + $s.failed +
             ', opens=' + $s.smokeOpens + ', phones=' + $s.smokePhones + ', fixture=' + ($s.fixtureEvents -join ','))
     }
-    Write-Host 'PASS GUI: STA form/tray, guided enrollment, consent, responsive UI, desktop/phone pairing, explicit code window/countdown/cancel/expiry, advanced transport radio selection with explicit Apply and import guard, duplicate activation and graceful shutdown.'
+    Write-Host 'PASS GUI: STA form/tray, guided enrollment, consent, responsive UI, desktop/phone pairing, advanced transport radio selection with explicit Apply and import guard, duplicate activation and graceful shutdown.'
 }
 
 if (-not $LibraryOnly) {

@@ -2,13 +2,12 @@ import './style.css'
 import { captureGroups, allPoints, finishCapture, type Collection, type CaptureGroup, type Point, type ShapeType } from './capture-groups'
 import { layerPalette, isLayerColor } from './layer-palette'
 import { SettledPosition } from './settled-position'
-import { RelayClient, RelayRequestError, loadIdentity, saveIdentity, browserLink, exchangeBrowserLink, relayBaseUrl, parseJob, type BrowserLink } from './relay'
+import { RelayClient, RelayRequestError, loadIdentity, saveIdentity, browserLink, exchangeBrowserLink, parseJob, type BrowserLink } from './relay'
 import { appendCollectionPrimitives, primitiveBounds, hasEnoughPoints, serializeSvg, buildDelta, fmt, type BuiltSvg, type Primitive } from './geometry'
 import { LIVE_QUEUE_LIMIT, emptyLiveQueue, makeUpdate, enqueue, recordOutcome, parseLiveQueue, type LiveUpdate, type ImportTarget, type LiveQueue } from './live-updates'
 import { openImportStream, type ImportResult } from './import-stream'
 import { LiveHandover, HANDOVER_TIMEOUT_MS, type LiveHandoverState } from './live-handover'
 import { setupOnboarding, HOSTED_RELAY } from './onboarding'
-import { setupCodePairing } from './code-pairing'
 
 interface LivePosition {
   x: number
@@ -93,18 +92,15 @@ app.innerHTML = `
       </select>
     </label>
     <section id="relayConnection">
-      <p class="hint">Need RAP? Use Get started for the Windows download and setup steps. Already set up? Double-click RAP to open this computer's app; for a phone use Pair phone in RAP and approve its phrase. For QR/link pairing, capture control is automatic when available.</p>
-      <details><summary>Existing QR/link or manual pairing</summary>
-      <label>Relay API URL<input id="relayUrl" type="url" value="${HOSTED_RELAY}" /></label>
-      <label>Relay ID<input id="relayId" /></label>
-      <label>Pairing invitation<input id="relayInvitation" type="password" autocomplete="off" /></label>
+      <p class="hint">Open this browser using Open PathPlotter in RAP. For a phone, choose Pair phone in RAP and scan its QR or open its link, then compare and approve the phrase in RAP. The link contains all pairing details. Saved browsers can reconnect below; capture control is automatic when available.</p>
       <div class="row">
-        <button id="pairRelayBtn" class="primary">Pair</button>
+        <button id="pairRelayBtn" class="primary">Reconnect saved browser</button>
       </div>
       <p id="relayMessage" role="status"></p>
-      </details>
       <details>
         <summary>Advanced / recovery</summary>
+        <label>Saved relay API URL<input id="relayUrl" type="url" value="${HOSTED_RELAY}" readonly /></label>
+        <label>Saved relay ID<input id="relayId" readonly /></label>
         <p class="hint">Only needed when changing workspace, recovering an interrupted import, or removing this browser's connection. These actions never move points or resend artwork.</p>
         <div class="row">
         <button id="unlinkRelayBtn">Unlink this browser</button>
@@ -677,10 +673,10 @@ function requireRelayContext(): string {
   return key
 }
 
-function attachRelay(identity: NonNullable<ReturnType<typeof loadIdentity>>, automaticControl = true): void {
+function attachRelay(identity: NonNullable<ReturnType<typeof loadIdentity>>): void {
   const transport = relay?.connectionType ?? 'socket'
   relay?.stop()
-  relay = new RelayClient(identity, relayChanged, transport, automaticControl)
+  relay = new RelayClient(identity, relayChanged, transport)
   must<HTMLInputElement>('relayUrl').value = identity.baseUrl
   must<HTMLInputElement>('relayId').value = identity.relayId
   if (mode === 'relay') relay.start()
@@ -697,25 +693,6 @@ modeInput.addEventListener('change', () => {
   mode = nextMode
   ++pairingEpoch
   updateConnectionMode()
-})
-setupCodePairing({
-  container: must<HTMLElement>('relayConnection'),
-  dialog: must<HTMLDialogElement>('connectionDialog'),
-  begin: () => {
-    if (mode !== 'relay' || endingSession || connectionInFlight || requestInFlight || uploadInFlight || liveOwnsWork() ||
-        pendingImport || handoverPending || handoverStopping || otherTabOwnsLive) throw new Error('Finish or reconcile current work before code pairing.')
-    if ((relay || loadIdentity()) && !window.confirm('Pair this browser using a RAP code? Its saved connection may be replaced. Existing points will not be transformed.')) return null
-    connectionInFlight = true
-    const epoch = ++pairingEpoch
-    return () => epoch === pairingEpoch && mode === 'relay' && must<HTMLDialogElement>('connectionDialog').open
-  },
-  connected: identity => {
-    sessionEnded = false
-    attachRelay(identity, false)
-    setStatus('Browser paired. Use Take control when ready; existing capture control is unchanged.')
-    renderControls()
-  },
-  finished: () => { connectionInFlight = false; renderControls() },
 })
 async function connectBrowserLink(link: BrowserLink, requestControl = false): Promise<void> {
   const button = must<HTMLButtonElement>('pairRelayBtn')
@@ -740,7 +717,6 @@ async function connectBrowserLink(link: BrowserLink, requestControl = false): Pr
     if (!identity || epoch !== pairingEpoch) return
     saveIdentity(identity)
     attachRelay(identity)
-    must<HTMLInputElement>('relayInvitation').value = ''
     message.textContent = 'Connected to RAP. See the capture status for any remaining steps.'
     setStatus('Connected to RAP.')
     if (requestControl) {
@@ -750,7 +726,7 @@ async function connectBrowserLink(link: BrowserLink, requestControl = false): Pr
         await new Promise(resolve => window.setTimeout(resolve, 100))
       }
       if (epoch !== pairingEpoch || client !== relay) return
-      if (!client?.isOnline()) throw new Error('Paired, but RAP is offline. Check LightBurn and RAP, then click Pair again.')
+      if (!client?.isOnline()) throw new Error('Paired, but RAP is offline. Check LightBurn and RAP, then click Reconnect saved browser.')
       if (!client.activeBrowser && !await takeCaptureControl()) return
     }
     must<HTMLDialogElement>('connectionDialog').close()
@@ -763,26 +739,23 @@ must<HTMLButtonElement>('pairRelayBtn').addEventListener('click', async () => {
     if (endingSession) return
     if (connectionInFlight) throw new Error('Wait for the current connection request.')
     if (sessionEnded) { sessionEnded = false; relay?.start(); renderControls() }
-    const baseUrl = relayBaseUrl(must<HTMLInputElement>('relayUrl').value)
-    const relayId = must<HTMLInputElement>('relayId').value.trim()
-    const token = must<HTMLInputElement>('relayInvitation').value.trim()
-    if (relay && relay.identity.baseUrl === baseUrl && relay.identity.relayId === relayId && !token) {
-      button.disabled = true
-      must<HTMLDialogElement>('connectionDialog').close()
-      if (!await takeLiveOwnership()) await takeCaptureControl()
-      return
+    if (!relay) {
+      const identity = loadIdentity()
+      if (!identity) throw new Error('Open PathPlotter from RAP, or scan the Pair phone QR/open its link to pair this browser first.')
+      attachRelay(identity)
     }
-    if (!relayId || !token) throw new Error('Enter a relay ID and invitation, or open the link from RAP.')
-    await connectBrowserLink({ baseUrl, relayId, token, kind: 'phone' }, true)
+    button.disabled = true
+    must<HTMLDialogElement>('connectionDialog').close()
+    if (!await takeLiveOwnership()) await takeCaptureControl()
   } catch (error) { setStatus(errorToMessage(error)) }
   finally { button.disabled = false }
 })
 async function takeCaptureControl(): Promise<boolean> {
   try {
-    if (sessionEnded || endingSession) throw new Error('Session ended. Use Connection > Pair to reconnect.')
+    if (sessionEnded || endingSession) throw new Error('Session ended. Use Connection > Reconnect saved browser.')
     if (!relay) throw new Error('Pair with RAP first.')
     if (relay.activeBrowser && relay.canCapture()) { setStatus('Already paired and ready to capture.'); return true }
-    if (!relay.isOnline() || !relay.snapshot?.context) throw new Error('RAP is offline or its workspace is unavailable. Check LightBurn and RAP, then click Pair again.')
+    if (!relay.isOnline() || !relay.snapshot?.context) throw new Error('RAP is offline or its workspace is unavailable. Check LightBurn and RAP, then click Reconnect saved browser.')
     if (uploadInFlight || liveDispatching || liveRecoveryInFlight) throw new Error('Wait for the import result before requesting control.')
     const takeover = relay.controlOccupied
     if (takeover && !window.confirm('Take capture control from the other browser? Its capture stops; pending or unresolved imports must be reconciled first.')) return false
@@ -844,7 +817,7 @@ must<HTMLButtonElement>('unlinkRelayBtn').addEventListener('click', async () => 
     relay?.stop()
     relay = null
     updateConnectionMode()
-    must<HTMLParagraphElement>('relayMessage').textContent = 'Unlinked locally. Pair again to reconnect.'
+    must<HTMLParagraphElement>('relayMessage').textContent = 'Unlinked locally. Open a new RAP link or scan its Pair phone QR to pair again.'
   } catch (error) { setStatus(errorToMessage(error)) }
 })
 must<HTMLButtonElement>('revalidateBtn').addEventListener('click', () => {
@@ -969,7 +942,6 @@ function consumePairingLink(): boolean {
     modeInput.value = mode
     must<HTMLInputElement>('relayUrl').value = link.baseUrl
     must<HTMLInputElement>('relayId').value = link.relayId
-    must<HTMLInputElement>('relayInvitation').value = link.kind === 'phone' ? link.token : ''
     updateConnectionMode()
     const dialog = must<HTMLDialogElement>('connectionDialog')
     if (!dialog.open) dialog.showModal()

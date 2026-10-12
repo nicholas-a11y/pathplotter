@@ -63,7 +63,6 @@ function Invoke-AgentWork($Result, [switch]$FreshRequest) {
     if ($FreshRequest -or $script:PreviewActive -ne $Result.previewActive) { $script:ForcePublish = $true }
     $script:PreviewActive = $Result.previewActive
     Show-PendingPairings $Result.pairings
-    if (Test-Field $Result 'codePairing') { Show-CodePairing (Get-Field $Result 'codePairing') }
     if ($null -ne $Result.job) { Invoke-Import $Result.job (Get-Observation) }
 }
 
@@ -166,9 +165,6 @@ function Complete-Enrollment($Pending) {
 }
 
 function Publish-RapHealth([string]$Message, [bool]$Connected) { }
-function Show-CodePairing($State) {
-    if ($null -ne $State) { Write-Verbose ('Code pairing: ' + (Get-Field $State 'status')) }
-}
 
 function Get-Field($Object, [string]$Name) {
     if ($null -eq $Object) { return $null }

@@ -187,23 +187,13 @@ No automatic LightBurn pairing is performed on authorization failure. Check
 the Windows clock, API capability grants, and which LightBurn copy has focus.
 Use `forget-lightburn` and restart only when you intend to pair again.
 
-## Optional website-first code pairing
+## Browser pairing
 
-The status window offers **Allow code pairing** while RAP is healthy and no import is active. The operator must first enable `CODE_PAIRING_ENABLED="true"` on the relay; it is off by default. Browser code pairing does not require Turnstile. This is separate from transport settings and guided computer enrollment, which still uses verification.
+Use **Open PathPlotter** for this computer's browser. For a phone or another browser, choose **Pair phone**, scan its QR or open/copy its link, compare the phrase and approve in RAP. The links contain the relay address and temporary authorization information; no three-letter code or manual entry is needed.
 
-1. On the static website, choose **Connection > Cloud relay (RAP) > Start code pairing**.
-2. In RAP, explicitly choose **Allow code pairing**.
-3. Enter the displayed three letters in the website within the **60-second** countdown. No relay ID or QR is needed.
-4. Compare the browser's phrase with the request in RAP and **Approve**, or **Reject** an unwanted request. The request expires two minutes after submission. No access is granted until approval; RAP must still be healthy, idle and in the same session generation.
-5. The website checks approval automatically every seven seconds. An approved browser retains access until revoked through **Connected browsers**. Capture-control takeover remains a separate explicit browser action.
+Browser pairing does not require Turnstile. Guided registration of a new RAP computer is separate and still requires its enrollment configuration or an operator invitation.
 
-**A code alone never grants access.** Someone who guesses it can consume the window and create an unwanted approval request. Reject any phrase that does not match your own browser. Strict limits remain in place, and this does not prove the browser is on the same LAN. **Pair phone** with its longer random invitation remains available.
-
-**Cancel code** closes an unclaimed window. Once a request appears, use **Reject**; approved access must be revoked separately. Expiry does not renew the code. RAP hides codes when disconnected and attempts cancellation of open windows on disconnect/orderly quit; failure to reach the relay cannot guarantee immediate cancellation, so server expiry still applies. Closing the status window merely hides RAP in the tray and is not Quit.
-
-If issuance is interrupted, explicitly retry **Allow code pairing** to recover the same window within its lifetime. If the browser loses a reply, use its **Recover pairing**, not the short code again. Recovery lasts two minutes after acceptance. Existing QR/desktop links and saved pairing remain unchanged.
-
-Service admission is limited to five live windows globally, three initial submissions/IP/minute and ten globally/minute; new windows are separately capped at three/RAP and thirty globally per rolling ten minutes. Limits can temporarily block legitimate users. No code is automatically issued on startup or reconnect.
+Saved browser access remains valid until revoked through **Connected browsers**. Closing the status window merely hides RAP in the tray and is not Quit. Existing registrations and already-approved browser credentials are preserved when upgrading.
 
 ## Import safety and limitations
 

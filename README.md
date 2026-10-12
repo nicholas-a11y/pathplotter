@@ -77,24 +77,9 @@ The website cannot detect, install or silently start RAP. **Get started** provid
 
 QR/link pairing always requires desktop approval. Do not share pairing links or screenshots of the QR code.
 
-### Website-first pairing with three letters (optional)
+New browsers must open **Open PathPlotter** from RAP, or scan/open the QR/link from **Pair phone**. These links contain all pairing details; there are no short codes or manual relay/invitation fields. Phone QR/link requests still require matching-phrase approval in RAP. Browser pairing does not require Turnstile; guided enrollment of new computers still does.
 
-1. Open PathPlotter in your browser and choose **Connection > Cloud relay (RAP)**.
-2. Choose **Start code pairing** to check availability.
-3. In the healthy, idle RAP status window, choose **Allow code pairing**.
-4. Enter its three letters within **60 seconds** and choose **Connect with code**. Case does not matter; no relay ID or QR is needed.
-5. Compare the phrase shown in the browser with RAP's approval request, then **Approve** in RAP. Approval must happen within two minutes of submission. The website checks automatically every seven seconds while Connection remains open.
-6. Use **Take control** when ready; code pairing never takes control from another browser automatically.
-
-This feature is **operator-disabled by default**. Enable `CODE_PAIRING_ENABLED="true"` on the relay; Turnstile is not needed for browser code pairing. Guided enrollment of new computers still uses Turnstile. Both devices require internet, not necessarily the same Wi-Fi. It is not LAN discovery. A guessed code can consume the window and create an unwanted request, but **never grants access without approval in RAP**. Only approve the phrase displayed by your own browser. Approved access stays saved until revoked.
-
-There are at most five live code windows across the service, three submissions per IP per rolling minute and ten submissions per rolling minute globally. Busy/rate-limited messages are explicit; wait or use the existing QR/link method. RAP also limits new windows and never renews them automatically.
-
-**Cancel code** stops an unclaimed window. Once a request appears, **Reject** it in RAP to refuse access. Already-approved access must be revoked through RAP's **Connected browsers** instead. Closing/disconnecting RAP attempts cancellation of its open window, but on network failure server expiry remains the final bound. A completed pairing is not revoked by closing RAP or using **End session**.
-
-If a response is lost or Connection is closed, **Recover pairing** uses the saved private request and resumes waiting rather than trying the code again. Approval/recovery expires two minutes after acceptance; checks are at least five seconds apart. Do not discard recovery unless prepared to review/revoke any approved browser grant in RAP. Points and the previous connection are preserved if pairing fails.
-
-The browser's **Connection > Existing QR/link or manual pairing** section still supports the relay URL, relay ID and invitation. Its **Pair** button pairs and requests capture control. An already paired browser can use **Pair** without another invitation. Saved same-RAP authorization is reused; reopening a same-RAP link closes Connection immediately and puts any outstanding-work reminder in the main status area.
+An already paired browser can use **Connection > Reconnect saved browser** without another invitation. Saved same-RAP authorization is reused; reopening a same-RAP link closes Connection immediately and puts any outstanding-work reminder in the main status area. Browser access remains saved until revoked through RAP's **Connected browsers**; **End session** does not revoke it.
 
 For detailed startup, tray controls and credential recovery, see [RAP instructions](rap/README.md).
 
@@ -188,7 +173,7 @@ The capture status and hint show the actual blocking reason; pairing successfull
 | Situation | What to do |
 | --- | --- |
 | Waiting for fresh coordinates | Check RAP, LightBurn and the machine connection; return the browser to the foreground and wait for fresh data. |
-| Another browser has capture control | Use **Take control**, or **Connection > Pair**, and confirm. Another browser's unresolved imports must be reconciled first. |
+| Another browser has capture control | Use **Take control**, or **Connection > Reconnect saved browser**, and confirm. Another browser's unresolved imports must be reconciled first. |
 | Workspace confirmation needed | If saved points truly belong to this machine and workpiece origin, use **Connection > Advanced / recovery > Confirm workspace for existing points**. Otherwise export a session backup and clear the old points. |
 | Capture finished | Click **Resume** to start the next group. |
 | Finish disabled, but the summary shows points | The summary counts all groups. Finish needs enough points in the **current** group; older finished groups do not count. |
@@ -205,7 +190,7 @@ The app then attempts to close the tab. Browsers and LightBurn's embedded browse
 
 Only one browser holds relay capture control at a time. An explicit takeover stops the previous browser from capturing; it does not automatically take control back.
 
-For Live update tabs in the **same browser profile and site**, click **Pair** or enable Live update in the tab you want to use. The old owner stops new captures and subsequent imports, settles its current operation, saves the queue and releases its exclusive lock. The new tab checks the original destination/workspace before continuing safe unsent work; live capture continues if it was enabled.
+For Live update tabs in the **same browser profile and site**, click **Reconnect saved browser** or enable Live update in the tab you want to use. The old owner stops new captures and subsequent imports, settles its current operation, saves the queue and releases its exclusive lock. The new tab checks the original destination/workspace before continuing safe unsent work; live capture continues if it was enabled.
 
 The old tab stays open but read-only with Live update off. Simply opening a tab or switching focus does not request takeover. Paused/unknown work stays paused and submitted artwork is never automatically resent. If transfer times out, inspect LightBurn before closing the old tab and recovering saved work. This cooperative handover needs Web Locks and BroadcastChannel; it does not transfer collections or queues between devices or profiles.
 

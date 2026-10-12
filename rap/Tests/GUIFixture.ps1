@@ -44,15 +44,6 @@ function Invoke-Cloud([string]$Path, $Body = @{}, [string]$Method = 'POST') {
         }
         '/agent/browser-launch' { return @{ launchToken = 'fixture-launch-never-display'; expiresAt = $now + 60000 } }
         '/pairing/new' { return @{ invitation = 'fixture-phone'; expiresAt = $now + 300000 } }
-        '/agent/code/new' {
-            if ($null -ne $script:ActiveImport) { throw 'Code window issued during an import.' }
-            Send-Ui 'fixture' 'code-created'
-            return @{ id = $Body.requestId; code = 'ABC'; expiresAt = $now + 60000; serverTime = $now; status = 'waiting' }
-        }
-        '/agent/code/cancel' {
-            Send-Ui 'fixture' 'code-cancelled'
-            return @{ id = $Body.requestId; status = 'cancelled' }
-        }
         '/pairing/decide' {
             if ($Body.pairingId -cne 'fixture-pair') { throw 'Wrong pairing target.' }
             if ($Body.approve) { Send-Ui 'fixture' 'approve' }

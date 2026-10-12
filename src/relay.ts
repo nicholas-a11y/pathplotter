@@ -230,7 +230,6 @@ export class RelayClient {
   private healthMonotonic = -Infinity
   private online = false
   private transport: 'socket' | 'http'
-  private automaticControl: boolean
   private reconnectDelay = 1000
   private pendingRead: { id: string; epoch: number; started: number; resolve: (snapshot: RelaySnapshot) => void; reject: (error: Error) => void; timer: ReturnType<typeof setTimeout> } | null = null
   settled = false
@@ -239,11 +238,10 @@ export class RelayClient {
   private observedJob: RelayJob | null = null
   private jobListeners = new Set<() => void>()
 
-  constructor(identity: RelayIdentity, changed: () => void, transport: 'socket' | 'http' = 'socket', automaticControl = true) {
+  constructor(identity: RelayIdentity, changed: () => void, transport: 'socket' | 'http' = 'socket') {
     this.identity = identity
     this.changed = changed
     this.transport = transport
-    this.automaticControl = automaticControl
   }
 
   request(path: string, body?: unknown): Promise<unknown> {
@@ -286,7 +284,7 @@ export class RelayClient {
   start(): void {
     if (this.running) return
     this.running = true
-    this.autoClaimPending = this.automaticControl && !this.controlLost
+    this.autoClaimPending = !this.controlLost
     const epoch = ++this.epoch
     if (this.transport === 'socket') {
       void this.connectSocket(epoch)
