@@ -57,7 +57,7 @@ This is an explicit connection option, not automatic embedded-browser detection.
 1. Open **Get started** in the web app and choose **Find Windows download**, or visit [public releases](https://github.com/nicholas-a11y/pathplotter/releases). Download **PathPlotter-RAP-Windows.zip** from a compatible `rap-v2.*` release. Extract the complete ZIP somewhere writable; do not run it from inside the ZIP. If no compatible release is published, the guide says so rather than offering an older connector.
 2. Open LightBurn and enable its REST API in **Settings > Extensions**. Leave network API access off.
 3. Double-click **Start RAP.cmd**. **Start RAP.vbs** is an alternative that avoids the brief command-window flash.
-4. Use RAP's guided setup. Compare its computer name and setup phrase with the opened browser, enter the enrollment code and complete verification. Approval authorizes only that matching RAP; the browser does not receive its agent credentials. Alternatively use an operator-issued registration invitation.
+4. Paste your operator-issued registration invitation into RAP's **Operator invitation** field and choose **Register this computer**. Each invitation registers one computer and batch invitations expire after seven days. If your operator has enabled guided setup instead, leave the invitation blank, compare its computer name/phrase with the opened browser, enter the enrollment code and complete verification.
 5. Click **Request local LightBurn permission**. Bring LightBurn to the foreground and approve its permission dialog within 30 seconds.
 6. Once RAP is ready, it opens PathPlotter automatically. Desktop authorization and capture control are automatic when control is free.
 

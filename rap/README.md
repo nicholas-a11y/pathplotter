@@ -14,7 +14,8 @@ and the Windows .NET Framework are used.
    flash). RAP starts a small Windows Forms status window and tray icon, with no
    everyday console. A second launch activates the existing status window.
 2. On first use, choose a computer name and **Register this computer**. The
-   current relay is prefilled; leave the invitation blank for guided browser
+   current relay is prefilled. If given an individual invitation, paste it into
+   **Operator invitation** before registering. Otherwise leave it blank for guided browser
    enrollment. RAP opens the hosted setup page and displays a comparison phrase.
    Verify the exact phrase for this computer, complete the browser verification
    and explicitly approve there, then confirm the matching phrase in RAP.
@@ -84,6 +85,24 @@ New registrations default to `https://pathplotter-relay-v2.nicholas-leqeta.worke
 Finish/reconcile any pending import first. In the tray menu choose **Forget local registration...** and confirm, then restart the updated RAP. This preserves the import journal but removes local relay and LightBurn credentials. Revoke the old RAP permission in LightBurn's **Manage API Security**, then request and approve local permission again when prompted.
 
 The v2 relay initially uses operator invitations, not guided enrollment. Set a fresh private `BOOTSTRAP_TOKEN` secret on `pathplotter-relay-v2`, enter that same value in RAP's **Operator invitation** field, and choose **Register this computer**. A value registers only one computer; replace it before registering another. Browser pairing still uses **Open PathPlotter** or **Pair phone**, never the operator secret.
+
+### Operator batch invitations
+
+For several people, use **Operator-Invitations.ps1** instead of rotating bootstrap secrets. Deploy the updated relay first and set its private `OPERATOR_ADMIN_TOKEN` secret once. Only the operator needs this tool or admin secret; users receive individual invitations.
+
+From the extracted RAP folder in Windows PowerShell 5.1:
+
+```powershell
+.\Operator-Invitations.ps1 -Action Generate -Count 10 -Label 'October group'
+.\Operator-Invitations.ps1 -Action List
+.\Operator-Invitations.ps1 -Action Cancel -InvitationId 'paste-the-id-from-List'
+```
+
+Each command prompts for the admin secret with hidden input. It is sent only in an HTTPS authorization header, never saved or included in a URL. An explicit `-Relay` HTTPS origin override is available for an operator-managed relay. Generate accepts 1-20 invitations per batch, defaulting to 10; each expires after **seven days** and registers **one computer**. Hand each person just their `Invitation` value to paste into RAP's **Operator invitation** field. They then register and approve LightBurn's local permission normally.
+
+Generation displays secrets once in your private terminal. Do not use PowerShell transcripts, recordings or shared terminals, and store handouts securely. List shows IDs, labels, batches, expiry and status but never the secrets. Cancellation requires the invitation **ID**, not its secret value, and cannot revoke already-registered computers. If generation times out, List identifies the uncertain batch by label/time so you can cancel it before generating replacements. The tool never automatically retries generation.
+
+The service permits 100 outstanding unused invitations, five operator requests/IP/minute, and 50 registered computers total. Invites do not reserve slots. Metadata remains available until 30 days after expiry; very large histories explicitly report a truncated list.
 
 Use **Start RAP diagnostics.cmd** for the original typed console workflow.
 Quit the tray instance before starting diagnostics (both retain the same durable

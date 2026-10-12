@@ -87,14 +87,14 @@ export function setupOnboarding(options: { fallback: () => void; sockets: () => 
       <ol>
         <li>Download the ZIP and extract the complete folder somewhere writable. Do not run it inside the ZIP.</li>
         <li>Open LightBurn. Enable REST API in Settings &gt; Extensions; keep Allow API Access From Network off.</li>
-        <li>Double-click <strong>Start RAP.cmd</strong>. Choose guided setup, compare its setup phrase with the browser, enter the enrollment code and complete verification.</li>
+        <li>Double-click <strong>Start RAP.cmd</strong>. Paste your operator-issued invitation into <strong>Operator invitation</strong> and register. If guided enrollment is enabled instead, leave the invitation blank, compare its setup phrase with the browser, enter the enrollment code and complete verification.</li>
         <li>In RAP, request local LightBurn permission. Bring LightBurn forward and approve within 30 seconds.</li>
         <li>RAP opens PathPlotter when ready. Choose Capture settings, position the head using normal controls, then Capture point.</li>
       </ol>
       <p class="hint">No administrator access or extra runtime installation is normally needed. This page cannot install or start RAP automatically. If Windows or your organization blocks scripts, follow its approved procedure; do not disable protections.</p>
     </section>
     <section><h3>Connect a phone or another browser</h3><p>Start RAP on the Windows LightBurn computer. Choose <strong>Open PathPlotter</strong> for that computer's browser. For a phone or another browser, choose <strong>Pair phone</strong>, scan its QR or open its private link, compare the phrase, then approve in RAP. The link contains all pairing details; no manual codes are needed. Both devices need internet, but not the same Wi-Fi. Browser access stays saved until revoked in RAP.</p></section>
-    <section><h3>Already set up?</h3><p>Use <strong>Open PathPlotter</strong> in RAP, or Pair in Connection. A disconnected browser cannot tell whether RAP is missing or just offline. Check RAP, LightBurn and your network first.</p></section>
+    <section><h3>Already set up?</h3><p>Use <strong>Open PathPlotter</strong> in RAP, or Reconnect saved browser in Connection. A disconnected browser cannot tell whether RAP is missing or just offline. Check RAP, LightBurn and your network first.</p></section>
     <section id="enrollSection" hidden>
       <h3>Authorize this RAP setup</h3><p id="enrollDescription"></p>
       <label class="check"><input id="enrollMatch" type="checkbox"> This computer name and phrase match the setup shown in RAP.</label>

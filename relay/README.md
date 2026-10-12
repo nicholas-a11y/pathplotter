@@ -15,6 +15,26 @@ npx wrangler deploy --config .\wrangler.jsonc --keep-vars
 
 Operator registration requires a private `BOOTSTRAP_TOKEN` Worker secret. Set it in the Cloudflare dashboard or using `npx wrangler secret put BOOTSTRAP_TOKEN`; never put the value in a command argument or chat. Each invitation is single-use. Replace it with a new random value before registering another computer. Guided enrollment remains unavailable unless separately configured below.
 
+### Batch invitations (preferred for several people)
+
+Configure **one** private random `OPERATOR_ADMIN_TOKEN` secret of at least 32 characters. This is separate from all registration invitations and must never be handed out. After deploying this version:
+
+```powershell
+npx wrangler secret put OPERATOR_ADMIN_TOKEN
+```
+
+Use the private PowerShell tool described in [RAP operator instructions](../rap/README.md#operator-batch-invitations) to generate, list and cancel invitations. Users paste their individual invitation into RAP's existing **Operator invitation** field; no RAP protocol update is required.
+
+The operator-only API has no browser access:
+
+- Bearer-authenticated `POST /v1/operator/invitations {count,label}` creates 1-20 invitations, all expiring seven days after creation. Response contains `batchId` and `{id,batchId,label,createdAt,expiresAt,status,token}` per invitation. Tokens are cryptographically random 256-bit values and returned only on creation; only hashes are stored.
+- `GET /v1/operator/invitations` returns metadata/status, never token values. Status is `unused`, `used`, `expired` or `cancelled`. Metadata expires 30 days after invitation expiry; listing returns the latest 1000 records and an explicit `truncated` flag.
+- `POST /v1/operator/invitations/:id/cancel {}` idempotently cancels an unused invitation. Used invitations return `409`; cancellation is not revocation of a registered RAP.
+- All operator routes reject any `Origin` header. Operator attempts are capped at five/IP/minute, including failed authorization, independently of registration's five/IP/minute limit. At most 100 unexpired, unused invitations may be outstanding. The existing 50-computer service capacity is unchanged; invitations do not reserve registration slots.
+- `/v1/register` atomically validates expiry/cancellation and consumes each batch invitation once, even under concurrent requests. Legacy `BOOTSTRAP_TOKEN` remains available but is no longer needed for batches.
+
+Creation is not automatically retried. If its response is lost, list recent batches by label/time, cancel the uncertain invitations and generate replacements. Plaintext invitations cannot be recovered from the relay. Registration reply loss can consume an invitation without delivering a RAP credential; issue a replacement after checking the setup rather than repeatedly retrying the same consumed value.
+
 ## Local development and checks
 
 ```powershell

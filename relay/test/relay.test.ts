@@ -17,6 +17,144 @@ type Browser = { pairingId: string; pendingToken: string; phrase: string; creden
 const testSockets = new Map<string, { socket: WebSocket; last: number }>();
 const testRelays: string[] = [];
 
+describe("operator batch invitations", () => {
+  const admin = "test-operator-admin-private-not-production-123";
+  type Invitation = { id: string; token: string; status: string; expiresAt: number };
+  function runtime(): TestBindings {
+    const cp = env.CONTROL_PLANE.getByName(`operator-tests-${crypto.randomUUID()}`);
+    return Object.assign(bindings(""), { OPERATOR_ADMIN_TOKEN: admin, CONTROL_PLANE: { getByName: () => cp } });
+  }
+  async function batch(env: TestBindings, count = 3) {
+    const response = await call("/v1/operator/invitations", {
+      credential: admin, origin: null, bindings: env, body: { count, label: "Test group" },
+    });
+    expect(response.status).toBe(201);
+    return json<{ batchId: string; invitations: Invitation[] }>(response);
+  }
+  async function redeem(env: TestBindings, token: string, ip?: string) {
+    return call("/v1/register", { bindings: env, ip, body: { bootstrapToken: token, name: "Invited PC" } });
+  }
+
+  it("requires separate admin authorization, denies browser use and bounds batches", async () => {
+    const env = runtime();
+    for (const credential of [undefined, "wrong-admin", "a".repeat(43)]) {
+      const response = await call("/v1/operator/invitations", { credential, origin: null, bindings: env });
+      expect(response.status).toBe(401); await response.text();
+    }
+    expect((await call("/v1/operator/invitations", { credential: admin, bindings: env })).status).toBe(403);
+    for (const count of [0, 21, 1.5, "3"]) {
+      expect((await call("/v1/operator/invitations", { credential: admin, origin: null, bindings: env, body: { count, label: "" } })).status).toBe(400);
+    }
+    const disabled = await call("/v1/operator/invitations", { credential: admin, origin: null, bindings: bindings("") });
+    expect(disabled.status).toBe(503);
+    expect((await redeem(env, admin)).status).toBe(401);
+    const missing = await call(`/v1/operator/invitations/${crypto.randomUUID()}/cancel`, { origin: null, credential: admin, bindings: env, body: {} });
+    expect(missing.status).toBe(404); await missing.text();
+  });
+
+  it("generates unique 256-bit invitations with seven-day expiry and stores only hashes", async () => {
+    const env = runtime(), result = await batch(env);
+    expect(result.invitations).toHaveLength(3);
+    expect(new Set(result.invitations.map((i) => i.token)).size).toBe(3);
+    for (const invitation of result.invitations) {
+      expect(invitation.token).toMatch(/^[A-Za-z0-9_-]{43}$/u);
+      expect(invitation.expiresAt - Date.now()).toBeGreaterThan(7 * 86400000 - 5000);
+      expect(invitation.expiresAt - Date.now()).toBeLessThanOrEqual(7 * 86400000);
+    }
+    const stub = env.CONTROL_PLANE.getByName("registration-control");
+    await runInDurableObject(stub, (_instance, state) => {
+      const rows = state.storage.sql.exec("SELECT * FROM operator_invitations WHERE batch_id=?", result.batchId).toArray();
+      expect(rows).toHaveLength(3);
+      for (const invitation of result.invitations) expect(JSON.stringify(rows)).not.toContain(invitation.token);
+    });
+    await evictDurableObject(stub);
+    const listed = await json<{ invitations: Invitation[] }>(await call("/v1/operator/invitations", { origin: null, credential: admin, bindings: env }));
+    expect(listed.invitations.map((i) => i.id)).toEqual(expect.arrayContaining(result.invitations.map((i) => i.id)));
+    expect(JSON.stringify(listed)).not.toContain(result.invitations[0].token);
+  });
+
+  it("atomically allows one registration and refuses cancellation of used invitations", async () => {
+    const env = runtime(), invitation = (await batch(env, 1)).invitations[0];
+    const responses = await Promise.all([redeem(env, invitation.token), redeem(env, invitation.token)]);
+    expect(responses.map((r) => r.status).sort()).toEqual([201, 409]);
+    const credentials: string[] = [];
+    for (const response of responses) {
+      const body = await json<{ relayId?: string; credential?: string }>(response);
+      if (body.relayId && body.credential) { testRelays.push(body.relayId); credentials.push(body.credential); }
+    }
+    expect(credentials[0]).toMatch(/^[A-Za-z0-9_-]{43}$/u);
+    const cancelled = await call(`/v1/operator/invitations/${invitation.id}/cancel`, { origin: null, credential: admin, bindings: env, body: {} });
+    expect(cancelled.status).toBe(409); await cancelled.text();
+    const listed = await json<{ invitations: Invitation[] }>(await call("/v1/operator/invitations", { origin: null, credential: admin, bindings: env }));
+    expect(listed.invitations.find((i) => i.id === invitation.id)?.status).toBe("used");
+  });
+
+  it("cancels unused invitations idempotently and rejects expiry without requiring alarms", async () => {
+    const env = runtime(), result = await batch(env, 2);
+    const [cancelled, expired] = result.invitations;
+    for (let i = 0; i < 2; i++) {
+      const response = await call(`/v1/operator/invitations/${cancelled.id}/cancel`, { origin: null, credential: admin, bindings: env, body: {} });
+      expect(response.status).toBe(200); await response.text();
+    }
+    expect((await redeem(env, cancelled.token)).status).toBe(401);
+    await runInDurableObject(env.CONTROL_PLANE.getByName("registration-control"), (_instance, state) => {
+      state.storage.sql.exec("UPDATE operator_invitations SET expires_at=? WHERE id=?", Date.now() - 1, expired.id);
+    });
+    expect((await redeem(env, expired.token)).status).toBe(401);
+    const listed = await json<{ invitations: Invitation[] }>(await call("/v1/operator/invitations", { origin: null, credential: admin, bindings: env }));
+    expect(listed.invitations.find((i) => i.id === cancelled.id)?.status).toBe("cancelled");
+    expect(listed.invitations.find((i) => i.id === expired.id)?.status).toBe("expired");
+  });
+
+  it("limits admin guessing and registration guessing independently", async () => {
+    const env = runtime(), ip = crypto.randomUUID();
+    const invitation = (await batch(env, 1)).invitations[0];
+    for (let i = 0; i < 5; i++) {
+      expect((await call("/v1/operator/invitations", { origin: null, credential: "wrong", bindings: env, ip })).status).toBe(401);
+    }
+    expect((await call("/v1/operator/invitations", { origin: null, credential: admin, bindings: env, ip })).status).toBe(429);
+    for (let i = 0; i < 5; i++) expect((await redeem(env, "not-an-invitation-but-long-enough", ip)).status).toBe(401);
+    expect((await redeem(env, invitation.token, ip)).status).toBe(429);
+  });
+
+  it("bounds outstanding invitations and preserves service registration capacity", async () => {
+    const env = runtime();
+    for (let i = 0; i < 5; i++) await batch(env, 20);
+    expect((await call("/v1/operator/invitations", { credential: admin, origin: null, bindings: env, body: { count: 1, label: "" } })).status).toBe(429);
+    const stub = env.CONTROL_PLANE.getByName("registration-control");
+    const listed = await json<{ invitations: Invitation[] }>(await call("/v1/operator/invitations", { credential: admin, origin: null, bindings: env }));
+    await runInDurableObject(stub, (_instance, state) => {
+      for (let i = 0; i < 50; i++) state.storage.sql.exec("INSERT INTO registered_relays VALUES (?)", crypto.randomUUID());
+    });
+    // Token metadata is hash-only; this failed registration must not consume it.
+    const hashRow = await runInDurableObject(stub, (_instance, state) => {
+      return state.storage.sql.exec<{ token_hash: string }>("SELECT token_hash FROM operator_invitations WHERE id=?", listed.invitations[0].id).one();
+    });
+    expect(await stub.consumeRegistrationAttempt(crypto.randomUUID(), hashRow.token_hash, crypto.randomUUID(), Date.now(), true)).toBe("capacity");
+  });
+
+  it("cleans old metadata but keeps permanent consumption and existing bootstrap registration", async () => {
+    const env = runtime(), invitation = (await batch(env, 1)).invitations[0];
+    const registered = await json<{ relayId: string }>(await redeem(env, invitation.token));
+    testRelays.push(registered.relayId);
+    const stub = env.CONTROL_PLANE.getByName("registration-control");
+    await runInDurableObject(stub, (_instance, state) => {
+      state.storage.sql.exec("UPDATE operator_invitations SET expires_at=? WHERE id=?", Date.now() - 31 * 86400000, invitation.id);
+    });
+    expect(await runDurableObjectAlarm(stub)).toBe(true);
+    await runInDurableObject(stub, (_instance, state) => {
+      expect(state.storage.sql.exec("SELECT id FROM operator_invitations WHERE id=?", invitation.id).toArray()).toHaveLength(0);
+      expect(state.storage.sql.exec("SELECT relay_id FROM consumed_invitations WHERE relay_id=?", registered.relayId).toArray()).toHaveLength(1);
+    });
+    const legacy = "legacy-bootstrap-not-admin-" + crypto.randomUUID();
+    env.BOOTSTRAP_TOKEN = legacy;
+    const response = await redeem(env, legacy);
+    expect(response.status).toBe(201);
+    const body = await json<{ relayId: string }>(response);
+    testRelays.push(body.relayId);
+  });
+});
+
 describe("retired code pairing", () => {
   it("returns 404 for old public and authenticated agent routes even with stale enablement", async () => {
     const agent = await startAgent(await register());

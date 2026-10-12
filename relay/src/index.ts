@@ -24,6 +24,8 @@ const LAUNCH_RATE_LIMIT = 20;
 const LAUNCH_BROWSER_LIMIT = 20;
 const LIVENESS_MS = 45_000;
 const FALLBACK_MS = 5_000;
+const INVITATION_LIFETIME_MS = 7 * 24 * 60 * 60_000;
+type OperatorInvitation = { id: string; batchId: string; label: string; createdAt: number; expiresAt: number; status: "unused" | "used" | "cancelled" | "expired" };
 type SocketIdentity = { role: "agent" | "browser"; browserId?: string; generation?: number; seen: number; lastMessage?: number; sequence?: number; watching?: boolean };
 type Capture = { browserId: string; generation: number; revision: string | null; created: number; sequence: number; observedAt: number; status: "pending" | "complete" | "failed"; body?: unknown; error?: string };
 type EnrollmentClaim = { status: "pending" } | { status: "complete"; relayId: string; credential: string };
@@ -398,6 +400,11 @@ export class ControlPlaneDO extends DurableObject<Env> {
           relay_id TEXT, wrapped_iv TEXT, wrapped_credential TEXT
         );
         CREATE TABLE IF NOT EXISTS registered_relays (relay_id TEXT PRIMARY KEY);
+        CREATE TABLE IF NOT EXISTS operator_invitations (
+          id TEXT PRIMARY KEY, batch_id TEXT NOT NULL, label TEXT NOT NULL,
+          token_hash TEXT NOT NULL UNIQUE, created_at INTEGER NOT NULL,
+          expires_at INTEGER NOT NULL, cancelled INTEGER NOT NULL DEFAULT 0
+        );
         CREATE TABLE IF NOT EXISTS code_windows (
           id TEXT PRIMARY KEY, relay_id TEXT NOT NULL, code TEXT NOT NULL UNIQUE,
           generation INTEGER NOT NULL, expires_at INTEGER NOT NULL, created_at INTEGER NOT NULL,
@@ -418,6 +425,7 @@ export class ControlPlaneDO extends DurableObject<Env> {
     this.ctx.storage.sql.exec("DELETE FROM registration_rates WHERE window_start <= ?", now - 5 * 60_000);
     this.ctx.storage.sql.exec("DELETE FROM code_windows");
     this.ctx.storage.sql.exec("DELETE FROM code_attempts");
+    this.ctx.storage.sql.exec("DELETE FROM operator_invitations WHERE expires_at <= ?", now - 30 * JOB_RETENTION_MS);
     await this.ctx.storage.setAlarm(now + 60_000);
   }
 
@@ -437,6 +445,52 @@ export class ControlPlaneDO extends DurableObject<Env> {
 
   inventory(relayId: string): void {
     this.ctx.storage.sql.exec("INSERT OR IGNORE INTO registered_relays VALUES (?)", relayId);
+  }
+
+  async invitationBatch(count: number, label: string): Promise<{ error: "invitation_capacity" } | { batchId: string; invitations: (OperatorInvitation & { token: string })[] }> {
+    const batchId = crypto.randomUUID(), now = Date.now();
+    const items = await Promise.all(Array.from({ length: count }, async () => {
+      const token = randomToken();
+      return { id: crypto.randomUUID(), token, hash: await hashToken(token) };
+    }));
+    const admitted = this.ctx.storage.transactionSync(() => {
+      const active = this.ctx.storage.sql.exec<{ n: number }>(
+        `SELECT COUNT(*) AS n FROM operator_invitations WHERE cancelled=0 AND expires_at>?
+         AND token_hash NOT IN (SELECT token_hash FROM consumed_invitations)`, now).one().n;
+      if (active + count > 100) return false;
+      for (const item of items) this.ctx.storage.sql.exec(
+        "INSERT INTO operator_invitations (id,batch_id,label,token_hash,created_at,expires_at) VALUES (?,?,?,?,?,?)",
+        item.id, batchId, label, item.hash, now, now + INVITATION_LIFETIME_MS);
+      return true;
+    });
+    if (!admitted) return { error: "invitation_capacity" };
+    return { batchId, invitations: items.map(({ id, token }) => ({
+      id, token, batchId, label, createdAt: now, expiresAt: now + INVITATION_LIFETIME_MS, status: "unused",
+    })) };
+  }
+
+  invitationList(): { invitations: OperatorInvitation[]; truncated: boolean } {
+    const rows = this.ctx.storage.sql.exec<{ id: string; batch_id: string; label: string; created_at: number; expires_at: number; cancelled: number; used: number }>(
+      `SELECT i.id,i.batch_id,i.label,i.created_at,i.expires_at,i.cancelled,
+       EXISTS(SELECT 1 FROM consumed_invitations c WHERE c.token_hash=i.token_hash) AS used
+       FROM operator_invitations i ORDER BY created_at DESC,id LIMIT 1001`).toArray();
+    const now = Date.now();
+    return { truncated: rows.length > 1000, invitations: rows.slice(0, 1000).map((row) => ({
+      id: row.id, batchId: row.batch_id, label: row.label, createdAt: row.created_at, expiresAt: row.expires_at,
+      status: row.used ? "used" : row.cancelled ? "cancelled" : row.expires_at <= now ? "expired" : "unused",
+    })) };
+  }
+
+  invitationCancel(id: string): { status: "cancelled" } | { error: "invitation_not_found" | "invitation_already_used" } {
+    return this.ctx.storage.transactionSync(() => {
+      const row = this.ctx.storage.sql.exec<{ token_hash: string }>("SELECT token_hash FROM operator_invitations WHERE id=?", id).toArray()[0];
+      if (!row) return { error: "invitation_not_found" };
+      if (this.ctx.storage.sql.exec("SELECT token_hash FROM consumed_invitations WHERE token_hash=?", row.token_hash).toArray().length) {
+        return { error: "invitation_already_used" };
+      }
+      this.ctx.storage.sql.exec("UPDATE operator_invitations SET cancelled=1 WHERE id=?", id);
+      return { status: "cancelled" };
+    });
   }
 
   async enrollmentStart(name: string, verifierHash: string, ipHash: string): Promise<unknown> {
@@ -500,7 +554,7 @@ export class ControlPlaneDO extends DurableObject<Env> {
     return { status: "complete", relayId, credential: stableCredential };
   }
 
-  consumeRegistrationAttempt(ipHash: string, tokenHash: string | null, relayId: string, now: number): "allowed" | "invalid" | "consumed" | "rate_limited" | "capacity" {
+  consumeRegistrationAttempt(ipHash: string, tokenHash: string | null, relayId: string, now: number, batchInvitation = false): "allowed" | "invalid" | "consumed" | "rate_limited" | "capacity" {
     return this.ctx.storage.transactionSync(() => {
       const windowStart = Math.floor(now / 60_000) * 60_000;
       const row = this.ctx.storage.sql.exec<{ attempts: number }>(
@@ -518,6 +572,8 @@ export class ControlPlaneDO extends DurableObject<Env> {
       );
       this.ctx.storage.sql.exec("DELETE FROM registration_rates WHERE window_start < ?", now - 5 * 60_000);
       if (!tokenHash) return "invalid";
+      if (batchInvitation && !this.ctx.storage.sql.exec(
+        "SELECT id FROM operator_invitations WHERE token_hash=? AND cancelled=0 AND expires_at>?", tokenHash, now).toArray().length) return "invalid";
       const consumed = this.ctx.storage.sql.exec<{ token_hash: string }>(
         "SELECT token_hash FROM consumed_invitations WHERE token_hash = ?",
         tokenHash,
@@ -1904,16 +1960,17 @@ async function register(request: Request, env: Env): Promise<Response> {
   const ip = request.headers.get("CF-Connecting-IP") ?? "unknown";
   const ipHash = toHex(await sha256(ip));
   const relayId = crypto.randomUUID();
-  const invitationHash = valid ? suppliedHash : null;
+  const invitationHash = suppliedHash;
   const decision = await env.CONTROL_PLANE.getByName("registration-control").consumeRegistrationAttempt(
     ipHash,
     invitationHash,
     relayId,
     Date.now(),
+    !valid,
   );
   if (decision === "rate_limited") throw new HttpError(429, "registration_rate_limited");
-  if (!configured) throw new HttpError(503, "registration_unavailable");
-  if (!valid || decision === "invalid") throw new HttpError(401, "invalid_bootstrap_token");
+  if (decision === "invalid" && !configured && envString(env, "OPERATOR_ADMIN_TOKEN").length < 32) throw new HttpError(503, "registration_unavailable");
+  if (decision === "invalid") throw new HttpError(401, "invalid_bootstrap_token");
   if (decision === "consumed") throw new HttpError(409, "bootstrap_token_used");
   if (decision === "capacity") throw new HttpError(429, "registration_capacity");
   const credential = randomToken();
@@ -1927,6 +1984,41 @@ async function register(request: Request, env: Env): Promise<Response> {
 function envString(env: Env, key: string): string {
   const value: unknown = Reflect.get(env, key);
   return typeof value === "string" ? value.trim() : "";
+}
+
+async function operatorInvitations(request: Request, env: Env, path: string): Promise<Response> {
+  if (request.headers.has("Origin")) throw new HttpError(403, "operator_browser_forbidden");
+  const cp = env.CONTROL_PLANE.getByName("registration-control");
+  const ipHash = await hashToken(request.headers.get("CF-Connecting-IP") ?? "unknown");
+  if (await cp.consumeRegistrationAttempt(`operator:${ipHash}`, null, "", Date.now()) === "rate_limited") {
+    throw new HttpError(429, "operator_rate_limited");
+  }
+  const secret = envString(env, "OPERATOR_ADMIN_TOKEN");
+  if (secret.length < 32) throw new HttpError(503, "operator_unavailable");
+  const supplied = request.headers.get("Authorization") ?? "";
+  if (!supplied.startsWith("Bearer ") || !constantTimeEqual(await hashToken(supplied.slice(7)), await hashToken(secret))) {
+    throw new HttpError(401, "unauthorized");
+  }
+  if (path === "/v1/operator/invitations") {
+    if (request.method === "GET") return jsonResponse(await cp.invitationList());
+    if (request.method === "POST") {
+      const body = requiredObject(await readJson(request));
+      jsonBody(body, ["count", "label"]);
+      if (!Number.isInteger(body.count) || typeof body.count !== "number" || body.count < 1 || body.count > 20 ||
+        typeof body.label !== "string" || body.label.length > 64 || /[\u0000-\u001f\u007f]/u.test(body.label)) throw new HttpError(400, "invalid_request");
+      const result = await cp.invitationBatch(body.count, body.label.trim());
+      if ("error" in result) throw new HttpError(429, result.error);
+      return jsonResponse(result, 201);
+    }
+    throw new HttpError(405, "method_not_allowed");
+  }
+  const match = path.match(/^\/v1\/operator\/invitations\/([0-9a-f-]{36})\/cancel$/iu);
+  if (!match) throw new HttpError(404, "not_found");
+  if (request.method !== "POST") throw new HttpError(405, "method_not_allowed");
+  jsonBody(requiredObject(await readJson(request)), []);
+  const result = await cp.invitationCancel(requireUuid(match[1]));
+  if ("error" in result) throw new HttpError(result.error === "invitation_not_found" ? 404 : 409, result.error);
+  return jsonResponse(result);
 }
 
 function enrollmentConfigured(env: Env): boolean {
@@ -2012,6 +2104,8 @@ export default {
       let response: Response;
       if (url.pathname === "/v1/register") {
         response = await register(request, env);
+      } else if (url.pathname.startsWith("/v1/operator/")) {
+        response = await operatorInvitations(request, env, url.pathname);
       } else if (url.pathname.startsWith("/v1/enrollment/")) {
         response = await enrollment(request, env, url.pathname);
       } else {
