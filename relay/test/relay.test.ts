@@ -1239,7 +1239,7 @@ function randomTokenForTest(): string {
 describe("explicit three-letter code pairing", () => {
   const cp = () => env.CONTROL_PLANE.getByName("registration-control");
   const configured = (runtime: TestBindings) => Object.assign({}, runtime, {
-    CODE_PAIRING_ENABLED: "true", TURNSTILE_SITE_KEY: "0xTESTSITEKEYONLY", TURNSTILE_SECRET: "test-secret-not-for-production",
+    CODE_PAIRING_ENABLED: "true",
   });
   beforeEach(async () => {
     await runInDurableObject(cp(), (_instance, state) => {
@@ -1254,7 +1254,7 @@ describe("explicit three-letter code pairing", () => {
     relay.bindings = configured(relay.bindings);
     await runInDurableObject(env.RELAYS.getByName(relay.relayId), (instance) => {
       Object.assign(Reflect.get(instance, "env"), {
-        CODE_PAIRING_ENABLED: "true", TURNSTILE_SITE_KEY: "0xTESTSITEKEYONLY", TURNSTILE_SECRET: "test-secret-not-for-production",
+        CODE_PAIRING_ENABLED: "true",
       });
     });
     const agent = await startAgent(relay);
@@ -1270,11 +1270,19 @@ describe("explicit three-letter code pairing", () => {
     return vi.spyOn(globalThis, "fetch").mockImplementation(async () => Response.json({ success: true, action: "pairing", hostname: "nicholas-a11y.github.io" }));
   }
   function redeem(agent: Agent, code: string, requestId = crypto.randomUUID(), verifier = randomTokenForTest()) {
-    return call("/v1/pairing/code", { bindings: agent.bindings, body: { code, requestId, verifier, turnstileToken: crypto.randomUUID() } });
+    return call("/v1/pairing/code", { bindings: agent.bindings, body: { code, requestId, verifier } });
+  }
+  async function decide(agent: Agent, pairingId: string, approve = true) {
+    const response = await call(`/v1/relays/${agent.relayId}/pairing/decide`, { credential: agent.credential, bindings: agent.bindings, body: { pairingId, approve } });
+    await response.text();
+    return response;
+  }
+  async function recover(agent: Agent, requestId: string, verifier: string) {
+    return call("/v1/pairing/claim", { bindings: agent.bindings, body: { requestId, verifier } });
   }
 
   it("is operator disabled by default, origin protected, agent authenticated and healthy-only", async () => {
-    expect(await json(await call("/v1/pairing/config"))).toEqual({ enabled: false, siteKey: "" });
+    expect(await json(await call("/v1/pairing/config"))).toEqual({ enabled: false, approvalRequired: true });
     expect((await call("/v1/pairing/config", { origin: null })).status).toBe(403);
     expect((await call("/v1/pairing/code", { body: {} })).status).toBe(503);
     const agent = await ready(), root = `/v1/relays/${agent.relayId}/agent/code/new`;
@@ -1301,18 +1309,24 @@ describe("explicit three-letter code pairing", () => {
     expect((await redeem(agent, second.code)).status).toBe(409);
   });
 
-  it("requires correct verification and rejects replayed tokens before code lookup", async () => {
+  it("requires desktop approval without Turnstile and exposes a matching phrase but no credential", async () => {
     const agent = await ready(), window = await issue(agent), mock = verification();
-    for (const result of [
-      { success: false }, { success: true, action: "enrollment", hostname: ORIGIN.replace("https://", "") },
-      { success: true, action: "pairing", hostname: "localhost" },
-    ]) {
-      mock.mockResolvedValueOnce(Response.json(result));
-      expect((await redeem(agent, window.code)).status).toBe(403);
-    }
-    expect((await redeem(agent, window.code.toLowerCase())).status).toBe(200);
-    mock.mockResolvedValueOnce(Response.json({ success: false, "error-codes": ["timeout-or-duplicate"] }));
-    expect((await redeem(agent, window.code)).status).toBe(403);
+    expect(await json(await call("/v1/pairing/config", { bindings: agent.bindings }))).toEqual({ enabled: true, approvalRequired: true });
+    const id = crypto.randomUUID(), verifier = randomTokenForTest();
+    const pending = await json<{ status: string; phrase: string }>(await redeem(agent, window.code.toLowerCase(), id, verifier));
+    expect(pending).toEqual({ status: "pending", phrase: expect.any(String) });
+    const work = await json<{ pairings: { id: string; phrase: string }[] }>(await update(agent, 2));
+    expect(work.pairings).toContainEqual({ id, phrase: pending.phrase });
+    expect((await json<{ browsers: unknown[] }>(await call(`/v1/relays/${agent.relayId}/browsers`, { credential: agent.credential, bindings: agent.bindings }))).browsers).toHaveLength(0);
+    expect(await json(await recover(agent, id, verifier))).toEqual(pending);
+    expect(mock).not.toHaveBeenCalled();
+    expect((await redeem(agent, window.code)).status).toBe(409);
+    const unauthorized = await call(`/v1/relays/${agent.relayId}/pairing/decide`, { bindings: agent.bindings, body: { pairingId: id, approve: true } });
+    expect(unauthorized.status).toBe(401);
+    expect((await decide(agent, id, false)).status).toBe(200);
+    vi.useFakeTimers(); vi.setSystemTime(Date.now() + 5001);
+    expect((await recover(agent, id, verifier)).status).toBe(409);
+    expect((await decide(agent, id)).status).toBe(409);
   });
 
   it("atomically grants one browser, recovers the same credential after eviction, and never steals control or revives revoked access", async () => {
@@ -1327,23 +1341,28 @@ describe("explicit three-letter code pairing", () => {
     expect(results.map(r => r.status).sort()).toEqual([200, 409]);
     const winningIndex = results.findIndex(r => r.status === 200);
     const winningId = winningIndex === 0 ? id : secondId, winningVerifier = winningIndex === 0 ? verifier : secondVerifier;
-    const winner = await json<{ status: string; credential: string; relayId: string }>(results[winningIndex]);
+    const pending = await json<{ status: string; phrase: string }>(results[winningIndex]);
+    expect(pending.status).toBe("pending");
+    expect((await decide(agent, winningId)).status).toBe(200);
+    expect((await decide(agent, winningId)).status).toBe(200);
+    const winner = await json<{ status: string; credential: string; relayId: string }>(await recover(agent, winningId, winningVerifier));
     expect(winner).toMatchObject({ status: "complete", relayId: agent.relayId });
     expect(winner.credential).not.toBe(agent.credential);
     expect(await json(await call(`/v1/relays/${agent.relayId}/snapshot`, { credential: winner.credential, bindings: agent.bindings }))).toMatchObject({ activeBrowser: false, controlOccupied: true });
-    expect(await cp().codeCancel(agent.relayId, window.id)).toEqual({ ok: true, body: "complete" });
+    expect(await json(await call(`/v1/relays/${agent.relayId}/agent/code/cancel`, { credential: agent.credential, bindings: agent.bindings, body: { requestId: window.id } }))).toMatchObject({ status: "complete" });
     expect((await call("/v1/pairing/claim", { bindings: agent.bindings, body: { requestId: winningId, verifier: randomTokenForTest() } })).status).toBe(409);
     verify.mockRestore();
     testSockets.get(`${agent.relayId}:${agent.generation}`)?.socket.close();
     testSockets.delete(`${agent.relayId}:${agent.generation}`);
     await evictDurableObject(env.RELAYS.getByName(agent.relayId), { webSockets: "close" });
     await evictDurableObject(cp());
+    vi.useFakeTimers(); vi.setSystemTime(Date.now() + 5001);
     expect(await json(await call("/v1/pairing/claim", { bindings: agent.bindings, body: { requestId: winningId, verifier: winningVerifier } }))).toEqual(winner);
     expect((await call("/v1/pairing/claim", { bindings: agent.bindings, body: { requestId: winningId, verifier: winningVerifier } })).status).toBe(429);
     const browsers = await json<{ browsers: { id: string }[] }>(await call(`/v1/relays/${agent.relayId}/browsers`, { credential: agent.credential, bindings: agent.bindings }));
     expect(browsers.browsers).toHaveLength(2);
     await call(`/v1/relays/${agent.relayId}/browsers/revoke`, { credential: agent.credential, bindings: agent.bindings, body: { browserId: browsers.browsers[1].id } });
-    vi.useFakeTimers(); vi.setSystemTime(Date.now() + 5001);
+    vi.setSystemTime(Date.now() + 5001);
     expect((await call("/v1/pairing/claim", { bindings: agent.bindings, body: { requestId: winningId, verifier: winningVerifier } })).status).toBe(409);
     expect((await call(`/v1/relays/${agent.relayId}/snapshot`, { credential: winner.credential, bindings: agent.bindings })).status).toBe(401);
   });
@@ -1399,16 +1418,76 @@ describe("explicit three-letter code pairing", () => {
     expect(list.browsers).toHaveLength(0);
   });
 
-  it("cancellation during verification wins before reservation and creates no browser", async () => {
-    const agent = await ready(), window = await issue(agent);
-    vi.spyOn(globalThis, "fetch").mockImplementation(async () => {
-      expect(await cp().codeCancel(agent.relayId, window.id)).toEqual({ ok: true, body: "cancelled" });
-      return Response.json({ success: true, action: "pairing", hostname: "nicholas-a11y.github.io" });
+  it("persists the pending phrase across eviction and requires a healthy current generation to approve", async () => {
+    const agent = await ready(), window = await issue(agent), id = crypto.randomUUID(), verifier = randomTokenForTest();
+    const pending = await json(await redeem(agent, window.code, id, verifier));
+    testSockets.get(`${agent.relayId}:${agent.generation}`)?.socket.close();
+    testSockets.delete(`${agent.relayId}:${agent.generation}`);
+    await evictDurableObject(env.RELAYS.getByName(agent.relayId), { webSockets: "close" });
+    await evictDurableObject(cp());
+    expect(await json(await recover(agent, id, verifier))).toEqual(pending);
+    expect((await decide(agent, id)).status).toBe(409);
+    await update(agent, 2);
+    expect((await decide(agent, id)).status).toBe(200);
+    vi.useFakeTimers(); vi.setSystemTime(Date.now() + 5001);
+    expect(await json(await recover(agent, id, verifier))).toMatchObject({ status: "complete" });
+  });
+
+  it("rejects approval after its two-minute deadline or a generation replacement", async () => {
+    const agent = await ready(), window = await issue(agent), id = crypto.randomUUID(), verifier = randomTokenForTest();
+    expect(await json(await redeem(agent, window.code, id, verifier))).toMatchObject({ status: "pending" });
+    vi.useFakeTimers(); vi.setSystemTime(Date.now() + 120001);
+    expect((await decide(agent, id)).status).toBe(410);
+    expect((await recover(agent, id, verifier)).status).toBe(409);
+    vi.useRealTimers();
+    const next = await ready(), nextWindow = await issue(next), nextId = crypto.randomUUID();
+    expect(await json(await redeem(next, nextWindow.code, nextId))).toMatchObject({ status: "pending" });
+    const replacement = await startAgent(next);
+    await update(replacement, 1);
+    expect((await decide(replacement, nextId)).status).toBe(409);
+    expect((await json<{ browsers: unknown[] }>(await call(`/v1/relays/${next.relayId}/browsers`, { credential: next.credential, bindings: next.bindings }))).browsers).toHaveLength(0);
+  });
+
+  it("blocks approval during an import and bounds the shared desktop approval queue", async () => {
+    const agent = await ready(), window = await issue(agent), id = crypto.randomUUID(), verifier = randomTokenForTest();
+    expect(await json(await redeem(agent, window.code, id, verifier))).toMatchObject({ status: "pending" });
+    await runInDurableObject(env.RELAYS.getByName(agent.relayId), (_instance, state) => {
+      state.storage.sql.exec(`INSERT INTO jobs
+        (id,svg,checksum,filename,anchor,context_revision,expires_at,status,browser_id,generation,created_at,updated_at)
+        VALUES (?,NULL,'fixture','fixture.svg','workpiece','fixture',?,'accepted','fixture',?,?,?)`,
+        crypto.randomUUID(), Date.now() + 60000, agent.generation, Date.now(), Date.now());
     });
+    expect((await decide(agent, id)).status).toBe(409);
+    expect(await json(await recover(agent, id, verifier))).toMatchObject({ status: "pending" });
+    await runInDurableObject(env.RELAYS.getByName(agent.relayId), (_instance, state) => {
+      state.storage.sql.exec("UPDATE jobs SET status='confirmed'");
+    });
+    expect((await decide(agent, id)).status).toBe(200);
+    vi.useFakeTimers(); vi.setSystemTime(Date.now() + 5001);
+    expect(await json(await recover(agent, id, verifier))).toMatchObject({ status: "complete" });
+    vi.useRealTimers();
+    const next = await ready(), nextWindow = await issue(next);
+    await runInDurableObject(env.RELAYS.getByName(next.relayId), (_instance, state) => {
+      for (let i = 0; i < 20; i++) state.storage.sql.exec(`INSERT INTO pairings
+        (id,pending_hash,credential_hash,browser_id,wrapped_iv,wrapped_credential,phrase,status,expires_at,created_at)
+        VALUES (?,'fixture','fixture',?,'fixture','fixture','fixture','pending',?,?)`,
+        crypto.randomUUID(), crypto.randomUUID(), Date.now() + 120000, Date.now());
+    });
+    expect((await redeem(next, nextWindow.code)).status).toBe(409);
+    expect((await json<{ browsers: unknown[] }>(await call(`/v1/relays/${next.relayId}/browsers`, { credential: next.credential, bindings: next.bindings }))).browsers).toHaveLength(0);
+  });
+
+  it("cancellation of a pending approval creates no browser and cannot be approved or recovered", async () => {
+    const agent = await ready(), window = await issue(agent);
+    const id = crypto.randomUUID(), verifier = randomTokenForTest();
+    expect(await json(await redeem(agent, window.code, id, verifier))).toMatchObject({ status: "pending" });
+    expect(await json(await call(`/v1/relays/${agent.relayId}/agent/code/cancel`, { credential: agent.credential, bindings: agent.bindings, body: { requestId: window.id } }))).toMatchObject({ status: "cancelled" });
     expect((await redeem(agent, window.code)).status).toBe(409);
+    expect((await decide(agent, id)).status).toBe(409);
+    expect((await recover(agent, id, verifier)).status).toBe(409);
     const list = await json<{ browsers: unknown[] }>(await call(`/v1/relays/${agent.relayId}/browsers`, { credential: agent.credential, bindings: agent.bindings }));
     expect(list.browsers).toHaveLength(0);
-    expect(await env.RELAYS.getByName(agent.relayId).codeGrant(window.id, agent.generation, crypto.randomUUID(), crypto.randomUUID(), "a".repeat(64), window.expiresAt, Date.now() - 1)).toBe("unavailable");
+    expect(await env.RELAYS.getByName(agent.relayId).codeGrant(window.id, agent.generation, crypto.randomUUID(), crypto.randomUUID(), "a".repeat(64), window.expiresAt, Date.now() - 1)).toEqual({ status: "unavailable" });
   });
 
   it("permits the 30th global issuance but not the 31st within the rolling window", async () => {
@@ -1441,11 +1520,15 @@ describe("explicit three-letter code pairing", () => {
     expect((await redeem(agent, window.code, requestId, verifier)).status).toBe(500);
     await runInDurableObject(cp(), instance => { Reflect.set(Reflect.get(instance, "env"), "RELAYS", realRelays); });
     expect((await redeem(agent, window.code)).status).toBe(409);
-    const recovered = await json<{ status: string; credential: string }>(await call("/v1/pairing/claim", { bindings: agent.bindings, body: { requestId, verifier } }));
+    const pending = await json<{ status: string; phrase: string }>(await recover(agent, requestId, verifier));
+    expect(pending.status).toBe("pending");
+    expect((await decide(agent, requestId)).status).toBe(200);
+    vi.useFakeTimers(); vi.setSystemTime(Date.now() + 5001);
+    const recovered = await json<{ status: string; credential: string }>(await recover(agent, requestId, verifier));
     expect(recovered.status).toBe("complete");
     const listed = await json<{ browsers: unknown[] }>(await call(`/v1/relays/${agent.relayId}/browsers`, { credential: agent.credential, bindings: agent.bindings }));
     expect(listed.browsers).toHaveLength(1);
-    vi.useFakeTimers(); vi.setSystemTime(Date.now() + 120001);
+    vi.setSystemTime(Date.now() + 120001);
     expect((await call("/v1/pairing/claim", { bindings: agent.bindings, body: { requestId, verifier } })).status).toBe(409);
     await runDurableObjectAlarm(cp());
     await runInDurableObject(cp(), (_instance, state) => expect(state.storage.sql.exec<{ wrapped_credential: string | null }>("SELECT wrapped_credential FROM code_windows WHERE id=?", window.id).one().wrapped_credential).toBeNull());

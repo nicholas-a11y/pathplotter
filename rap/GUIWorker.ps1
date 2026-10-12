@@ -137,6 +137,7 @@ function Show-CodePairing($State) {
     Send-Ui 'code-status' @{ id = $script:CodeRequest.id; status = $status }
     if ($status -cne 'waiting') {
         $script:CodeRequest = $null
+        if ($status -ceq 'claimed') { Send-Ui 'notice' 'A browser requested code pairing. Compare its phrase with the approval request and approve only your browser.' }
         if ($status -ceq 'complete') { Send-Ui 'notice' 'A browser paired using the code and retains access until revoked. Check Connected browsers to revoke unwanted access.' }
     }
 }

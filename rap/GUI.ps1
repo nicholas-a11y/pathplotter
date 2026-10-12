@@ -249,7 +249,7 @@ function Handle-UiEvent($Event) {
         'code-status' {
             if ($d.codeId -ceq $Event.value.id -and $Event.value.status -cne 'waiting') {
                 $d.codeText.Text = ''; $d.codeId = ''
-                $d.codeStatus.Text = $(if ($Event.value.status -in @('claimed', 'complete')) { 'Code claimed. Check Connected browsers; access persists until revoked.' } else { 'Code window ' + $Event.value.status + '.' })
+                $d.codeStatus.Text = $(if ($Event.value.status -ceq 'claimed') { 'Code used. Compare the browser phrase and approve or reject below.' } elseif ($Event.value.status -ceq 'complete') { 'Browser approved. Access persists until revoked in Connected browsers.' } else { 'Code window ' + $Event.value.status + '.' })
             }
         }
         'pairings' { Show-Approvals $Event.value }
@@ -318,7 +318,7 @@ function Start-RapDesktop {
         $codePanel = New-Object Windows.Forms.FlowLayoutPanel
         $codePanel.Size = New-Object Drawing.Size(580, 165); $codePanel.FlowDirection = 'TopDown'; $codePanel.WrapContents = $false
         $codeHelp = New-Object Windows.Forms.Label
-        $codeHelp.Text = 'Website-first pairing: explicitly allow a 60-second code window, then enter its three letters in PathPlotter Connection. Anyone who knows or guesses this short code can gain saved access. Use Pair phone with desktop approval for stronger protection.'
+        $codeHelp.Text = 'Website-first pairing: allow a 60-second code window, then enter its three letters in PathPlotter Connection. Compare the phrase in the browser with the request below before approving. A code alone never grants access.'
         $codeHelp.Size = New-Object Drawing.Size(560, 60); $codePanel.Controls.Add($codeHelp)
         $codeActions = New-Object Windows.Forms.FlowLayoutPanel
         $codeActions.Size = New-Object Drawing.Size(560, 35)
@@ -330,7 +330,7 @@ function Start-RapDesktop {
         $d.codeText.Size = New-Object Drawing.Size(560, 25); $d.codeText.Font = New-Object Drawing.Font('Segoe UI', 14, [Drawing.FontStyle]::Bold)
         $codePanel.Controls.Add($d.codeText)
         $d.codeStatus = New-Object Windows.Forms.Label
-        $d.codeStatus.Size = New-Object Drawing.Size(560, 35); $d.codeStatus.Text = 'Not enabled. Requires operator opt-in and browser verification.'
+        $d.codeStatus.Size = New-Object Drawing.Size(560, 35); $d.codeStatus.Text = 'Requires operator opt-in. Every browser request needs approval in RAP.'
         $codePanel.Controls.Add($d.codeStatus); $layout.Controls.Add($codePanel)
         $d.setup = New-Object Windows.Forms.FlowLayoutPanel
         $d.setup.Size = New-Object Drawing.Size(580, 255); $d.setup.FlowDirection = 'TopDown'; $d.setup.WrapContents = $false; $d.setup.Visible = $false

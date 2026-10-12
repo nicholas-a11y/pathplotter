@@ -25,11 +25,11 @@ test('private claim is persisted before it is returned and validates for recover
 })
 
 test('only complete well-shaped browser credentials can become an identity', () => {
-  assert.equal(codeClaimIdentity({ status: 'pending' }), null)
+  assert.equal(codeClaimIdentity({ status: 'pending', phrase: 'amber river 123' }), null)
   const relayId = crypto.randomUUID(), credential = createCodeClaim({ setItem: () => {} }).verifier
   assert.deepEqual(codeClaimIdentity({ status: 'complete', relayId, credential }),
     { baseUrl: 'https://pathplotter-relay-test.nicholas-leqeta.workers.dev', relayId, credential })
-  for (const value of [{}, { status: 'complete', relayId: 'wrong', credential }, { status: 'complete', relayId, credential: 'short' }]) {
+  for (const value of [{}, { status: 'pending' }, { status: 'pending', phrase: '<script>' }, { status: 'complete', relayId: 'wrong', credential }, { status: 'complete', relayId, credential: 'short' }]) {
     assert.throws(() => codeClaimIdentity(value), /Invalid code-pairing response/)
   }
 })

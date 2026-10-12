@@ -1,4 +1,4 @@
-import { HOSTED_RELAY, loadTurnstile } from './onboarding.ts'
+import { HOSTED_RELAY } from './onboarding.ts'
 import { saveIdentity, type RelayIdentity } from './relay.ts'
 
 const CLAIM_KEY = 'pathplotter.code-claim.v1'
@@ -42,7 +42,6 @@ class PairingError extends Error {
       code_pairing_busy: 'Code pairing is busy. Wait, or use the QR/link from RAP.',
       code_rate_limited: 'Pairing attempts are limited. Wait at least a minute before trying again.',
       code_claim_unavailable: 'Pairing recovery is unavailable, expired or revoked.',
-      turnstile_invalid: 'Browser verification failed or expired. Complete it again.',
     }
     super(messages[code] ?? `Pairing failed (${status}): ${code}`)
     this.status = status
@@ -62,7 +61,7 @@ async function request(path: string, body?: unknown): Promise<unknown> {
 }
 
 export function codeClaimIdentity(value: unknown): RelayIdentity | null {
-  if (record(value) && value.status === 'pending') return null
+  if (record(value) && value.status === 'pending' && typeof value.phrase === 'string' && /^[A-Za-z0-9 -]{1,120}$/.test(value.phrase)) return null
   if (!record(value) || value.status !== 'complete' || typeof value.relayId !== 'string' ||
       !/^[0-9a-f]{8}(-[0-9a-f]{4}){3}-[0-9a-f]{12}$/i.test(value.relayId) ||
       typeof value.credential !== 'string' || !/^[A-Za-z0-9_-]{43}$/.test(value.credential)) throw new Error('Invalid code-pairing response. Recover the saved request; do not resubmit the code.')
@@ -79,9 +78,8 @@ export function setupCodePairing(options: {
   const section = document.createElement('section')
   section.innerHTML = `
     <h3>Connect with RAP code</h3>
-    <p class="hint">In RAP choose Allow code pairing, then enter its three letters within 60 seconds. Internet is required on both devices. Code pairing saves browser access until revoked; the stronger QR/link option requires approval in RAP.</p>
+    <p class="hint">In RAP choose Allow code pairing, then enter its three letters within 60 seconds. Compare the phrase shown here with RAP and approve the request there. Internet is required on both devices. Approved browser access stays saved until revoked.</p>
     <label>Three-letter RAP code<input id="rapCode" autocomplete="off" autocapitalize="characters" spellcheck="false" maxlength="3" placeholder="ABC" /></label>
-    <div id="codeWidget"></div>
     <div class="row"><button id="prepareCodePairing">Start code pairing</button><button id="submitCodePairing" class="primary" disabled>Connect with code</button><button id="recoverCodePairing" hidden>Recover pairing</button><button id="discardCodePairing" hidden>Discard recovery</button></div>
     <p id="codePairingMessage" role="status"></p>
   `
@@ -96,51 +94,45 @@ export function setupCodePairing(options: {
   const prepare = get<HTMLButtonElement>('prepareCodePairing')
   const recover = get<HTMLButtonElement>('recoverCodePairing')
   const discard = get<HTMLButtonElement>('discardCodePairing')
-  let widget: string | null = null, token = '', busy = false, epoch = 0, lastRecovery = -Infinity
+  let available = false, busy = false, epoch = 0, lastRecovery = -Infinity
+  let waiting: AbortController | null = null
   const update = () => {
     let pending = false
     try { pending = pendingCodeClaim() !== null }
     catch (error) { pending = true; message.textContent = error instanceof Error ? error.message : String(error) }
-    submit.disabled = busy || !token || pending
+    submit.disabled = busy || !available || pending
     prepare.disabled = busy || pending
     recover.hidden = discard.hidden = !pending
     recover.disabled = discard.disabled = busy
   }
-  const clearWidget = () => {
+  const stopWaiting = () => {
     ++epoch
-    if (widget !== null) window.turnstile?.remove(widget)
-    widget = null; token = ''; update()
+    waiting?.abort()
+    waiting = null; available = false; update()
   }
-  options.dialog.addEventListener('close', clearWidget)
+  options.dialog.addEventListener('close', stopWaiting)
   prepare.addEventListener('click', async () => {
-    clearWidget()
+    stopWaiting()
     const current = epoch
     busy = true; update(); message.textContent = 'Checking code-pairing availability...'
     try {
       const config = await request('config')
       if (current !== epoch) return
-      if (!record(config) || config.enabled !== true || typeof config.siteKey !== 'string' || !config.siteKey) throw new Error('Code pairing is not enabled. Use Pair phone or Open PathPlotter in RAP instead.')
-      await loadTurnstile()
-      if (current !== epoch) return
-      if (!window.turnstile) throw new Error('Verification did not initialize.')
-      widget = window.turnstile.render(get('codeWidget'), {
-        sitekey: config.siteKey, action: 'pairing',
-        callback: value => { if (current === epoch) { token = value; update() } },
-        'expired-callback': () => { if (current === epoch) { token = ''; message.textContent = 'Verification expired. Complete it again.'; update() } },
-        'error-callback': () => { if (current === epoch) { token = ''; message.textContent = 'Verification failed. Check your connection and retry.'; update() } },
-      })
-      message.textContent = 'Enable a code window in RAP, enter its three letters and complete verification.'
+      if (!record(config) || config.enabled !== true || config.approvalRequired !== true) throw new Error('Approval-based code pairing is not enabled. Use Pair phone or Open PathPlotter in RAP instead.')
+      available = true
+      message.textContent = 'Enable a code window in RAP, enter its three letters, then approve the matching phrase in RAP.'
     } catch (error) { if (current === epoch) message.textContent = error instanceof Error ? error.message : String(error) }
     finally { busy = false; update() }
   })
   const exchange = async (recovery: boolean) => {
     if (busy) return
+    const current = epoch
     let active: (() => boolean) | null = null
     let initial = false
     let submitted = false
     try {
       const code = recovery ? '' : normalizePairingCode(get<HTMLInputElement>('rapCode').value)
-      if (!recovery && !token) throw new Error('Complete browser verification first.')
+      if (!recovery && !available) throw new Error('Start code pairing first.')
       if (recovery && performance.now() - lastRecovery < 5000) throw new Error('Wait five seconds before checking recovery again.')
       active = options.begin()
       if (!active) return
@@ -153,15 +145,31 @@ export function setupCodePairing(options: {
       }
       if (!claim) throw new Error('No pending code pairing to recover.')
       update()
-      const current = epoch
-      message.textContent = recovery ? 'Recovering the accepted pairing...' : 'Verifying and pairing...'
+      const controller = new AbortController()
+      waiting = controller
+      message.textContent = recovery ? 'Checking the saved approval request...' : 'Requesting approval in RAP...'
       if (recovery) lastRecovery = performance.now()
       submitted = true
-      const result = await request(recovery ? 'claim' : 'code', recovery ? { requestId: claim.requestId, verifier: claim.verifier } :
-        { code, requestId: claim.requestId, verifier: claim.verifier, turnstileToken: token })
+      let result = await request(recovery ? 'claim' : 'code', recovery ? { requestId: claim.requestId, verifier: claim.verifier } :
+        { code, requestId: claim.requestId, verifier: claim.verifier })
       if (!active() || current !== epoch) return
-      const identity = codeClaimIdentity(result)
-      if (!identity) { message.textContent = 'Pairing is pending. Wait five seconds, then Recover pairing.'; return }
+      let identity = codeClaimIdentity(result)
+      while (!identity) {
+        if (!record(result) || typeof result.phrase !== 'string') throw new Error('Invalid approval phrase.')
+        message.textContent = `Compare "${result.phrase}" with RAP, then Approve there. Waiting for approval (up to two minutes)...`
+        await new Promise<void>(resolve => {
+          const done = () => { clearTimeout(timer); controller.signal.removeEventListener('abort', done); resolve() }
+          const timer = setTimeout(done, 7000)
+          controller.signal.addEventListener('abort', done, { once: true })
+        })
+        if (controller.signal.aborted || !active() || current !== epoch) return
+        if (!pendingCodeClaim()) throw new Error('Pairing recovery expired. Request a new code in RAP.')
+        lastRecovery = performance.now()
+        initial = false
+        result = await request('claim', { requestId: claim.requestId, verifier: claim.verifier })
+        if (!active() || current !== epoch) return
+        identity = codeClaimIdentity(result)
+      }
       saveIdentity(identity)
       // Keep recovery data until both the grant and browser identity are persistent.
       localStorage.removeItem(CLAIM_KEY)
@@ -169,6 +177,7 @@ export function setupCodePairing(options: {
       get<HTMLInputElement>('rapCode').value = ''
       message.textContent = 'Browser paired. Use Take control to capture; another browser will not be displaced automatically.'
     } catch (error) {
+      if (current !== epoch || waiting?.signal.aborted) return
       message.textContent = error instanceof Error ? error.message : String(error)
       if (error instanceof PairingError && ((initial && [400, 403, 409, 429, 503].includes(error.status)) || (!initial && error.status === 409))) {
         try { localStorage.removeItem(CLAIM_KEY) }
@@ -176,8 +185,7 @@ export function setupCodePairing(options: {
       } else if (submitted) message.textContent += ' Recovery is saved; use Recover pairing, not the code again.'
     } finally {
       if (active) options.finished()
-      busy = false; token = ''
-      if (widget !== null) window.turnstile?.reset(widget)
+      busy = false; waiting = null
       update()
     }
   }
@@ -190,6 +198,6 @@ export function setupCodePairing(options: {
     }
   })
   options.dialog.addEventListener('toggle', update)
-  document.querySelector('#connectionMode')?.addEventListener('change', clearWidget)
+  document.querySelector('#connectionMode')?.addEventListener('change', stopWaiting)
   update()
 }

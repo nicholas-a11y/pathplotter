@@ -28,7 +28,8 @@ const CODE_LIFETIME_MS = 60_000;
 const CODE_RECOVERY_MS = 120_000;
 type CodeWindow = { id: string; code: string; generation: number; expiresAt: number; status: string };
 type CodeRow = { id: string; relay_id: string; code: string; generation: number; expires_at: number; created_at: number; status: string; claim_id: string | null; verifier_hash: string | null; browser_id: string | null; credential_hash: string | null; wrapped_iv: string | null; wrapped_credential: string | null; recovery_until: number | null; last_recovery: number | null };
-type CodeClaim = { status: "complete"; relayId: string; credential: string } | { status: "pending" };
+type CodeClaim = { status: "complete"; relayId: string; credential: string } | { status: "pending"; phrase: string };
+type CodeGrant = { status: "complete" | "unavailable" } | { status: "pending"; phrase: string };
 type CodeResult<T> = { ok: true; body: T } | { ok: false; status: number; error: string };
 
 function codeFailure(error: unknown): { ok: false; status: number; error: string } {
@@ -584,11 +585,11 @@ export class ControlPlaneDO extends DurableObject<Env> {
         row.recovery_until <= Date.now() || !["claimed", "complete"].includes(row.status)) throw new HttpError(409, "code_claim_unavailable");
     const result = await this.env.RELAYS.getByName(row.relay_id).codeGrant(row.id, row.generation, claimId, row.browser_id, row.credential_hash, row.expires_at, row.recovery_until);
     if (row.recovery_until <= Date.now()) throw new HttpError(409, "code_claim_unavailable");
-    if (result === "unavailable") {
+    if (result.status === "unavailable") {
       this.ctx.storage.sql.exec("UPDATE code_windows SET status='failed' WHERE claim_id=?", claimId);
       throw new HttpError(409, "code_claim_unavailable");
     }
-    if (result === "pending") return { status: "pending" };
+    if (result.status === "pending") return result;
     this.ctx.storage.sql.exec("UPDATE code_windows SET status='complete' WHERE claim_id=?", claimId);
     return { status: "complete", relayId: row.relay_id, credential: await unwrapCredential(verifier, row.wrapped_iv, row.wrapped_credential) };
   }
@@ -1143,26 +1144,46 @@ export class RelayDO extends DurableObject<Env> {
   private async codeCancel(request: Request): Promise<Response> {
     const body = requiredObject(await readJson(request)); jsonBody(body, ["requestId"]);
     const id = requireUuid(body.requestId);
-    const status = codeBody(await this.env.CONTROL_PLANE.getByName("registration-control").codeCancel(this.meta()!.relay_id, id));
-    this.ctx.storage.sql.exec("UPDATE code_pairings SET status=? WHERE id=? AND status!='complete'", status, id);
+    let status = codeBody(await this.env.CONTROL_PLANE.getByName("registration-control").codeCancel(this.meta()!.relay_id, id));
+    this.ctx.storage.transactionSync(() => {
+      const row = this.ctx.storage.sql.exec<{ claim_id: string | null; status: string }>("SELECT claim_id,status FROM code_pairings WHERE id=?", id).toArray()[0];
+      if (row?.status === "complete") { status = "complete"; return; }
+      if (row?.claim_id) {
+        this.ctx.storage.sql.exec("UPDATE pairings SET status='rejected' WHERE id=? AND status='pending'", row.claim_id);
+      }
+      if (status === "claimed") status = "cancelled";
+      this.ctx.storage.sql.exec("INSERT OR IGNORE INTO code_pairings (id,generation,expires_at,status) VALUES (?,?,?,?)", id, this.meta()!.generation, Date.now(), status);
+      this.ctx.storage.sql.exec("UPDATE code_pairings SET status=? WHERE id=?", status, id);
+    });
     this.notifyWork();
     return jsonResponse({ id, status });
   }
 
-  async codeGrant(id: string, generation: number, claimId: string, browserId: string, credentialHash: string, expiresAt: number, recoveryUntil: number): Promise<"complete" | "pending" | "unavailable"> {
-    const result = this.ctx.storage.transactionSync(() => {
-      if (Date.now() >= recoveryUntil) return "unavailable";
-      const prior = this.ctx.storage.sql.exec<{ browser_id: string | null; claim_id: string | null }>("SELECT browser_id,claim_id FROM code_pairings WHERE id=?", id).toArray()[0];
+  async codeGrant(id: string, generation: number, claimId: string, browserId: string, credentialHash: string, expiresAt: number, recoveryUntil: number): Promise<CodeGrant> {
+    const result = this.ctx.storage.transactionSync<CodeGrant>(() => {
+      if (Date.now() >= recoveryUntil) return { status: "unavailable" };
+      const prior = this.ctx.storage.sql.exec<{ browser_id: string | null; claim_id: string | null; status: string }>("SELECT browser_id,claim_id,status FROM code_pairings WHERE id=?", id).toArray()[0];
+      if (prior && ["cancelled", "expired", "failed"].includes(prior.status)) return { status: "unavailable" };
       if (prior?.claim_id) {
-        return prior.claim_id === claimId && prior.browser_id === browserId &&
-          this.ctx.storage.sql.exec("SELECT id FROM browsers WHERE id=? AND revoked=0", browserId).toArray().length ? "complete" : "unavailable";
+        if (prior.claim_id !== claimId || prior.browser_id !== browserId) return { status: "unavailable" };
+        const pairing = this.ctx.storage.sql.exec<{ status: string; phrase: string; expires_at: number }>("SELECT status,phrase,expires_at FROM pairings WHERE id=?", claimId).toArray()[0];
+        if (prior.status === "complete") {
+          return { status: this.ctx.storage.sql.exec("SELECT id FROM browsers WHERE id=? AND revoked=0", browserId).toArray().length ? "complete" : "unavailable" };
+        }
+        if (pairing?.status === "pending" && pairing.expires_at > Date.now() && this.meta()?.generation === generation) return { status: "pending", phrase: pairing.phrase };
+        return { status: "unavailable" };
       }
-      if (!this.codeEligible(generation)) return "unavailable";
+      if (!this.codeEligible(generation)) return { status: "unavailable" };
+      if (this.ctx.storage.sql.exec<{ n: number }>("SELECT COUNT(*) AS n FROM pairings WHERE status='pending' AND expires_at>?", Date.now()).one().n >= 20) return { status: "unavailable" };
       // Issuance response may be lost before this object's local window insert.
       this.ctx.storage.sql.exec("INSERT OR IGNORE INTO code_pairings (id,generation,expires_at,status) VALUES (?,?,?,'claimed')", id, generation, expiresAt);
-      this.ctx.storage.sql.exec("INSERT INTO browsers (id,credential_hash,created_at,revoked) VALUES (?,?,?,0)", browserId, credentialHash, Date.now());
-      this.ctx.storage.sql.exec("UPDATE code_pairings SET status='complete',claim_id=?,browser_id=? WHERE id=?", claimId, browserId, id);
-      return "complete";
+      const phrase = randomPhrase();
+      // Code claims recover through the registry's private verifier, not the QR status endpoint.
+      this.ctx.storage.sql.exec(`INSERT INTO pairings
+        (id,pending_hash,credential_hash,browser_id,wrapped_iv,wrapped_credential,phrase,status,expires_at,created_at)
+        VALUES (?,'',?,?,'','',?,'pending',?,?)`, claimId, credentialHash, browserId, phrase, recoveryUntil, Date.now());
+      this.ctx.storage.sql.exec("UPDATE code_pairings SET status='claimed',claim_id=?,browser_id=? WHERE id=?", claimId, browserId, id);
+      return { status: "pending", phrase };
     });
     this.notifyWork();
     return result;
@@ -1315,6 +1336,8 @@ export class RelayDO extends DurableObject<Env> {
         this.ctx.storage.sql.exec("UPDATE pairings SET status = 'rejected' WHERE id = ?", pairingId);
         throw new HttpError(410, "pairing_expired");
       }
+      const code = this.ctx.storage.sql.exec<{ generation: number; status: string }>("SELECT generation,status FROM code_pairings WHERE claim_id=?", pairingId).toArray()[0];
+      if (body.approve && code && (code.status !== "claimed" || !this.codeEligible(code.generation))) throw new HttpError(409, "code_claim_unavailable");
       if (body.approve) {
         this.ctx.storage.sql.exec(
           "INSERT INTO browsers (id, credential_hash, created_at, revoked) VALUES (?, ?, ?, 0)",
@@ -1324,7 +1347,9 @@ export class RelayDO extends DurableObject<Env> {
         );
       }
       this.ctx.storage.sql.exec("UPDATE pairings SET status = ? WHERE id = ?", body.approve ? "approved" : "rejected", pairingId);
+      if (code) this.ctx.storage.sql.exec("UPDATE code_pairings SET status=? WHERE claim_id=?", body.approve ? "complete" : "failed", pairingId);
     });
+    this.notifyWork();
     return jsonResponse({});
   }
 
@@ -2144,9 +2169,7 @@ function enrollmentConfigured(env: Env): boolean {
 }
 
 function codePairingConfigured(env: Env): boolean {
-  const key = envString(env, "TURNSTILE_SITE_KEY");
-  return envString(env, "CODE_PAIRING_ENABLED") === "true" && envString(env, "TURNSTILE_SECRET").length >= 16 &&
-    /^0x[A-Za-z0-9_-]{10,}$/u.test(key) && !/^[123]x/u.test(key);
+  return envString(env, "CODE_PAIRING_ENABLED") === "true";
 }
 
 async function verifyBrowser(request: Request, env: Env, token: unknown, action: string): Promise<void> {
@@ -2170,19 +2193,18 @@ async function codePairing(request: Request, env: Env, path: string): Promise<Re
   requireAllowedOrigin(request);
   if (path === "/v1/pairing/config" && request.method === "GET") {
     const enabled = codePairingConfigured(env);
-    return jsonResponse({ enabled, siteKey: enabled ? envString(env, "TURNSTILE_SITE_KEY") : "" });
+    return jsonResponse({ enabled, approvalRequired: true });
   }
   if (!codePairingConfigured(env)) throw new HttpError(503, "code_pairing_unavailable");
   if (request.method !== "POST" || !["/v1/pairing/code", "/v1/pairing/claim"].includes(path)) throw new HttpError(404, "not_found");
   const cp = env.CONTROL_PLANE.getByName("registration-control");
-  // Admission precedes body parsing and verification; failed attempts cannot bypass it.
+  // Admission precedes body parsing and lookup; failed attempts cannot bypass it.
   codeBody(await cp.codeAttempt(await hashToken(request.headers.get("CF-Connecting-IP") ?? "unknown"), path === "/v1/pairing/claim"));
   const body = requiredObject(await readJson(request));
-  jsonBody(body, path.endsWith("/code") ? ["code", "requestId", "verifier", "turnstileToken"] : ["requestId", "verifier"]);
+  jsonBody(body, path.endsWith("/code") ? ["code", "requestId", "verifier"] : ["requestId", "verifier"]);
   const id = requireUuid(body.requestId), verifier = requireToken(body.verifier);
   if (path.endsWith("/claim")) return jsonResponse(codeBody(await cp.codeClaim(id, verifier)));
   if (typeof body.code !== "string" || !/^[A-Za-z]{3}$/u.test(body.code)) throw new HttpError(400, "invalid_request");
-  await verifyBrowser(request, env, body.turnstileToken, "pairing");
   return jsonResponse(codeBody(await cp.codeRedeem(body.code.toUpperCase(), id, verifier)));
 }
 

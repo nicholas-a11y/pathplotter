@@ -124,7 +124,18 @@ try {
     if ($script:WireCalls[$before].body.requestId -cne $id -or $script:WireCalls[$before + 1].body.requestId -cne $id) { throw 'Explicit issuance recovery minted a different window.' }
     Invoke-UiCommand @{ action = 'code-cancel' }
     if ($null -ne $script:CodeRequest -or $script:WireCalls[$before + 2].body.requestId -cne $id) { throw 'Code cancellation lost the window identity.' }
-    Write-Host 'PASS code pairing protocol: healthy/import guards, private idempotent issuance and explicit Cancel.'
+    Invoke-UiCommand @{ action = 'code-new' }
+    $id = $script:CodeRequest.id
+    $before = $script:WireCalls.Count
+    Show-CodePairing @{ id = $id; status = 'claimed' }
+    Show-PendingPairings @(@{ id = 'fixture-code-request'; phrase = 'BLUE FOREST' })
+    if ($script:WireCalls.Count -ne $before) { throw 'A code claim was automatically approved.' }
+    $rejected = $false
+    try { Invoke-UiCommand @{ action = 'decide'; id = 'fixture-code-request'; phrase = 'WRONG PHRASE'; approve = $true } } catch { $rejected = $true }
+    if (-not $rejected -or $script:WireCalls.Count -ne $before) { throw 'Wrong code request phrase reached approval.' }
+    Invoke-UiCommand @{ action = 'decide'; id = 'fixture-code-request'; phrase = 'BLUE FOREST'; approve = $true }
+    if ($script:WireCalls[$before].path -cne '/pairing/decide' -or $script:WireCalls[$before].body.pairingId -cne 'fixture-code-request') { throw 'Code request did not use explicit desktop approval.' }
+    Write-Host 'PASS code pairing protocol: healthy/import guards, private idempotent issuance, explicit Cancel and matching-phrase desktop approval.'
     & (Join-Path $PSScriptRoot 'GUI.ps1') -SmokeTest -DataDirectory $state
     $lock = New-Object IO.FileStream((Join-Path $state 'instance.lock'), 'OpenOrCreate', 'ReadWrite', 'None')
     $lock.Dispose()
