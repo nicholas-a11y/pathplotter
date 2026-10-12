@@ -27,7 +27,7 @@ export class RelayRequestError extends Error {
 export const MAX_SAMPLE_AGE_MS = 2000
 export const RELAY_HEARTBEAT_MS = 15000
 export const RELAY_HEALTH_MS = 45000
-export const HTTP_POLL_MS = 5000
+const JOB_WAIT_MS = 5000
 const IDENTITY_KEY = 'pathplotter.relay.v1'
 const jobStates = ['queued', 'claimed', 'attempting', 'accepted', 'confirmed', 'failed', 'expired', 'unknown']
 
@@ -146,15 +146,6 @@ export function loadIdentity(): RelayIdentity | null {
   return { baseUrl: relayBaseUrl(value.baseUrl), relayId: value.relayId, credential: value.credential }
 }
 
-export function pairingInvitation(hash: string): { baseUrl: string; relayId: string; invitation: string } | null {
-  const params = new URLSearchParams(hash.replace(/^#/, ''))
-  if (!params.has('invite')) return null
-  const relayId = params.get('relayId')
-  const invitation = params.get('invite')
-  if (!relayId || !invitation) throw new Error('Incomplete RAP pairing link.')
-  return { baseUrl: relayBaseUrl(params.get('relay') ?? ''), relayId, invitation }
-}
-
 export interface BrowserLink {
   baseUrl: string
   relayId: string
@@ -183,7 +174,7 @@ export async function exchangeBrowserLink(link: BrowserLink, existing: RelayIden
   }
   if (matching) {
     try {
-      await relayRequest(link.baseUrl, link.relayId, '/snapshot', undefined, matching.credential)
+      await relayRequest(link.baseUrl, link.relayId, '/ticket', {}, matching.credential)
       if (!active()) return null
       message('Using this browser’s saved RAP connection.')
       return matching
@@ -236,19 +227,18 @@ export class RelayClient {
   private heartbeat: ReturnType<typeof setInterval> | undefined
   private healthMonotonic = -Infinity
   private online = false
-  private transport: 'socket' | 'http'
   private reconnectDelay = 1000
   private pendingRead: { id: string; epoch: number; started: number; resolve: (snapshot: RelaySnapshot) => void; reject: (error: Error) => void; timer: ReturnType<typeof setTimeout> } | null = null
   settled = false
   previewActive = false
   connectionNotice = ''
+  rapUpdateRequired = false
   private observedJob: RelayJob | null = null
   private jobListeners = new Set<() => void>()
 
-  constructor(identity: RelayIdentity, changed: () => void, transport: 'socket' | 'http' = 'socket') {
+  constructor(identity: RelayIdentity, changed: () => void) {
     this.identity = identity
     this.changed = changed
-    this.transport = transport
   }
 
   request(path: string, body?: unknown): Promise<unknown> {
@@ -267,7 +257,7 @@ export class RelayClient {
         resolve(job)
       }
       const listener = () => { const job = changedJob(); if (job) finish(job) }
-      const timer = setTimeout(() => finish(null), HTTP_POLL_MS)
+      const timer = setTimeout(() => finish(null), JOB_WAIT_MS)
       this.jobListeners.add(listener)
     })
   }
@@ -282,7 +272,6 @@ export class RelayClient {
       this.snapshot.position !== null && this.snapshot.context !== null && this.isOnline()
   }
   isOnline(): boolean { return this.online && performance.now() - this.healthMonotonic <= RELAY_HEALTH_MS }
-  get connectionType(): 'socket' | 'http' { return this.transport }
   hasFreshPosition(): boolean {
     return this.running && !this.error && this.snapshot?.connected === true &&
       this.snapshot.position !== null && this.snapshot.context !== null && this.age() <= MAX_SAMPLE_AGE_MS
@@ -293,65 +282,7 @@ export class RelayClient {
     this.running = true
     this.autoClaimPending = !this.controlLost
     const epoch = ++this.epoch
-    if (this.transport === 'socket') {
-      void this.connectSocket(epoch)
-      return
-    }
-    const poll = async () => {
-      if (!this.running || epoch !== this.epoch) return
-      const started = performance.now()
-      try {
-        const value = await this.request('/snapshot')
-        if (!this.running || epoch !== this.epoch) return
-        if (!record(value) || !finite(value.serverTime) || typeof value.activeBrowser !== 'boolean') {
-          throw new Error('Invalid relay response.')
-        }
-        if (value.controlOccupied !== undefined && typeof value.controlOccupied !== 'boolean') throw new Error('Invalid relay control state.')
-        if (value.protocol === 2) {
-          await this.applyEnvelope(value, performance.now() - started, epoch)
-          if (this.running && epoch === this.epoch) this.timer = setTimeout(poll, HTTP_POLL_MS)
-          return
-        }
-        const next = parseSnapshot(value.snapshot)
-        if (next && this.snapshot && next.generation === this.snapshot.generation &&
-            next.sequence < this.snapshot.sequence) throw new Error('Out-of-order relay snapshot.')
-        this.snapshot = next
-        this.online = value.agentOnline === true || (value.agentOnline === undefined && next?.connected === true)
-        this.healthMonotonic = performance.now()
-        this.serverTime = value.serverTime
-        this.roundTripMs = performance.now() - started
-        this.receivedMonotonic = performance.now()
-        if (this.activeBrowser && !value.activeBrowser) {
-          this.controlLost = true
-          this.autoClaimPending = false
-          this.controlError = 'Capture control was released or taken by another browser. Click Take control to continue.'
-        }
-        this.activeBrowser = value.activeBrowser
-        this.controlOccupied = value.controlOccupied === true
-        this.error = ''
-        if (this.autoClaimPending && this.isOnline() && this.snapshot?.context) {
-          this.autoClaimPending = false
-          if (!this.activeBrowser && !this.controlOccupied) {
-            try { await this.claimControl(false) }
-            catch (error) { this.controlError = error instanceof Error ? error.message : String(error) }
-          }
-        }
-        if (!this.running || epoch !== this.epoch) return
-      } catch (error) {
-        if (!this.running || epoch !== this.epoch) return
-        const denied = error instanceof RelayRequestError && [401, 403].includes(error.status)
-        this.error = denied ? 'Browser authorization is no longer valid. Open PathPlotter from RAP, or use Pair phone to reconnect.' :
-          error instanceof Error ? error.message : String(error)
-        if (denied) { this.controlLost = true; this.autoClaimPending = false; this.controlError = this.error }
-        this.snapshot = null
-        this.online = false
-        this.activeBrowser = false
-        if (!this.controlLost) this.autoClaimPending = true
-      }
-      this.changed()
-      if (this.running && epoch === this.epoch) this.timer = setTimeout(poll, HTTP_POLL_MS)
-    }
-    void poll()
+    void this.connectSocket(epoch)
   }
 
   stop(): void {
@@ -373,23 +304,9 @@ export class RelayClient {
     this.claimInFlight = false
   }
 
-  useHttpFallback(): void {
-    this.stop()
-    this.transport = 'http'
-    this.error = ''
-    this.start()
-  }
-
   async endSession(): Promise<void> {
     this.stop()
     await this.request('/control/release', {})
-  }
-
-  useWebSocket(): void {
-    this.stop()
-    this.transport = 'socket'
-    this.error = ''
-    this.start()
   }
 
   private rejectRead(error: Error): void {
@@ -404,7 +321,7 @@ export class RelayClient {
     if (!this.running || epoch !== this.epoch) return
     if (!record(value) || !finite(value.serverTime) || typeof value.activeBrowser !== 'boolean' ||
         typeof value.controlOccupied !== 'boolean' || typeof value.agentOnline !== 'boolean' ||
-        value.protocol !== 2) throw new Error('Relay needs a compatible WebSocket update. Update RAP and the relay.')
+        value.protocol !== 2) throw new Error('The relay sent an unexpected update. Reload PathPlotter.')
     const next = parseSnapshot(value.snapshot)
     const job = value.job === null ? null : parseJob(value.job)
     if (next && this.snapshot && next.generation === this.snapshot.generation && next.sequence < this.snapshot.sequence) {
@@ -423,6 +340,7 @@ export class RelayClient {
     this.healthMonotonic = performance.now()
     this.online = value.agentOnline
     this.settled = value.settled === true
+    this.rapUpdateRequired = value.rapUpdateRequired === true
     this.previewActive = value.previewActive === true
     if (this.previewActive) this.connectionNotice = ''
     this.activeBrowser = value.activeBrowser
@@ -446,7 +364,7 @@ export class RelayClient {
     const handshakeStarted = performance.now()
     let transportBound = 0
     try {
-      if (typeof WebSocket === 'undefined') throw new Error('WebSockets are unavailable. Use the explicit slower HTTP connection in Connection.')
+      if (typeof WebSocket === 'undefined') throw new Error('This browser does not support WebSockets, which PathPlotter needs to reach RAP.')
       const ticket = await this.request('/ticket', {})
       transportBound = performance.now() - handshakeStarted
       if (!this.running || epoch !== this.epoch) return
@@ -527,7 +445,7 @@ export class RelayClient {
       }
       socket.onerror = () => {
         if (epoch !== this.epoch) return
-        this.error = 'WebSocket connection failed. Check RAP/network, or explicitly choose the slower HTTP fallback.'
+        this.error = 'WebSocket connection failed. Check your network connection; PathPlotter will keep retrying.'
         this.changed()
       }
       socket.onclose = () => {
@@ -579,24 +497,8 @@ export class RelayClient {
       const timer = setTimeout(() => this.rejectRead(new Error('RAP coordinate request timed out. No point was saved.')), 10000)
       this.pendingRead = { id, epoch, started, resolve, reject, timer }
     })
-    void this.request('/capture', { requestId: id }).then(async response => {
+    void this.request('/capture', { requestId: id }).then(response => {
       if (!record(response) || response.requestId !== id) throw new Error('Invalid fresh-coordinate acknowledgment.')
-      if (this.transport !== 'http') return
-      while (this.pendingRead?.id === id && this.running && epoch === this.epoch) {
-        const getStarted = performance.now()
-        const status = await this.request(`/capture/${encodeURIComponent(id)}`)
-        const getElapsed = performance.now() - getStarted
-        if (this.pendingRead?.id !== id || !this.running || epoch !== this.epoch) return
-        if (!record(status)) throw new Error('Invalid coordinate request status.')
-        if (status.status === 'pending') {
-          await new Promise(resolve => setTimeout(resolve, Math.max(0, HTTP_POLL_MS - getElapsed)))
-          continue
-        }
-        if (status.status === 'failed') throw new Error(typeof status.error === 'string' ? status.error : 'RAP coordinate request failed.')
-        if (status.status !== 'complete') throw new Error('Coordinate request expired. No point was saved.')
-        await this.applyEnvelope(status.body, responseTransitMs(getElapsed, status.waitMs), epoch)
-        this.completeRead()
-      }
     }).catch(error => {
       if (this.pendingRead?.id === id) this.rejectRead(error instanceof Error ? error : new Error(String(error)))
     })

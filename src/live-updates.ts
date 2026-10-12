@@ -2,10 +2,10 @@ import type { BuiltSvg } from './geometry'
 
 export const LIVE_QUEUE_LIMIT = 20
 export type ImportOutcome = 'confirmed' | 'failed' | 'expired' | 'unknown'
+export interface ImportResult { status: ImportOutcome; error?: string }
 export interface ImportTarget {
-  mode: 'local' | 'relay' | 'webtool'
   baseUrl: string
-  relayId?: string
+  relayId: string
   contextRevision: string
 }
 export interface LiveUpdate extends BuiltSvg {
@@ -61,19 +61,19 @@ export function parseLiveQueue(value: unknown): LiveQueue {
         typeof item.svg !== 'string' || !item.svg.startsWith('<?xml') || new TextEncoder().encode(item.svg).length > 512 * 1024 ||
         !Array.isArray(item.unsupportedCharacters) || item.unsupportedCharacters.length ||
         !record(item.anchor) || !finite(item.anchor.x) || !finite(item.anchor.y) ||
-        !record(item.target) || !['local', 'relay', 'webtool'].includes(String(item.target.mode)) ||
-        typeof item.target.baseUrl !== 'string' || typeof item.target.contextRevision !== 'string' || !item.target.contextRevision ||
-        (item.target.mode === 'relay' && (typeof item.target.relayId !== 'string' || !item.target.relayId)) ||
+        !record(item.target) || typeof item.target.baseUrl !== 'string' ||
+        typeof item.target.contextRevision !== 'string' || !item.target.contextRevision ||
+        typeof item.target.relayId !== 'string' || !item.target.relayId ||
         !['queued', 'submitted', 'confirmed', 'failed', 'expired', 'unknown'].includes(String(item.phase))) return invalid()
     const url = new URL(item.target.baseUrl)
     if (!['http:', 'https:'].includes(url.protocol) || url.username || url.password || url.search || url.hash) return invalid()
+    const relayId = item.target.relayId as string
     ids.add(item.id)
     return {
       id: item.id, checksum: item.checksum, svg: item.svg, unsupportedCharacters: [],
       anchor: { x: item.anchor.x, y: item.anchor.y },
       phase: item.phase as LiveUpdate['phase'],
-      target: { mode: item.target.mode as ImportTarget['mode'], baseUrl: item.target.baseUrl,
-        contextRevision: item.target.contextRevision, ...(typeof item.target.relayId === 'string' ? { relayId: item.target.relayId } : {}) },
+      target: { baseUrl: item.target.baseUrl, relayId, contextRevision: item.target.contextRevision },
     }
   })
   if (items.slice(1).some(item => item.phase !== 'queued')) return invalid()

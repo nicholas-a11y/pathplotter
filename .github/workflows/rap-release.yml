@@ -2,11 +2,11 @@ name: Publish portable Windows RAP
 
 on:
   push:
-    tags: ['rap-v2.*']
+    tags: ['rap-v*']
   workflow_dispatch:
     inputs:
       tag:
-        description: 'Release tag beginning rap-v2. (must already exist)'
+        description: 'Existing release tag, for example rap-v3.0.0'
         required: true
         type: string
 
@@ -28,9 +28,12 @@ jobs:
         env:
           RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
         run: |
-          if ($env:RELEASE_TAG -notmatch '^rap-v2\.\d+\.\d+$') { throw 'Use a rap-v2.MINOR.PATCH tag.' }
+          if ($env:RELEASE_TAG -notmatch '^rap-v(\d+\.\d+\.\d+)$') { throw 'Use a rap-vMAJOR.MINOR.PATCH tag.' }
+          $tagVersion = $Matches[1]
           git rev-parse --verify "refs/tags/$env:RELEASE_TAG"
           if ($LASTEXITCODE -ne 0) { throw 'The requested release tag does not exist.' }
+          $fileVersion = [IO.File]::ReadAllText("$env:GITHUB_WORKSPACE\rap\version.txt").Trim()
+          if ($fileVersion -cne $tagVersion) { throw "rap/version.txt ($fileVersion) does not match tag $env:RELEASE_TAG." }
       - uses: actions/setup-node@v4
         with:
           node-version: 24
@@ -49,6 +52,8 @@ jobs:
         run: |
           & "$env:SystemRoot\System32\WindowsPowerShell\v1.0\powershell.exe" -NoProfile -File .\rap\Test-RAP.ps1
           if ($LASTEXITCODE -ne 0) { throw 'RAP tests failed.' }
+          & "$env:SystemRoot\System32\WindowsPowerShell\v1.0\powershell.exe" -NoProfile -File .\rap\Test-Operator-Invitations.ps1
+          if ($LASTEXITCODE -ne 0) { throw 'Operator invitation tests failed.' }
           & "$env:SystemRoot\System32\WindowsPowerShell\v1.0\powershell.exe" -NoProfile -STA -File .\rap\Test-GUI.ps1
           if ($LASTEXITCODE -ne 0) { throw 'GUI tests failed.' }
       - name: Package allowlisted source distribution
@@ -62,7 +67,7 @@ jobs:
         run: |
           gh release view $env:RELEASE_TAG
           if ($LASTEXITCODE -ne 0) {
-            gh release create $env:RELEASE_TAG --verify-tag --title "PathPlotter Windows RAP $env:RELEASE_TAG" --notes "Portable Windows RAP. Extract the complete ZIP and double-click Start RAP.cmd. Requires the matching protocol 2 relay/frontend. No installer or automatic laser operation."
+            gh release create $env:RELEASE_TAG --verify-tag --title "PathPlotter Windows RAP $env:RELEASE_TAG" --notes "Portable Windows RAP. New users: extract the complete ZIP and double-click Start RAP.cmd. Existing users: click Update now in the RAP window. No installer and no automatic laser operation."
             if ($LASTEXITCODE -ne 0) { throw 'Release creation failed.' }
           }
           gh release upload $env:RELEASE_TAG .\PathPlotter-RAP-Windows.zip .\PathPlotter-RAP-Windows.zip.sha256

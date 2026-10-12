@@ -13,7 +13,7 @@ function Initialize-DesktopTypes {
     if (-not ('PathPlotterRap.UiBridge' -as [type])) {
         $compiler = New-Object CodeDom.Compiler.CompilerParameters
         $compiler.GenerateInMemory = $true
-        $compiler.TempFiles = New-Object CodeDom.Compiler.TempFileCollection($PSScriptRoot, $false)
+        $compiler.TempFiles = New-Object CodeDom.Compiler.TempFileCollection([IO.Path]::GetTempPath(), $false)
         foreach ($assembly in @('System.dll', 'System.Core.dll', 'System.Drawing.dll')) { [void]$compiler.ReferencedAssemblies.Add($assembly) }
         try { Add-Type -Path (Join-Path $PSScriptRoot 'Desktop.cs') -CompilerParameters $compiler }
         finally { $compiler.TempFiles.Delete() }
@@ -35,7 +35,7 @@ function Initialize-DesktopTypes {
         # Separate compilation units keep upstream using directives legal.
         $compiler = New-Object CodeDom.Compiler.CompilerParameters
         $compiler.GenerateInMemory = $true
-        $compiler.TempFiles = New-Object CodeDom.Compiler.TempFileCollection($PSScriptRoot, $false)
+        $compiler.TempFiles = New-Object CodeDom.Compiler.TempFileCollection([IO.Path]::GetTempPath(), $false)
         foreach ($assembly in @('System.dll', 'System.Core.dll', 'System.Drawing.dll')) { [void]$compiler.ReferencedAssemblies.Add($assembly) }
         $provider = New-Object Microsoft.CSharp.CSharpCodeProvider
         try {
@@ -189,22 +189,8 @@ function Handle-UiEvent($Event) {
     $d = $script:Desktop
     switch -CaseSensitive ($Event.kind) {
         'setup' {
-            $d.busy = $false; $d.setup.Visible = $true; $d.register.Enabled = $true
-            $d.enrollment.Visible = $false
-            if ($null -ne $Event.value) { $d.api.Text = $Event.value.apiRoot; $d.name.Text = $Event.value.name }
-            $d.status.Text = 'Not registered.'
-            Show-RapWindow
-        }
-        'enrollment' {
-            $d.busy = $false; $d.setup.Visible = $false; $d.enrollment.Visible = $true
-            $d.enrollmentPhrase = $Event.value.phrase
-            $d.enrollmentText.Text = 'Enrollment phrase: ' + $Event.value.phrase + '. Compare it with the browser for this computer. Never approve a different phrase or an unsolicited request.'
-            $d.confirmEnrollment.Enabled = $true
-            $d.status.Text = 'Browser setup opened. Complete its verification and explicit approval. Confirm the matching phrase below to finish on this computer.'
-            if (-not $d.smoke) {
-                try { Start-Process -FilePath $Event.value.url }
-                catch { $d.notice.Text = 'Windows could not open your browser. Retry setup explicitly; the enrollment verifier is protected for recovery.' }
-            }
+            $d.busy = $false; $d.setup.Visible = $true; $d.registrationAdvanced.Visible = $true; $d.register.Enabled = $true
+            $d.status.Text = 'Not registered. Enter the Invitation ID you were given.'
             Show-RapWindow
         }
         'consent' {
@@ -212,7 +198,7 @@ function Handle-UiEvent($Event) {
             $d.status.Text = 'Open LightBurn, enable REST API in Settings > Extensions, keep network API access disabled. Click below, bring LightBurn forward, then approve its own dialog within 30 seconds.'
             Show-RapWindow
         }
-        'configured' { $d.configured = $true; $d.busy = $false; $d.setup.Visible = $false; $d.enrollment.Visible = $false; $d.consent.Visible = $false; $d.status.Text = 'Connecting to LightBurn and relay...' }
+        'configured' { $d.configured = $true; $d.busy = $false; $d.setup.Visible = $false; $d.registrationAdvanced.Visible = $false; $d.consent.Visible = $false; $d.status.Text = 'Connecting to LightBurn and relay...' }
         'recovery' {
             $d.busy = $false; $d.recovery.Visible = $true
             $d.status.Text = 'Saved registration is invalid or unreadable. Replace only local credentials with explicit consent below. The import journal is preserved; ask the operator to revoke the old agent credential and revoke the old LightBurn entry.'
@@ -221,17 +207,23 @@ function Handle-UiEvent($Event) {
         'health' {
             $d.healthy = $Event.value.connected
             $d.importing = [bool]$Event.value.importing
-            $d.activeSlowHttp = [bool]$Event.value.slowHttp
-            $d.status.Text = $(if ($d.healthy) { 'Connected' } else { 'Reconnecting / not ready' }) +
-                ' - ' + $(if ($d.activeSlowHttp) { 'HTTP compatibility mode' } else { 'WebSockets' }) + '. ' + $Event.value.message
+            $d.status.Text = $(if ($d.healthy) { 'Connected. ' } else { 'Not ready. ' }) + $Event.value.message
             if ($Event.value.importing) { $d.status.Text += ' Import in progress; never automatically retried.' }
             $d.tray.Text = 'PathPlotter RAP - ' + $(if ($d.healthy) { 'Connected' } else { 'Not ready' })
             if (-not $d.healthy) { Show-Approvals @{} }
         }
-        'transport' {
-            $d.activeSlowHttp = [bool]$Event.value
-            $d.healthy = $false
-            $d.status.Text = 'Reconnecting - ' + $(if ($d.activeSlowHttp) { 'HTTP compatibility mode' } else { 'WebSockets' }) + '.'
+        'version' {
+            $d.versionLabel.Text = 'RAP v' + $Event.value.current
+            $d.update.Visible = [bool]$Event.value.available
+            if ($Event.value.available) {
+                $d.update.Text = 'Update now to v' + $Event.value.latest
+                $d.versionLabel.Text += ' - update available'
+                if ($Event.value.required) { Show-RapWindow }
+            }
+        }
+        'restarting' {
+            $d.closing = $true; $d.bridge.StopRequested = $true
+            $d.status.Text = 'RAP updated. Restarting...'
         }
         'desktop' {
             # Never place launch grants in labels, clipboard, QR, logs or saved state.
@@ -313,11 +305,25 @@ function Start-RapDesktop {
         $d.list = New-UiButton 'Paired browser' @{ action = 'browsers' }
         foreach ($button in @($d.open, $d.pair)) { $button.Enabled = $false; $actions.Controls.Add($button) }
         $d.list.Enabled = $false
+        $versionRow = New-Object Windows.Forms.FlowLayoutPanel
+        $versionRow.Size = New-Object Drawing.Size(585, 35); $layout.Controls.Add($versionRow)
+        $d.versionLabel = New-Object Windows.Forms.Label
+        $d.versionLabel.AutoSize = $true; $d.versionLabel.Margin = New-Object Windows.Forms.Padding(3, 8, 3, 3)
+        $d.versionLabel.Text = 'RAP'; $versionRow.Controls.Add($d.versionLabel)
+        $d.update = New-Object Windows.Forms.Button
+        $d.update.AutoSize = $true; $d.update.Visible = $false
+        $d.update.Add_Click({
+            param($sender, $eventArgs)
+            if ([Windows.Forms.MessageBox]::Show('Download the new RAP from GitHub, replace these files and restart RAP? Your registration and LightBurn permission are kept.', 'Update RAP', 'YesNo', 'Question') -eq 'Yes') {
+                if (Submit-Ui @{ action = 'update' }) { $sender.Enabled = $false; $script:Desktop.status.Text = 'Downloading update...' }
+            }
+        })
+        $versionRow.Controls.Add($d.update)
         $d.setup = New-Object Windows.Forms.FlowLayoutPanel
         $d.setup.Size = New-Object Drawing.Size(580, 90); $d.setup.FlowDirection = 'TopDown'; $d.setup.WrapContents = $false; $d.setup.Visible = $false
         $layout.Controls.Add($d.setup)
         $d.registrationAdvanced = New-Object Windows.Forms.FlowLayoutPanel
-        $d.registrationAdvanced.Size = New-Object Drawing.Size(560, 180)
+        $d.registrationAdvanced.Size = New-Object Drawing.Size(560, 110)
         $d.registrationAdvanced.FlowDirection = 'TopDown'; $d.registrationAdvanced.WrapContents = $false
         foreach ($field in @(@('Relay origin', 'api'), @('Computer name', 'name'), @('Invitation ID', 'invitation'))) {
             $parent = $(if ($field[1] -ceq 'invitation') { $d.setup } else { $d.registrationAdvanced })
@@ -327,77 +333,29 @@ function Start-RapDesktop {
             $box.Width = 540; $d[$field[1]] = $box; $parent.Controls.Add($box)
         }
         $d.name.Text = $env:COMPUTERNAME; $d.invitation.UseSystemPasswordChar = $true
-        $d.api.Text = 'https://pathplotter-relay-v2.nicholas-leqeta.workers.dev'; $d.api.ReadOnly = $true
-        $d.override = New-Object Windows.Forms.CheckBox
-        $d.override.Text = 'Override relay origin'; $d.override.AutoSize = $true
-        $d.override.Add_CheckedChanged({ $script:Desktop.api.ReadOnly = -not $script:Desktop.override.Checked })
-        $d.registrationAdvanced.Controls.Add($d.override)
-        $d.guided = New-Object Windows.Forms.CheckBox
-        $d.guided.Text = 'Use guided enrollment instead of an invitation'; $d.guided.AutoSize = $true
-        $d.guided.Add_CheckedChanged({ $script:Desktop.invitation.Enabled = -not $script:Desktop.guided.Checked })
-        $d.registrationAdvanced.Controls.Add($d.guided)
+        $d.api.Text = 'https://pathplotter-relay-v3.nicholas-leqeta.workers.dev'
         $d.register = New-Object Windows.Forms.Button
         $d.register.Text = 'Register this computer'; $d.register.AutoSize = $true
         $d.register.Add_Click({
             $s = $script:Desktop
-            if (-not $s.guided.Checked -and [string]::IsNullOrWhiteSpace($s.invitation.Text)) { $s.notice.Text = 'Enter your Invitation ID.'; return }
-            $invitation = $(if ($s.guided.Checked) { '' } else { $s.invitation.Text })
-            if (Submit-Ui @{ action = 'register'; api = $s.api.Text.Trim(); name = $s.name.Text.Trim(); invitation = $invitation }) {
-                $s.invitation.Clear(); $s.register.Enabled = $false; $s.status.Text = 'Registering... Do not repeat an ambiguous request automatically.'
+            if ([string]::IsNullOrWhiteSpace($s.invitation.Text)) { $s.notice.Text = 'Enter your Invitation ID.'; return }
+            if (Submit-Ui @{ action = 'register'; api = $s.api.Text.Trim(); name = $s.name.Text.Trim(); invitation = $s.invitation.Text.Trim() }) {
+                $s.invitation.Clear(); $s.register.Enabled = $false; $s.status.Text = 'Registering...'
             }
         })
         $d.setup.Controls.Add($d.register)
-        $discard = New-Object Windows.Forms.Button
-        $discard.Text = 'Discard expired enrollment setup...'; $discard.AutoSize = $true
-        $discard.Add_Click({
-            if ([Windows.Forms.MessageBox]::Show('Discard only the protected pending enrollment verifier? Any ambiguous completed registration will no longer be recoverable through this verifier. Use only for expired or cancelled setup. Existing credentials and import journal are untouched.', 'Discard pending setup', 'YesNo', 'Warning') -eq 'Yes') {
-                [void](Submit-Ui @{ action = 'discard-enrollment' })
-            }
-        })
-        $d.registrationAdvanced.Controls.Add($discard)
-        $d.enrollment = New-Object Windows.Forms.FlowLayoutPanel
-        $d.enrollment.Size = New-Object Drawing.Size(580, 120); $d.enrollment.Visible = $false
-        $d.enrollmentText = New-Object Windows.Forms.Label
-        $d.enrollmentText.Size = New-Object Drawing.Size(560, 65); $d.enrollment.Controls.Add($d.enrollmentText)
-        $d.confirmEnrollment = New-Object Windows.Forms.Button
-        $d.confirmEnrollment.Text = 'Confirm exact matching enrollment phrase'; $d.confirmEnrollment.AutoSize = $true
-        $d.confirmEnrollment.Add_Click({
-            $s = $script:Desktop
-            if ([Windows.Forms.MessageBox]::Show('Only continue if your browser shows "' + $s.enrollmentPhrase + '" for this computer and you explicitly approved that request. Never approve an unsolicited enrollment.', 'Confirm enrollment', 'YesNo', 'Warning') -eq 'Yes') {
-                if (Submit-Ui @{ action = 'confirm-enrollment'; phrase = $s.enrollmentPhrase }) { $s.confirmEnrollment.Enabled = $false; $s.status.Text = 'Waiting for browser approval (setup checks at least 5 seconds apart)...' }
-            }
-        })
-        $d.enrollment.Controls.Add($d.confirmEnrollment); $layout.Controls.Add($d.enrollment)
-        $d.importing = $false; $d.activeSlowHttp = $false
+        $d.importing = $false
         $advanced = New-Object Windows.Forms.CheckBox
         $advanced.Text = 'Advanced connection settings'; $advanced.AutoSize = $true
-        $d.transportPanel = New-Object Windows.Forms.FlowLayoutPanel
-        $d.transportPanel.AutoSize = $true; $d.transportPanel.MaximumSize = New-Object Drawing.Size(580, 0)
-        $d.transportPanel.FlowDirection = 'TopDown'; $d.transportPanel.WrapContents = $false
-        $d.transportPanel.Visible = $false
-        $advanced.Add_CheckedChanged({ param($sender, $eventArgs) $script:Desktop.transportPanel.Visible = $sender.Checked })
+        $d.advancedPanel = New-Object Windows.Forms.FlowLayoutPanel
+        $d.advancedPanel.AutoSize = $true; $d.advancedPanel.MaximumSize = New-Object Drawing.Size(580, 0)
+        $d.advancedPanel.FlowDirection = 'TopDown'; $d.advancedPanel.WrapContents = $false
+        $d.advancedPanel.Visible = $false
+        $advanced.Add_CheckedChanged({ param($sender, $eventArgs) $script:Desktop.advancedPanel.Visible = $sender.Checked })
         $layout.Controls.Add($advanced)
-        $d.transportPanel.Controls.Add($d.registrationAdvanced)
-        $d.transportPanel.Controls.Add($d.list)
-        $d.socketChoice = New-Object Windows.Forms.RadioButton
-        $d.socketChoice.Text = 'WebSockets (recommended; reconnects automatically)'
-        $d.socketChoice.AutoSize = $true; $d.socketChoice.Checked = $true
-        $d.httpChoice = New-Object Windows.Forms.RadioButton
-        $d.httpChoice.Text = 'Compatibility mode - slower HTTP'
-        $d.httpChoice.AutoSize = $true
-        $d.transportPanel.Controls.Add($d.socketChoice); $d.transportPanel.Controls.Add($d.httpChoice)
-        $help = New-Object Windows.Forms.Label
-        $help.Text = 'Use HTTP only if your network blocks WebSockets. Updates and approvals may take longer. Select the same mode in PathPlotter. No automatic HTTP fallback or import retries.'
-        $help.Size = New-Object Drawing.Size(555, 48); $d.transportPanel.Controls.Add($help)
-        $d.applyTransport = New-Object Windows.Forms.Button
-        $d.applyTransport.Text = 'Apply'; $d.applyTransport.AutoSize = $true; $d.applyTransport.Enabled = $false
-        $d.applyTransport.Add_Click({
-            $s = $script:Desktop
-            if ($s.importing) { $s.notice.Text = 'Wait for the current import outcome before changing connection settings.'; return }
-            [void](Submit-Ui @{ action = $(if ($s.httpChoice.Checked) { 'slow-http' } else { 'socket' }) })
-        })
-        $d.transportPanel.Controls.Add($d.applyTransport)
-        $layout.Controls.Add($d.transportPanel)
+        $d.advancedPanel.Controls.Add($d.registrationAdvanced)
+        $d.advancedPanel.Controls.Add($d.list)
+        $layout.Controls.Add($d.advancedPanel)
         $d.consent = New-UiButton 'Request local LightBurn permission (state, project, upload)' @{ action = 'consent' }
         $d.consent.Visible = $false; $layout.Controls.Add($d.consent)
         $d.recovery = New-Object Windows.Forms.Button
@@ -425,6 +383,9 @@ function Start-RapDesktop {
             $d['menu-' + $item[1]] = $entry; $entry.Enabled = $false
         }
         $entry = $menu.Items.Add('Status'); $entry.Add_Click({ Show-RapWindow })
+        $entry = $menu.Items.Add('Check for updates'); $entry.Tag = @{ action = 'check-update' }
+        $entry.Add_Click({ param($sender, $eventArgs) [void](Submit-Ui $sender.Tag) })
+        $d['menu-check-update'] = $entry; $entry.Enabled = $false
         foreach ($item in @(@('Forget LightBurn permission...', 'forget-lightburn'), @('Forget local registration...', 'forget-relay'))) {
             $entry = $menu.Items.Add($item[0]); $entry.Tag = @{ action = $item[1] }
             $d['menu-' + $item[1]] = $entry; $entry.Enabled = $false
@@ -469,11 +430,9 @@ function Start-RapDesktop {
                 foreach ($control in @($s.open, $s.pair, $s['menu-open'], $s['menu-phone'])) {
                     $control.Enabled = $s.healthy -and -not $s.busy -and -not $s.closing -and -not $s.stopped
                 }
-                foreach ($control in @($s.list, $s['menu-browsers'], $s['menu-forget-lightburn'], $s['menu-forget-relay'])) {
+                foreach ($control in @($s.list, $s.update, $s['menu-browsers'], $s['menu-check-update'], $s['menu-forget-lightburn'], $s['menu-forget-relay'])) {
                     $control.Enabled = $s.configured -and -not $s.busy -and -not $s.closing -and -not $s.stopped
                 }
-                $s.applyTransport.Enabled = $s.configured -and -not $s.importing -and -not $s.busy -and
-                    -not $s.closing -and -not $s.stopped -and ($s.httpChoice.Checked -ne $s.activeSlowHttp)
                 if ($null -ne $s.phone -and $s.phoneUrl) {
                     $remaining = $s.phoneDeadline - $s.clock.ElapsedMilliseconds
                     if ($remaining -le 0) { Clear-Phone }
@@ -519,15 +478,13 @@ function Step-GuiSmoke {
     switch ($s.smokeStage) {
         0 {
             if ($s.setup.Visible) {
-                if ($s.transportPanel.Visible -or $s.api.Visible -or $s.name.Visible -or $s.setup.Controls.Count -ne 3) { throw 'Advanced setup is not hidden by default.' }
+                if ($s.advancedPanel.Visible -or $s.api.Visible -or $s.name.Visible -or $s.setup.Controls.Count -ne 3) { throw 'Advanced setup is not hidden by default.' }
                 $s.register.PerformClick()
                 if ($s.busy -or -not $s.bridge.Commands.IsEmpty -or $s.notice.Text -cne 'Enter your Invitation ID.' -or -not $s.invitation.UseSystemPasswordChar) { throw 'Blank invitation was not refused explicitly.' }
-                $s.guided.Checked = $true
-                [void](Submit-Ui @{ action = 'register'; api = 'https://fixture.invalid'; name = 'Fixture PC'; invitation = '' }); $s.smokeStage = 1
+                [void](Submit-Ui @{ action = 'register'; api = 'https://fixture.invalid'; name = 'Fixture PC'; invitation = 'fixture-invitation-id' }); $s.smokeStage = 1
             }
         }
-        1 { if ($s.enrollment.Visible -and -not $s.busy) { [void](Submit-Ui @{ action = 'confirm-enrollment'; phrase = $s.enrollmentPhrase }); $s.smokeStage = 8 } }
-        8 { if ($s.consent.Visible) { [void](Submit-Ui @{ action = 'consent' }); $s.smokeStage = 2 } }
+        1 { if ($s.consent.Visible) { [void](Submit-Ui @{ action = 'consent' }); $s.smokeStage = 2 } }
         2 {
             if ($s.consent.Visible -and -not $s.busy -and $s.fixtureEvents.Contains('consent-denied')) {
                 [void](Submit-Ui @{ action = 'consent' })
@@ -556,33 +513,10 @@ function Step-GuiSmoke {
             }
         }
         6 {
-            if (-not $s.phoneUrl -and -not $s.busy) {
-                if (-not $s.socketChoice.Checked -or $s.activeSlowHttp) { throw 'WebSockets must be the default.' }
-                $s.transportPanel.Visible = $true
-                $s.httpChoice.Checked = $true
-                if ($s.activeSlowHttp) { throw 'Selecting a radio button must not change transport.' }
-                $s.smokeStage = 9
+            if (-not $s.phoneUrl -and -not $s.busy -and $s.update.Visible) {
+                if ($s.update.Text -cne 'Update now to v9.9.9' -or $s.versionLabel.Text -notmatch '^RAP v\d+\.\d+\.\d+ - update available$') { throw 'Update offer is not shown.' }
+                [void](Submit-Ui @{ action = 'update' }); $s.smokeStage = 7
             }
-        }
-        9 {
-            if ($s.applyTransport.Enabled) { $s.applyTransport.PerformClick(); $s.smokeStage = 10 }
-        }
-        10 {
-            if ($s.activeSlowHttp -and -not $s.busy) {
-                $s.importing = $true
-                $s.applyTransport.Enabled = $false
-                $s.socketChoice.Checked = $true
-                $s.applyTransport.PerformClick()
-                if (-not $s.activeSlowHttp -or $s.busy) { throw 'Apply must not run during an import.' }
-                $s.importing = $false
-                $s.smokeStage = 11
-            }
-        }
-        11 {
-            if ($s.applyTransport.Enabled) { $s.applyTransport.PerformClick(); $s.smokeStage = 12 }
-        }
-        12 {
-            if (-not $s.activeSlowHttp -and -not $s.busy) { Request-RapQuit; $s.smokeStage = 7 }
         }
     }
 }
@@ -591,12 +525,12 @@ function Assert-GuiSmoke {
     $s = $script:Desktop
     if ($s.failed -or $s.smokeStage -ne 7 -or $s.smokeOpens -ne 1 -or $s.smokePhones -ne 1 -or
         $s.fixtureEvents.Contains('approve') -or -not $s.fixtureEvents.Contains('reject') -or -not $s.fixtureEvents.Contains('disconnected') -or
-        -not $s.fixtureEvents.Contains('enrollment-confirmed') -or -not $s.fixtureEvents.Contains('consent-denied') -or -not $s.fixtureEvents.Contains('consent-granted') -or
-        $s.smokeConsentTicks -lt 10) {
+        -not $s.fixtureEvents.Contains('registered') -or -not $s.fixtureEvents.Contains('consent-denied') -or -not $s.fixtureEvents.Contains('consent-granted') -or
+        -not $s.fixtureEvents.Contains('installed') -or -not $s.fixtureEvents.Contains('relaunch') -or $s.smokeConsentTicks -lt 10) {
         throw ('GUI fixture smoke checks failed: stage=' + $s.smokeStage + ', failed=' + $s.failed +
             ', opens=' + $s.smokeOpens + ', phones=' + $s.smokePhones + ', fixture=' + ($s.fixtureEvents -join ','))
     }
-    Write-Host 'PASS GUI: STA form/tray, guided enrollment, consent, responsive UI, desktop/phone pairing, advanced transport radio selection with explicit Apply and import guard, duplicate activation and graceful shutdown.'
+    Write-Host 'PASS GUI: STA form/tray, invitation registration, consent, responsive UI, desktop/phone pairing, update offer, install and restart, duplicate activation and graceful shutdown.'
 }
 
 if (-not $LibraryOnly) {

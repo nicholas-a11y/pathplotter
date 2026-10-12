@@ -16,19 +16,8 @@ class TestChannel implements HandoverChannel {
   close(): void { this.listeners.clear() }
 }
 const state: LiveHandoverState = { enabled: true, target: {
-  mode: 'relay', baseUrl: 'https://relay.example', relayId: 'test', contextRevision: 'original',
+  baseUrl: 'https://relay.example', relayId: 'test', contextRevision: 'original',
 } }
-
-test('Webtool live ownership preserves its direct API destination without cloud identity', async () => {
-  const peers: TestChannel[] = []
-  const direct: LiveHandoverState = { enabled: true, target: {
-    mode: 'webtool', baseUrl: 'http://localhost:19520', contextRevision: 'original',
-  } }
-  const owner = new LiveHandover(new TestChannel(peers), 'old', () => true, async () => direct)
-  const requester = new LiveHandover(new TestChannel(peers), 'new', () => false, async () => null)
-  try { assert.deepEqual(await requester.request(1000), direct) }
-  finally { owner.close(); requester.close() }
-})
 
 test('handover replies only after the owner has finished its current operation', async () => {
   const peers: TestChannel[] = []

@@ -1,26 +1,10 @@
-# Safe worker fixture. Never uses network, actual user registration or LightBurn.
-$script:ActiveImport = @{ fixture = $true }
-Invoke-UiCommand @{ action = 'slow-http' }
-if ($script:SlowHttp -or $null -eq $script:ActiveImport) { throw 'Worker changed transport or stopped an active import.' }
-$script:SlowHttp = $true
-Invoke-UiCommand @{ action = 'socket' }
-if (-not $script:SlowHttp -or $null -eq $script:ActiveImport) { throw 'Worker restored sockets during an active import.' }
-$script:SlowHttp = $false
-$script:ActiveImport = $null
+# Safe worker fixture. Never uses network, actual user registration, GitHub or LightBurn.
 $script:FixtureConsentAttempts = 0
-$script:FixtureClaimAttempts = 0
 function Invoke-Http([string]$Url, [string]$Method, [string]$Token, $Body = $null, [hashtable]$Headers = @{}, [int]$TimeoutMs = 5000, [switch]$Raw) {
-    if ($Url -ceq 'https://fixture.invalid/v1/register') { return @{ relayId = 'fixture-relay'; credential = 'fixture-only' } }
-    if ($Url -ceq 'https://fixture.invalid/v1/enrollment/start') {
-        if ((Read-Protected 'enrollment.dpapi').verifier -cne $Body.verifier) { throw 'Verifier was not persisted before start.' }
-        return @{ requestId = 'fixture-enrollment'; phrase = 'AMBER RIVER'; expiresAt = 1800000600000.0 }
-    }
-    if ($Url -ceq 'https://fixture.invalid/v1/enrollment/fixture-enrollment/claim') {
-        $script:FixtureClaimAttempts++
-        if ($script:FixtureClaimAttempts -eq 1) { $script:FixtureFirstClaim = $script:Clock.ElapsedMilliseconds; return @{ status = 'pending' } }
-        if ($script:Clock.ElapsedMilliseconds - $script:FixtureFirstClaim -lt 5000) { throw 'Enrollment polled too quickly.' }
-        Send-Ui 'fixture' 'enrollment-confirmed'
-        return @{ status = 'complete'; relayId = 'fixture-relay'; credential = 'fixture-only' }
+    if ($Url -ceq 'https://fixture.invalid/v1/register') {
+        if ($Body.invitation -cne 'fixture-invitation-id' -or $Body.name -cne 'Fixture PC' -or $Body.Count -ne 2) { throw 'Registration body is wrong.' }
+        Send-Ui 'fixture' 'registered'
+        return @{ relayId = 'fixture-relay'; credential = 'fixture-only' }
     }
     if ($Url -ceq 'http://127.0.0.1:19520/api/connect') {
         $script:FixtureConsentAttempts++
@@ -35,7 +19,10 @@ $script:FixturePairRejected = $false
 function Invoke-Cloud([string]$Path, $Body = @{}, [string]$Method = 'POST') {
     $now = ([DateTime]::UtcNow - [DateTime]'1970-01-01').TotalMilliseconds
     switch -CaseSensitive ($Path) {
-        '/agent/start' { return @{ generation = 1; serverTime = $now } }
+        '/agent/start' {
+            if ($Body.version -cne $script:RapVersion) { throw 'Start did not report the RAP version.' }
+            return @{ generation = 1; serverTime = $now }
+        }
         '/agent/update' {
             if (-not $Body.connected) { Send-Ui 'fixture' 'disconnected' }
             $pending = @()
@@ -43,9 +30,9 @@ function Invoke-Cloud([string]$Path, $Body = @{}, [string]$Method = 'POST') {
             return @{ serverTime = $now; job = $null; pairings = $pending; previewActive = $true }
         }
         '/agent/browser-launch' { return @{ launchToken = 'fixture-launch-never-display'; expiresAt = $now + 60000 } }
-        '/browsers' { return @{ browsers = @() } }
-        '/pairing/new' { return @{ invitation = 'fixture-phone'; expiresAt = $now + 300000 } }
-        '/pairing/decide' {
+        '/agent/browsers' { return @{ browsers = @() } }
+        '/agent/pairing/new' { return @{ invitation = 'fixture-phone'; expiresAt = $now + 300000 } }
+        '/agent/pairing/decide' {
             if ($Body.pairingId -cne 'fixture-pair') { throw 'Wrong pairing target.' }
             if ($Body.approve) { Send-Ui 'fixture' 'approve' }
             else { Send-Ui 'fixture' 'reject'; $script:FixturePairRejected = $true }
@@ -71,3 +58,9 @@ function New-AgentSocket {
     $mock | Add-Member ScriptMethod Dispose { $this.IsOpen = $false; Send-Ui 'fixture' 'disconnected' }
     return $mock
 }
+function Get-RapLatestRelease { return @{ version = '9.9.9'; tag = 'rap-v9.9.9'; zipUrl = 'https://github.com/fixture'; hashUrl = 'https://github.com/fixture.sha256' } }
+function Install-RapUpdate($Release) {
+    if ($Release.version -cne '9.9.9') { throw 'Wrong release installed.' }
+    Send-Ui 'fixture' 'installed'
+}
+function Start-RapRelaunch($Directory) { Send-Ui 'fixture' 'relaunch' }

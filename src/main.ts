@@ -1,21 +1,12 @@
 import './style.css'
 import { captureGroups, allPoints, finishCapture, type Collection, type CaptureGroup, type Point, type ShapeType } from './capture-groups'
 import { layerPalette, isLayerColor } from './layer-palette'
-import { SettledPosition } from './settled-position'
 import { RelayClient, RelayRequestError, loadIdentity, saveIdentity, browserLink, exchangeBrowserLink, parseJob, type BrowserLink } from './relay'
 import { appendCollectionPrimitives, primitiveBounds, hasEnoughPoints, serializeSvg, buildDelta, fmt, type BuiltSvg, type Primitive } from './geometry'
-import { LIVE_QUEUE_LIMIT, emptyLiveQueue, makeUpdate, enqueue, recordOutcome, parseLiveQueue, type LiveUpdate, type ImportTarget, type LiveQueue } from './live-updates'
-import { openImportStream, type ImportResult } from './import-stream'
+import { LIVE_QUEUE_LIMIT, emptyLiveQueue, makeUpdate, enqueue, recordOutcome, parseLiveQueue, type LiveUpdate, type ImportTarget, type LiveQueue, type ImportResult } from './live-updates'
 import { LiveHandover, HANDOVER_TIMEOUT_MS, type LiveHandoverState } from './live-handover'
 import { setupOnboarding, HOSTED_RELAY } from './onboarding'
 
-interface LivePosition {
-  x: number
-  y: number
-  updatedAt: number
-}
-
-const CAPABILITIES = ['state', 'project', 'upload']
 const STORAGE_KEY = 'pathplotter.collection.v3'
 
 function colorPicker(inputId: string, label: string): string {
@@ -65,7 +56,7 @@ app.innerHTML = `
     <button id="liveAbandonBtn" class="danger" hidden>Abandon unsent updates</button>
   </section>
   <div class="workspace-status">
-    <p id="statusText" role="status">Ready. Connect to LightBurn to capture.</p>
+    <p id="statusText" role="status">Ready. Open PathPlotter from RAP to connect.</p>
     <p id="captureBlockHint" role="status" hidden></p>
     <p id="liveText">No head position available.</p>
   </div>
@@ -84,24 +75,17 @@ app.innerHTML = `
       <h2 id="connectionTitle">Connection</h2>
       <button data-close="connectionDialog" aria-label="Close connection">Close</button>
     </header>
-    <label>Connection type
-      <select id="connectionMode">
-        <option value="relay">Cloud relay (RAP)</option>
-        <option value="webtool">LightBurn Webtool (direct API, no RAP)</option>
-        <option value="local">Local development connection</option>
-      </select>
-    </label>
     <section id="relayConnection">
-      <p class="hint">Open this browser using Open PathPlotter in RAP. For a phone, choose Pair phone in RAP and scan its QR or open its link, then compare and approve the phrase in RAP. The link contains all pairing details. Saved browsers can reconnect below; capture control is automatic when available.</p>
+      <p class="hint">Connect by clicking Open PathPlotter in RAP, or scan RAP's Pair phone QR code. A browser that was paired before can reconnect here.</p>
       <div class="row">
-        <button id="pairRelayBtn" class="primary">Reconnect saved browser</button>
+        <button id="pairRelayBtn" class="primary">Reconnect</button>
       </div>
       <p id="relayMessage" role="status"></p>
       <details>
-        <summary>Advanced / recovery</summary>
+        <summary>Advanced</summary>
         <label>Saved relay API URL<input id="relayUrl" type="url" value="${HOSTED_RELAY}" readonly /></label>
         <label>Saved relay ID<input id="relayId" readonly /></label>
-        <p class="hint">Only needed when changing workspace, recovering an interrupted import, or removing this browser's connection. These actions never move points or resend artwork.</p>
+        <p class="hint">Recovery tools. None of these move points or resend artwork.</p>
         <div class="row">
         <button id="unlinkRelayBtn">Unlink this browser</button>
         <button id="revalidateBtn">Confirm workspace for existing points</button>
@@ -109,25 +93,6 @@ app.innerHTML = `
         <button id="resolveImportBtn">Acknowledge uncertain import</button>
       </div>
       </details>
-    </section>
-    <section id="localConnection">
-    <div class="form-grid">
-      <label>LightBurn base URL
-        <input id="baseUrl" type="url" value="http://localhost:19520" />
-      </label>
-      <label id="secretField">Shared secret
-        <input id="secret" type="password" placeholder="Optional: paste an existing secret" />
-      </label>
-      <label>Application name
-        <input id="applicationName" type="text" value="PathPlotter" />
-      </label>
-    </div>
-    <p id="directConnectionHint" class="hint"></p>
-    <p id="apiPairingHint" class="hint"></p>
-    <div class="row">
-      <button id="connectBtn" class="primary">Connect</button>
-    </div>
-    <p id="connectionMessage" role="status"></p>
     </section>
   </dialog>
 
@@ -196,7 +161,7 @@ app.innerHTML = `
       <h2 id="sessionTitle">Session backup</h2>
       <button data-close="sessionDialog">Close</button>
     </header>
-    <p class="hint">All finished groups and the current capture are saved in this browser. Session files contain points and settings, never pairing credentials. Version 2 single-collection backups can also be imported.</p>
+    <p class="hint">All finished groups and the current capture are saved in this browser. Session files contain points and settings, never pairing credentials.</p>
     <div class="row">
       <button id="saveSessionBtn" class="secondary">Export session JSON</button>
       <label>Import collection JSON<input id="loadSessionInput" type="file" accept="application/json" /></label>
@@ -205,12 +170,6 @@ app.innerHTML = `
   </dialog>
 `
 
-const baseUrlInput = must<HTMLInputElement>('baseUrl')
-if (import.meta.env.DEV) {
-  baseUrlInput.value = `${location.origin}/lightburn`
-}
-const secretInput = must<HTMLInputElement>('secret')
-const appNameInput = must<HTMLInputElement>('applicationName')
 const connectionStateEl = must<HTMLDivElement>('connectionState')
 const statusTextEl = must<HTMLParagraphElement>('statusText')
 const liveTextEl = must<HTMLParagraphElement>('liveText')
@@ -231,13 +190,8 @@ let handoverStopping = false
 let handoverPending = false
 let liveTransferred = false
 let otherTabOwnsLive = captureGroups(state).some(group => group.liveLocked) || !!state.liveQueue?.items.length
-let localContextRevision: string | null = null
 if (state.liveQueue?.items.length) state.liveQueue.paused = 'Saved updates found. Check the last import, then explicitly resume or abandon.'
-let livePosition: LivePosition | null = null
-const settledPosition = new SettledPosition()
-let localObservationSequence = 0
-let settledRelayContext: string | null = null
-let pollHandle: number | null = null
+let livePosition: { x: number; y: number } | null = null
 let requestInFlight = false
 let uploadInFlight = false
 let connectionInFlight = false
@@ -245,11 +199,7 @@ let sessionEnded = false
 let endingSession = false
 let sessionReleaseFailed = false
 let workspaceSize: { x: number; y: number } | null = null
-let connectionCloseTimer: number | null = null
 let relay: RelayClient | null = null
-let mode: ImportTarget['mode'] = import.meta.env.DEV ? 'local' : 'relay'
-if (state.liveQueue?.items[0]) mode = state.liveQueue.items[0].target.mode
-if (mode === 'webtool') baseUrlInput.value = state.liveQueue?.items[0]?.target.baseUrl ?? 'http://localhost:19520'
 let pairingEpoch = 0
 const PENDING_IMPORT_KEY = 'pathplotter.relay.pending-import.v1'
 let pendingImport: { id: string; relayId: string } | null = null
@@ -261,8 +211,6 @@ try {
 }
 const savedLiveHead = state.liveQueue?.items[0]
 if (savedLiveHead && savedLiveHead.id === pendingImport?.id) savedLiveHead.phase = 'submitted'
-const modeInput = must<HTMLSelectElement>('connectionMode')
-modeInput.value = mode
 
 function liveQueue(): LiveQueue { return state.liveQueue ?? emptyLiveQueue() }
 async function acquireLiveLock(): Promise<void> {
@@ -355,9 +303,7 @@ async function takeLiveOwnership(): Promise<boolean> {
     liveTransferred = false
     const target = transferred?.target ?? liveQueue().items[0]?.target ?? null
     if (target) {
-      if (mode === 'relay') {
-        if (!await takeCaptureControl()) throw new Error('Live ownership acquired, but capture control is unavailable. Saved updates remain paused.')
-      }
+      if (!await takeCaptureControl()) throw new Error('Live ownership acquired, but capture control is unavailable. Saved updates remain paused.')
       await verifyImportTarget(target)
     }
     liveTarget = target
@@ -407,26 +353,20 @@ function commitCollection(next: Collection): void {
 }
 
 async function currentImportTarget(): Promise<ImportTarget> {
-  if (mode === 'relay') {
-    const client = relay
-    if (!client) throw new Error('Pair with RAP first.')
-    const verified = await client.freshPosition()
-    if (client !== relay || mode !== 'relay') throw new Error('Connection changed during workspace verification.')
-    if (client.snapshot?.generation !== verified.generation || client.snapshot.context?.revision !== verified.context?.revision) {
-      throw new Error('RAP or workspace changed during verification. Nothing was sent.')
-    }
-    requireRelayContext()
-    if (!relay?.snapshot?.context) throw new Error('No fresh relay workspace.')
-    return { mode, baseUrl: relay.identity.baseUrl, relayId: relay.identity.relayId, contextRevision: relay.snapshot.context.revision }
+  const client = relay
+  if (!client) throw new Error('Pair with RAP first.')
+  const verified = await client.freshPosition()
+  if (client !== relay) throw new Error('Connection changed during workspace verification.')
+  if (client.snapshot?.generation !== verified.generation || client.snapshot.context?.revision !== verified.context?.revision) {
+    throw new Error('RAP or workspace changed during verification. Nothing was sent.')
   }
-  await fetchStatus()
-  if (!localContextRevision) throw new Error('LightBurn workspace identity is unavailable.')
-  return { mode, baseUrl: normalizeBaseUrl(baseUrlInput.value), contextRevision: localContextRevision }
+  requireRelayContext()
+  if (!client.snapshot?.context) throw new Error('No fresh relay workspace.')
+  return { baseUrl: client.identity.baseUrl, relayId: client.identity.relayId, contextRevision: client.snapshot.context.revision }
 }
 
 async function verifyImportTarget(target: ImportTarget): Promise<void> {
-  if (mode !== target.mode || (mode !== 'relay' && normalizeBaseUrl(baseUrlInput.value) !== target.baseUrl) ||
-      (mode === 'relay' && (relay?.identity.baseUrl !== target.baseUrl || relay.identity.relayId !== target.relayId))) {
+  if (relay?.identity.baseUrl !== target.baseUrl || relay.identity.relayId !== target.relayId) {
     throw new Error('Reconnect to the original Live update destination; queued artwork must not be retargeted.')
   }
   const current = await currentImportTarget()
@@ -519,7 +459,6 @@ must<HTMLButtonElement>('liveCheckBtn').addEventListener('click', async () => {
   renderControls()
   try {
     await acquireLiveLock()
-    if (head.target.mode !== 'relay') throw new Error('Local imports have no queryable result. Inspect LightBurn and acknowledge the outcome.')
     const client = relay
     if (!client || client.identity.relayId !== head.target.relayId || client.identity.baseUrl !== head.target.baseUrl) throw new Error('Reconnect to the original relay to check this import.')
     const job = parseJob(await client.request(`/jobs/${encodeURIComponent(head.id)}`))
@@ -558,10 +497,7 @@ must<HTMLButtonElement>('liveReconcileBtn').addEventListener('click', async () =
   renderControls()
   try {
     await acquireLiveLock()
-    if (head.target.mode === 'relay') {
-      if (!head.target.relayId) throw new Error('Saved update has no original RAP identifier.')
-      await acknowledgeRelayImport(head.id, head.target.relayId, head.target.baseUrl)
-    }
+    await acknowledgeRelayImport(head.id, head.target.relayId, head.target.baseUrl)
     const next = structuredClone(state)
     next.liveQueue!.items.shift()
     next.liveQueue!.paused = 'Outcome acknowledged without retry. Explicitly resume remaining updates.'
@@ -602,36 +538,20 @@ window.addEventListener('storage', async event => {
   } catch (error) { setStatus(errorToMessage(error)) }
 })
 
-function updateConnectionMode(): void {
+function resetConnection(): void {
   sessionEnded = false
   sessionReleaseFailed = false
-  must<HTMLElement>('relayConnection').hidden = mode !== 'relay'
-  must<HTMLElement>('localConnection').hidden = mode === 'relay'
-  must<HTMLElement>('secretField').hidden = mode === 'webtool'
-  must<HTMLElement>('apiPairingHint').textContent = mode === 'webtool'
-    ? 'Click Connect and approve the permission request in LightBurn within 30 seconds. Authentication is handled automatically; no secret needs to be entered. The permission stays in memory until End session or a connection-mode change.'
-    : 'Connect uses the entered secret, or pairs locally if blank. Bring LightBurn to the foreground and approve within 30 seconds. Clear an invalid secret to pair again. Live preview starts automatically.'
-  must<HTMLElement>('directConnectionHint').textContent = mode === 'webtool'
-    ? 'For PathPlotter opened inside LightBurn as a Webtool. Connect directly to the local LightBurn API; RAP and the cloud relay are not used. Enable REST API in LightBurn; leave network access off. Ordinary browsers may block this connection through CORS or mixed-content restrictions.'
-    : 'For local development using the loopback Vite proxy. Ordinary hosted and phone browsers need RAP; the development proxy is not included in the hosted app.'
-  if (pollHandle !== null) {
-    window.clearInterval(pollHandle)
-    pollHandle = null
-  }
   relay?.stop()
   livePosition = null
-  settledPosition.reset()
-  settledRelayContext = null
-  localContextRevision = null
   workspaceSize = null
   connectionStateEl.textContent = 'Disconnected'
   connectionStateEl.classList.remove('ok')
-  if (mode === 'relay') relay?.start()
+  relay?.start()
   renderAll()
 }
 
 function relayChanged(): void {
-  if (mode !== 'relay' || sessionEnded) return
+  if (sessionEnded) return
   const snapshot = relay?.snapshot
   const fresh = relay?.canCapture() === true
   if (!otherTabOwnsLive && !handoverPending && (liveEnabled || (liveQueue().items.length > 0 && !liveQueue().paused)) && relay?.controlError && !relay.activeBrowser) {
@@ -642,18 +562,12 @@ function relayChanged(): void {
     try { commitCollection(next) }
     catch (error) { state.liveQueue = next.liveQueue; setStatus(`Live work paused; cannot save: ${errorToMessage(error)}`) }
   }
-  const relayContext = snapshot && relay ? `${relay.identity.relayId}:${snapshot.generation}:${snapshot.context?.revision}` : null
-  if (!fresh || relayContext !== settledRelayContext) settledPosition.reset()
-  settledRelayContext = relayContext
-  if (fresh && snapshot?.position) {
-    settledPosition.observe(`${snapshot.generation}:${snapshot.sequence}`, snapshot.position.x, snapshot.position.y)
-  }
-  livePosition = fresh && snapshot?.position ? { ...snapshot.position, updatedAt: Date.now() } : null
+  livePosition = fresh && snapshot?.position ? { ...snapshot.position } : null
   workspaceSize = snapshot?.context?.size ?? null
   connectionStateEl.textContent = fresh ? 'Ready to capture' : relay?.isOnline() ? 'Read-only · Take control' : 'Capture unavailable'
   connectionStateEl.classList.toggle('ok', fresh)
   liveTextEl.textContent = relay?.error ? `Relay: ${relay.error}` :
-    snapshot?.position ? `Preview: X ${snapshot.position.x.toFixed(3)}, Y ${snapshot.position.y.toFixed(3)} mm · observation age ${(relay!.age() / 1000).toFixed(1)} s${relay?.connectionType === 'socket' && !relay.previewActive ? ' · moving preview paused' : ''} · capture verifies a new reading${fresh ? '' : ' · offline or another browser has control'}${relay?.connectionNotice ? ` · ${relay.connectionNotice}` : ''}` :
+    snapshot?.position ? `Preview: X ${snapshot.position.x.toFixed(3)}, Y ${snapshot.position.y.toFixed(3)} mm · observation age ${(relay!.age() / 1000).toFixed(1)} s${!relay?.previewActive ? ' · moving preview paused' : ''} · capture verifies a new reading${fresh ? '' : ' · offline or another browser has control'}${relay?.connectionNotice ? ` · ${relay.connectionNotice}` : ''}` :
     'Waiting for a fresh RAP workpiece position.'
   if (relay?.controlError) must<HTMLElement>('relayMessage').textContent = relay.controlError
   renderControls()
@@ -675,26 +589,13 @@ function requireRelayContext(): string {
 }
 
 function attachRelay(identity: NonNullable<ReturnType<typeof loadIdentity>>): void {
-  const transport = relay?.connectionType ?? 'socket'
   relay?.stop()
-  relay = new RelayClient(identity, relayChanged, transport)
+  relay = new RelayClient(identity, relayChanged)
   must<HTMLInputElement>('relayUrl').value = identity.baseUrl
   must<HTMLInputElement>('relayId').value = identity.relayId
-  if (mode === 'relay') relay.start()
+  relay.start()
 }
 
-modeInput.addEventListener('change', () => {
-  if (liveOwnsWork() || pendingImport || uploadInFlight || requestInFlight || connectionInFlight) { modeInput.value = mode; setStatus('Finish/reconcile imports and wait for current work before changing connection.'); return }
-  const nextMode = modeInput.value === 'webtool' ? 'webtool' : modeInput.value === 'local' ? 'local' : 'relay'
-  if (nextMode !== mode) {
-    secretInput.value = ''
-    if (nextMode !== 'relay') baseUrlInput.value = nextMode === 'local' && import.meta.env.DEV
-      ? `${location.origin}/lightburn` : 'http://localhost:19520'
-  }
-  mode = nextMode
-  ++pairingEpoch
-  updateConnectionMode()
-})
 async function connectBrowserLink(link: BrowserLink, requestControl = false): Promise<void> {
   const button = must<HTMLButtonElement>('pairRelayBtn')
   const message = must<HTMLParagraphElement>('relayMessage')
@@ -727,7 +628,7 @@ async function connectBrowserLink(link: BrowserLink, requestControl = false): Pr
         await new Promise(resolve => window.setTimeout(resolve, 100))
       }
       if (epoch !== pairingEpoch || client !== relay) return
-      if (!client?.isOnline()) throw new Error('Paired, but RAP is offline. Check LightBurn and RAP, then click Reconnect saved browser.')
+      if (!client?.isOnline()) throw new Error('Paired, but RAP is offline. Check LightBurn and RAP, then click Reconnect.')
       if (!client.activeBrowser && !await takeCaptureControl()) return
     }
     must<HTMLDialogElement>('connectionDialog').close()
@@ -753,10 +654,10 @@ must<HTMLButtonElement>('pairRelayBtn').addEventListener('click', async () => {
 })
 async function takeCaptureControl(): Promise<boolean> {
   try {
-    if (sessionEnded || endingSession) throw new Error('Session ended. Use Connection > Reconnect saved browser.')
+    if (sessionEnded || endingSession) throw new Error('Session ended. Use Connection > Reconnect.')
     if (!relay) throw new Error('Pair with RAP first.')
     if (relay.activeBrowser && relay.canCapture()) { setStatus('Already paired and ready to capture.'); return true }
-    if (!relay.isOnline() || !relay.snapshot?.context) throw new Error('RAP is offline or its workspace is unavailable. Check LightBurn and RAP, then click Reconnect saved browser.')
+    if (!relay.isOnline() || !relay.snapshot?.context) throw new Error('RAP is offline or its workspace is unavailable. Check LightBurn and RAP, then click Reconnect.')
     if (uploadInFlight || liveDispatching || liveRecoveryInFlight) throw new Error('Wait for the import result before requesting control.')
     const takeover = relay.controlOccupied
     if (takeover && !window.confirm('Take capture control from the other browser? Its capture stops; pending or unresolved imports must be reconciled first.')) return false
@@ -785,20 +686,13 @@ must<HTMLButtonElement>('endSessionBtn').addEventListener('click', async () => {
     liveEnabled = false
     sessionEnded = true
     ++pairingEpoch
-    cancelConnectionClose()
-    if (pollHandle !== null) { window.clearInterval(pollHandle); pollHandle = null }
-    secretInput.value = ''
-    localContextRevision = null
     liveTarget = null
     livePosition = null
     workspaceSize = null
-    settledPosition.reset()
-    settledRelayContext = null
     releaseLiveLock?.()
     renderPlot()
     liveTextEl.textContent = 'Preview stopped.'
-    if (relay && mode === 'relay') await relay.endSession()
-    else relay?.stop()
+    await relay?.endSession()
     sessionReleaseFailed = false
     setStatus('Session ended. Your points and pairing are saved; you can close this tab. Use Connection to reconnect.')
     window.close()
@@ -817,7 +711,7 @@ must<HTMLButtonElement>('unlinkRelayBtn').addEventListener('click', async () => 
     saveIdentity(null)
     relay?.stop()
     relay = null
-    updateConnectionMode()
+    resetConnection()
     must<HTMLParagraphElement>('relayMessage').textContent = 'Unlinked locally. Open a new RAP link or scan its Pair phone QR to pair again.'
   } catch (error) { setStatus(errorToMessage(error)) }
 })
@@ -878,22 +772,8 @@ function clearPendingImport(): void {
   pendingImport = null
   renderControls()
 }
-document.addEventListener('visibilitychange', () => {
-  if (mode !== 'relay') return
-  relayChanged()
-})
-window.setInterval(() => { if (mode === 'relay') relayChanged() }, 200)
-
-function cancelConnectionClose(): void {
-  if (connectionCloseTimer !== null) {
-    window.clearTimeout(connectionCloseTimer)
-    connectionCloseTimer = null
-  }
-}
-must<HTMLDialogElement>('connectionDialog').addEventListener('close', cancelConnectionClose)
-for (const input of [baseUrlInput, secretInput, appNameInput]) {
-  input.addEventListener('input', cancelConnectionClose)
-}
+document.addEventListener('visibilitychange', relayChanged)
+window.setInterval(relayChanged, 200)
 
 if (navigator.locks) {
   void navigator.locks.query().then(locks => {
@@ -913,37 +793,14 @@ window.setInterval(() => {
   }).catch(error => setStatus(`Cannot check live ownership: ${errorToMessage(error)}`))
 }, 1000)
 renderAll()
-updateConnectionMode()
-setupOnboarding({
-  canChangeTransport: () => !sessionEnded && !endingSession && !liveOwnsWork() && !requestInFlight && !uploadInFlight && !pendingImport,
-  fallback: () => {
-    if (!relay || mode !== 'relay') { setStatus('Pair with RAP in cloud mode first.'); return }
-    relay.useHttpFallback()
-    setStatus('Slower HTTP connection selected. Select the same fallback in RAP; responses may take several seconds.')
-  },
-  sockets: () => {
-    if (!relay || mode !== 'relay') { setStatus('Pair with RAP in cloud mode first.'); return }
-    relay.useWebSocket()
-    setStatus('WebSocket connection selected. Select WebSockets in RAP too.')
-  },
-  status: setStatus,
-})
+resetConnection()
+setupOnboarding()
 function consumePairingLink(): boolean {
   const link = browserLink(location.hash)
   if (link) {
     history.replaceState(null, '', location.pathname + location.search)
-    const saved = loadIdentity()
-    const sameSavedWorkspace = otherTabOwnsLive && !releaseLiveLock &&
-      saved?.baseUrl === link.baseUrl && saved.relayId === link.relayId &&
-      state.coordinateContext?.startsWith(`${link.relayId}:`) === true
-    if (mode !== 'relay' && !sameSavedWorkspace && (liveOwnsWork() || uploadInFlight || pendingImport)) {
-      throw new Error('Reconcile existing work before changing connection mode.')
-    }
-    mode = 'relay'
-    modeInput.value = mode
     must<HTMLInputElement>('relayUrl').value = link.baseUrl
     must<HTMLInputElement>('relayId').value = link.relayId
-    updateConnectionMode()
     const dialog = must<HTMLDialogElement>('connectionDialog')
     if (!dialog.open) dialog.showModal()
     void connectBrowserLink(link)
@@ -1059,62 +916,6 @@ function updateDiameterVisibility(): void {
   must<HTMLLabelElement>('diameterField').hidden = must<HTMLSelectElement>('shapeType').value !== 'circles'
 }
 
-must<HTMLButtonElement>('connectBtn').addEventListener('click', async () => {
-  if (mode === 'relay' || connectionInFlight || endingSession) return
-  if (liveEnabled || liveDispatching) { setStatus('Turn live mode off and wait for import completion before connecting again.'); return }
-  if (liveQueue().items.length && !secretInput.value.trim()) {
-    setStatus(mode === 'webtool'
-      ? 'Saved live work needs reconciliation before requesting new LightBurn permission. Inspect LightBurn and acknowledge the import outcome or abandon safe unsent work first.'
-      : 'Enter the existing LightBurn secret to check queued work; new pairing is blocked until reconciliation.')
-    return
-  }
-  const appName = appNameInput.value.trim() || 'PathPlotter'
-  const connectButton = must<HTMLButtonElement>('connectBtn')
-  connectButton.disabled = true
-  connectionInFlight = true
-  cancelConnectionClose()
-  try {
-    sessionEnded = false
-    const baseUrl = normalizeBaseUrl(baseUrlInput.value)
-    if (!secretInput.value.trim()) {
-      setStatus('Pairing requested. Bring LightBurn to the foreground (click its window or Alt+Tab) and approve within 30 seconds.')
-      const response = await fetch(`${baseUrl}/api/connect`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ application_name: appName, capabilities: CAPABILITIES }),
-      })
-      if (response.status === 403) {
-        throw new Error('Pairing declined or timed out. Bring LightBurn to the foreground, then retry Connect and approve within 30 seconds.')
-      }
-      if (!response.ok) {
-        throw new Error(`Pairing failed (${response.status})`)
-      }
-      const payload = (await response.json()) as { secret?: string }
-      if (!payload.secret) {
-        throw new Error('Pairing response did not include a secret')
-      }
-      secretInput.value = payload.secret
-    } else {
-      setStatus('Connecting with the entered secret...')
-    }
-    await connectWithPreview()
-    setStatus('Connected. Live preview is automatic. Closing this dialog in 2 seconds.')
-    connectionCloseTimer = window.setTimeout(() => {
-      connectionCloseTimer = null
-      must<HTMLDialogElement>('connectionDialog').close()
-    }, 2000)
-  } catch (error) {
-    setStatus(mode === 'webtool' && error instanceof TypeError
-      ? `Direct LightBurn API connection failed: ${error.message}. Check the API is enabled and that this page is open inside LightBurn's Webtool browser. Browser CORS or mixed-content restrictions may block requests; use RAP in an ordinary browser if needed.`
-      : errorToMessage(error))
-    connectionStateEl.textContent = 'Disconnected'
-    connectionStateEl.classList.remove('ok')
-  } finally {
-    connectButton.disabled = false
-    connectionInFlight = false
-  }
-})
-
 must<HTMLButtonElement>('clearBtn').addEventListener('click', () => {
   if (liveOwnsWork() || requestInFlight || uploadInFlight) return
   const liveWarning = captureGroups(state).some(group => group.liveImported) ? ' Previously imported LightBurn artwork will NOT be removed.' : ''
@@ -1208,7 +1009,7 @@ must<HTMLButtonElement>('saveSessionBtn').addEventListener('click', () => {
   const blob = new Blob([JSON.stringify(payload, null, 2)], { type: 'application/json;charset=utf-8' })
   const name = `pathplotter-session-${new Date().toISOString().replace(/[:]/g, '-')}.json`
   downloadBlob(blob, name)
-  setExportStatus('Session exported. API secret was not included.')
+  setExportStatus('Session exported.')
 })
 
 must<HTMLInputElement>('loadSessionInput').addEventListener('change', async event => {
@@ -1221,7 +1022,7 @@ must<HTMLInputElement>('loadSessionInput').addEventListener('change', async even
     const text = await file.text()
     if (liveOwnsWork() || requestInFlight || uploadInFlight) throw new Error('Reconcile live work and wait for the current request before importing.')
     const parsed = JSON.parse(text) as { version?: unknown; state?: unknown }
-    if (parsed.version !== 2 && parsed.version !== 3) throw new Error('Only version 2 or 3 session files are supported.')
+    if (parsed.version !== 3) throw new Error('Only PathPlotter version 3 session files are supported.')
     const imported = validateCollection(parsed.state)
     if (imported.liveQueue?.items.length || imported.liveQueue?.paused) {
       throw new Error('This backup contains live import work. Restore it only after reconciling its LightBurn destination; queued imports cannot be imported through Session.')
@@ -1265,106 +1066,13 @@ function must<T extends Element>(id: string): T {
   return element as T
 }
 
-function normalizeBaseUrl(url: string): string {
-  const normalized = url.trim().replace(/\/+$/, '')
-  if (mode === 'webtool') {
-    const parsed = new URL(normalized)
-    if (!['http:', 'https:'].includes(parsed.protocol) ||
-        !['localhost', '127.0.0.1', '[::1]'].includes(parsed.hostname) ||
-        parsed.username || parsed.password || parsed.search || parsed.hash || parsed.pathname !== '/') {
-      throw new Error('LightBurn Webtool requires a loopback API origin, such as http://localhost:19520. Network API access is not required.')
-    }
-  }
-  return normalized
-}
-
 function setStatus(message: string): void {
   statusTextEl.textContent = message
-  must<HTMLParagraphElement>('connectionMessage').textContent = message
 }
 
 function setExportStatus(message: string): void {
   exportStatusEl.textContent = message
   must<HTMLParagraphElement>('sessionMessage').textContent = message
-}
-
-async function fetchStatus(): Promise<void> {
-  const response = await authorizedFetch('/api/status')
-  if (!response.ok) {
-    throw new Error(`Status request failed (${response.status})`)
-  }
-  const status = await response.json() as { connected?: boolean }
-  if (status.connected !== true) throw new Error('LightBurn is available, but no machine is connected.')
-  const projectResponse = await authorizedFetch('/api/project')
-  if (!projectResponse.ok) throw new Error(`Workspace request failed (${projectResponse.status})`)
-  const project = await projectResponse.json() as { filename?: unknown; device?: unknown; workspace?: {
-    machine_size?: { x?: number; y?: number }; workpiece_size?: { x?: number; y?: number };
-    workpiece_offset?: { x?: number; y?: number }; machine_view?: unknown
-  } }
-  const size = project.workspace?.workpiece_size
-  workspaceSize = size && typeof size.x === 'number' && typeof size.y === 'number' &&
-    Number.isFinite(size.x) && Number.isFinite(size.y) && size.x > 0 && size.y > 0
-    ? { x: size.x, y: size.y } : null
-  const workspace = project.workspace
-  localContextRevision = null
-  if (workspace && finiteNumber(workspace.machine_size?.x) && finiteNumber(workspace.machine_size?.y) &&
-      finiteNumber(workspace.workpiece_offset?.x) && finiteNumber(workspace.workpiece_offset?.y) &&
-      typeof workspace.machine_view === 'boolean') {
-    const stable = { workspace: { machine_size: workspace.machine_size, workpiece_size: workspaceSize,
-      workpiece_offset: workspace.workpiece_offset, machine_view: workspace.machine_view },
-      filename: project.filename, device: project.device }
-    const bytes = new TextEncoder().encode(JSON.stringify(stable))
-    localContextRevision = [...new Uint8Array(await crypto.subtle.digest('SHA-256', bytes))]
-      .map(value => value.toString(16).padStart(2, '0')).join('')
-  }
-  renderPlot()
-  connectionStateEl.textContent = 'Connected'
-  connectionStateEl.classList.add('ok')
-}
-
-async function refreshLivePosition(): Promise<void> {
-  if (mode === 'relay' || sessionEnded) return
-  const requestedMode = mode, requestedBaseUrl = baseUrlInput.value, requestedSecret = secretInput.value
-  try {
-    const response = await authorizedFetch('/api/position')
-    if (!response.ok) {
-      throw new Error(`Position request failed (${response.status})`)
-    }
-    const payload = (await response.json()) as { workpiece?: { x?: number; y?: number } }
-    if (sessionEnded || mode !== requestedMode || baseUrlInput.value !== requestedBaseUrl || secretInput.value !== requestedSecret) return
-    const x = payload.workpiece?.x
-    const y = payload.workpiece?.y
-    if (typeof x !== 'number' || typeof y !== 'number' || !Number.isFinite(x) || !Number.isFinite(y)) {
-      livePosition = null
-      settledPosition.reset()
-      liveTextEl.textContent = 'Workpiece X/Y are unavailable for the current device.'
-      renderPlot()
-      return
-    }
-    livePosition = { x, y, updatedAt: Date.now() }
-    settledPosition.observe(`local:${++localObservationSequence}`, x, y)
-    liveTextEl.textContent = `Live workpiece position: X ${x.toFixed(3)} mm, Y ${y.toFixed(3)} mm`
-    renderPlot()
-  } catch (error) {
-    if (sessionEnded || mode !== requestedMode || baseUrlInput.value !== requestedBaseUrl || secretInput.value !== requestedSecret) return
-    settledPosition.reset()
-    livePosition = null
-    renderPlot()
-    liveTextEl.textContent = `Live preview error: ${errorToMessage(error)}`
-  }
-}
-
-async function connectWithPreview(): Promise<void> {
-  await fetchStatus()
-  await refreshLivePosition()
-  startPreview()
-  setStatus('Connected. Live preview is automatic.')
-}
-
-function startPreview(): void {
-  if (pollHandle === null) {
-    pollHandle = window.setInterval(() => { void refreshLivePosition() }, 1500)
-  }
 }
 
 async function capturePoint(): Promise<void> {
@@ -1378,43 +1086,17 @@ async function capturePoint(): Promise<void> {
   requestInFlight = true
   renderControls()
   try {
-    if (mode === 'relay') {
-      const client = relay
-      if (!client) throw new Error('Pair with RAP first.')
-      const verified = await client.freshPosition()
-      if (client !== relay || mode !== 'relay') throw new Error('Connection changed during capture. No point was saved.')
-      if (client.snapshot?.generation !== verified.generation || client.snapshot.context?.revision !== verified.context?.revision) {
-        throw new Error('RAP or workspace changed during capture. No point was saved.')
-      }
-      const key = requireRelayContext()
-      const position = verified.position
-      if (!position) throw new Error('No fresh workpiece coordinates.')
-      await saveCapturedPoint({ id: makeId('pt'), name: '', x: position.x, y: position.y, labelOffsetX: 0, labelOffsetY: 0 }, key)
-      setStatus(`Captured point ${state.points.length} from a new verified RAP reading.`)
-      return
+    const client = relay
+    if (!client) throw new Error('Pair with RAP first.')
+    const verified = await client.freshPosition()
+    if (client !== relay) throw new Error('Connection changed during capture. No point was saved.')
+    if (client.snapshot?.generation !== verified.generation || client.snapshot.context?.revision !== verified.context?.revision) {
+      throw new Error('RAP or workspace changed during capture. No point was saved.')
     }
-    if (liveEnabled && liveTarget) await verifyImportTarget(liveTarget)
-    const response = await authorizedFetch('/api/position')
-    if (!response.ok) {
-      throw new Error(`Position request failed (${response.status})`)
-    }
-    const payload = (await response.json()) as { workpiece?: { x?: number; y?: number } }
-    const x = payload.workpiece?.x
-    const y = payload.workpiece?.y
-    if (typeof x !== 'number' || typeof y !== 'number' || !Number.isFinite(x) || !Number.isFinite(y)) {
-      throw new Error('Cannot capture: workpiece X/Y unavailable.')
-    }
-    const point: Point = {
-      id: makeId('pt'),
-      name: '',
-      x,
-      y,
-      labelOffsetX: 0,
-      labelOffsetY: 0,
-    }
-    await saveCapturedPoint(point)
-    livePosition = { x, y, updatedAt: Date.now() }
-    settledPosition.observe(`local:${++localObservationSequence}`, x, y)
+    const key = requireRelayContext()
+    const position = verified.position
+    if (!position) throw new Error('No fresh workpiece coordinates.')
+    await saveCapturedPoint({ id: makeId('pt'), name: '', x: position.x, y: position.y, labelOffsetX: 0, labelOffsetY: 0 }, key)
     setStatus(`Captured point ${state.points.length}.`)
   } catch (error) {
     setStatus(errorToMessage(error))
@@ -1424,21 +1106,20 @@ async function capturePoint(): Promise<void> {
   }
 }
 
-async function saveCapturedPoint(point: Point, coordinateContext?: string): Promise<void> {
-  if (liveEnabled && mode === 'relay' && liveTarget?.contextRevision !== relay?.snapshot?.context?.revision) {
+async function saveCapturedPoint(point: Point, coordinateContext: string): Promise<void> {
+  if (liveEnabled && liveTarget?.contextRevision !== relay?.snapshot?.context?.revision) {
     throw new Error('Workspace changed during Live update. Turn it off and reconcile queued work.')
   }
   const group = { ...state, points: [...state.points, point] }
   const built = liveEnabled ? buildDelta(group, 'capture') : null
   if (liveEnabled && !liveTarget) throw new Error('Live update destination is unavailable.')
   const update = built && liveTarget ? await makeUpdate(built, liveTarget) : null
-  if (coordinateContext && (mode !== 'relay' || requireRelayContext() !== coordinateContext)) {
+  if (requireRelayContext() !== coordinateContext) {
     throw new Error('Connection or workspace changed while saving. No point was saved.')
   }
   const next = structuredClone(state)
   next.points.push(point)
-  if (coordinateContext) next.coordinateContext = coordinateContext
-  else delete next.coordinateContext
+  next.coordinateContext = coordinateContext
   if (liveEnabled) {
     next.liveLocked = true
     next.liveQueue ??= emptyLiveQueue()
@@ -1446,32 +1127,6 @@ async function saveCapturedPoint(point: Point, coordinateContext?: string): Prom
   }
   commitCollection(next)
   void drainLiveQueue()
-}
-
-async function authorizedFetch(path: string, init?: RequestInit): Promise<Response> {
-  const baseUrl = normalizeBaseUrl(baseUrlInput.value)
-  const secret = secretInput.value.trim()
-  if (!baseUrl) {
-    throw new Error('Base URL is required.')
-  }
-  if (!secret) {
-    throw new Error('Shared secret is required.')
-  }
-  const token = await bearerToken(secret)
-  const headers = new Headers(init?.headers ?? {})
-  headers.set('Authorization', `Bearer ${token}`)
-  return fetch(`${baseUrl}${path}`, {
-    ...init,
-    headers,
-  })
-}
-
-async function bearerToken(secret: string): Promise<string> {
-  const message = new TextEncoder().encode(String(Math.floor(Date.now() / 1000 / 60)))
-  const keyData = new TextEncoder().encode(secret)
-  const key = await crypto.subtle.importKey('raw', keyData, { name: 'HMAC', hash: 'SHA-256' }, false, ['sign'])
-  const signature = await crypto.subtle.sign('HMAC', key, message)
-  return [...new Uint8Array(signature)].map(value => value.toString(16).padStart(2, '0')).join('')
 }
 
 async function sendToLightBurn(): Promise<void> {
@@ -1503,41 +1158,24 @@ async function submitImport(update: LiveUpdate, beforeSubmission: () => void): P
     .map(value => value.toString(16).padStart(2, '0')).join('')
   if (digest !== update.checksum) throw new Error('Saved live geometry checksum does not match. No update was sent.')
   await verifyImportTarget(update.target)
-  if (update.target.mode === 'relay') {
-    const client = relay
-    if (!client) throw new Error('Pair with RAP first.')
-    if (pendingImport) throw new Error(`Import ${pendingImport.id} is unresolved. Check it before sending more geometry.`)
-    pendingImport = { id: update.id, relayId: client.identity.relayId }
-    try { localStorage.setItem(PENDING_IMPORT_KEY, JSON.stringify(pendingImport)) }
-    catch (error) {
-      pendingImport = null
-      throw new Error(`Cannot save import journal; no job was sent: ${errorToMessage(error)}`)
-    }
-    try { beforeSubmission() }
-    catch (error) { clearPendingImport(); throw error }
-    const job = parseJob(await client.request('/jobs', {
-      id: update.id, svg: update.svg, checksum: update.checksum,
-      filename: `pathplotter-${update.id}.svg`, anchor: update.anchor, contextRevision: update.target.contextRevision,
-    }))
-    const imported = await followRelayJob(client, job, update.id)
-    if (imported.status !== 'unknown') clearPendingImport()
-    return imported
+  const client = relay
+  if (!client) throw new Error('Pair with RAP first.')
+  if (pendingImport) throw new Error(`Import ${pendingImport.id} is unresolved. Check it before sending more geometry.`)
+  pendingImport = { id: update.id, relayId: client.identity.relayId }
+  try { localStorage.setItem(PENDING_IMPORT_KEY, JSON.stringify(pendingImport)) }
+  catch (error) {
+    pendingImport = null
+    throw new Error(`Cannot save import journal; no job was sent: ${errorToMessage(error)}`)
   }
-  const stream = await openImportStream(signal => authorizedFetch('/api/events', { headers: { Accept: 'text/event-stream' }, signal }))
-  try {
-    await verifyImportTarget(update.target)
-    beforeSubmission()
-    stream.arm()
-    const response = await authorizedFetch('/api/file/upload', {
-      method: 'POST', headers: { 'Content-Type': 'application/octet-stream',
-        'X-Filename': `pathplotter-${update.id}.svg`, 'X-Position-X': String(update.anchor.x),
-        'X-Position-Y': String(update.anchor.y), 'X-Origin': 'center' },
-      body: new TextEncoder().encode(update.svg),
-      signal: AbortSignal.timeout(10000),
-    })
-    if (response.status !== 202) return { status: 'unknown', error: `Upload returned ${response.status}. Inspect LightBurn before continuing.` }
-    return await stream.result
-  } finally { stream.close() }
+  try { beforeSubmission() }
+  catch (error) { clearPendingImport(); throw error }
+  const job = parseJob(await client.request('/jobs', {
+    id: update.id, svg: update.svg, checksum: update.checksum,
+    filename: `pathplotter-${update.id}.svg`, anchor: update.anchor, contextRevision: update.target.contextRevision,
+  }))
+  const imported = await followRelayJob(client, job, update.id)
+  if (imported.status !== 'unknown') clearPendingImport()
+  return imported
 }
 
 async function followRelayJob(client: RelayClient, initial: ReturnType<typeof parseJob>, expectedId: string): Promise<ImportResult> {
@@ -1604,7 +1242,7 @@ function persistAndRender(): void {
 
 function loadState(): Collection {
   try {
-    const raw = window.localStorage.getItem(STORAGE_KEY) ?? window.localStorage.getItem('pathplotter.collection.v2')
+    const raw = window.localStorage.getItem(STORAGE_KEY)
     return raw ? validateCollection(JSON.parse(raw)) : emptyCollection()
   } catch (error) {
     savedStateError = `Saved collection could not be loaded: ${errorToMessage(error)}. Preserve its browser storage and inspect LightBurn before abandoning saved work.`
@@ -1710,16 +1348,17 @@ let operationBusySince: number | null = null
 
 function captureBlockReason(): { label: string; hint: string } | null {
   if (handoverPending || handoverStopping) return { label: 'Transferring live control', hint: 'Wait for the current operation and safe tab handover to finish.' }
-  if (otherTabOwnsLive) return { label: 'Another tab owns Live update', hint: 'Click Pair or enable Live update here to request a safe transfer.' }
+  if (otherTabOwnsLive) return { label: 'Another tab owns Live update', hint: 'Click Take control or enable Live update here to request a safe transfer.' }
   if (requestInFlight || (uploadInFlight && !liveDispatching) || liveRecoveryInFlight) return { label: 'Operation in progress', hint: 'Wait for the current capture, import or recovery operation to finish.' }
   if (liveQueue().paused) return { label: 'Live update paused', hint: liveQueue().paused }
-  if (mode === 'relay' && !relay?.canCapture()) return {
+  if (relay?.rapUpdateRequired) return { label: 'Update RAP', hint: 'This RAP version is too old for the relay. Open RAP and click Update now.' }
+  if (!relay?.canCapture()) return {
     label: relay?.isOnline() ? 'Read-only · Take control' : 'Capture unavailable',
-    hint: relay?.error || relay?.controlError || (relay?.isOnline() ? 'Click Pair in Connection to request capture control.' : 'Waiting for RAP to connect. Use Get started if you need to download or start it.'),
+    hint: relay?.error || relay?.controlError || (relay?.isOnline() ? 'Click Take control to capture from this browser.' : 'Waiting for RAP to connect. Use Get started if you need to download or start it.'),
   }
-  if (mode === 'relay' && allPoints(state).length && state.coordinateContext !== contextKey()) return {
+  if (allPoints(state).length && state.coordinateContext !== contextKey()) return {
     label: 'Workspace confirmation needed',
-    hint: 'Saved points belong to an unknown or different workspace. If they belong to this machine and workpiece origin, open Connection > Advanced / recovery > Confirm workspace for existing points. Otherwise save your session, then clear the old points.',
+    hint: 'Saved points belong to an unknown or different workspace. If they belong to this machine and workpiece origin, open Connection > Advanced > Confirm workspace for existing points. Otherwise save your session, then clear the old points.',
   }
   if (state.finished) return { label: 'Capture finished', hint: 'Click Resume to start the next capture group.' }
   if (liveEnabled && liveQueue().items.length >= LIVE_QUEUE_LIMIT) return { label: 'Live queue full', hint: 'Wait for pending imports before capturing another point.' }
@@ -1730,12 +1369,12 @@ function renderControls(): void {
   const busy = otherTabOwnsLive || handoverStopping || handoverPending || requestInFlight || (uploadInFlight && !liveDispatching)
   must<HTMLSpanElement>('collectionSummary').textContent =
     `${state.type} · ${allPoints(state).length} points · ${state.groups.length} finished groups`
-  const relayReady = !sessionEnded && !endingSession && (mode !== 'relay' || relay?.canCapture() === true)
+  const relayReady = !sessionEnded && !endingSession && relay?.canCapture() === true
   must<HTMLButtonElement>('endSessionBtn').disabled = (sessionEnded && !sessionReleaseFailed) || endingSession
   must<HTMLButtonElement>('connectionBtn').disabled = endingSession
-  must<HTMLButtonElement>('quickControlBtn').hidden = sessionEnded || mode !== 'relay' || !relay || relay.activeBrowser
+  must<HTMLButtonElement>('quickControlBtn').hidden = sessionEnded || !relay || relay.activeBrowser
   must<HTMLButtonElement>('quickControlBtn').disabled = busy || uploadInFlight || !relay?.isOnline()
-  const contextMatches = mode !== 'relay' || !allPoints(state).length || state.coordinateContext === contextKey()
+  const contextMatches = !allPoints(state).length || state.coordinateContext === contextKey()
   const blockReason = captureBlockReason()
   must<HTMLButtonElement>('captureBtn').disabled = sessionEnded || endingSession || blockReason !== null
   // Routine captures finish quickly; only announce an in-progress operation once it lingers.
@@ -1752,7 +1391,7 @@ function renderControls(): void {
   if (sessionEnded) {
     connectionStateEl.textContent = 'Session ended'
     connectionStateEl.classList.remove('ok')
-  } else if (mode === 'relay') {
+  } else {
     connectionStateEl.textContent = captureBlock?.label ?? 'Ready to capture'
     connectionStateEl.classList.toggle('ok', !captureBlock)
   }
@@ -1763,7 +1402,7 @@ function renderControls(): void {
   must<HTMLButtonElement>('settingsBtn').disabled = busy || !!savedStateError || !!(state.liveLocked && state.points.length)
   must<HTMLButtonElement>('pointsBtn').disabled = busy || allPoints(state).length === 0
   must<HTMLButtonElement>('sendBtn').disabled = busy || uploadInFlight || liveOwnsWork() || !hasExportGeometry() || !relayReady || !contextMatches ||
-    (mode === 'relay' && pendingImport !== null)
+    pendingImport !== null
   must<HTMLButtonElement>('downloadSvgBtn').disabled = busy || !hasExportGeometry()
   const queue = liveQueue()
   if (!requestInFlight) must<HTMLInputElement>('liveUpdateToggle').checked = liveEnabled
@@ -1777,9 +1416,6 @@ function renderControls(): void {
   must<HTMLButtonElement>('liveAbandonBtn').hidden = !queue.paused && !queue.items.length
   for (const id of ['liveCheckBtn', 'liveReconcileBtn', 'liveResumeBtn', 'liveAbandonBtn']) must<HTMLButtonElement>(id).disabled = otherTabOwnsLive || handoverPending || handoverStopping || liveRecoveryInFlight || liveDispatching || requestInFlight
   must<HTMLInputElement>('loadSessionInput').disabled = busy || liveOwnsWork()
-  baseUrlInput.disabled = liveEnabled || liveDispatching
-  secretInput.disabled = liveEnabled || liveDispatching
-  modeInput.disabled = endingSession || liveOwnsWork() || pendingImport !== null || busy || uploadInFlight
 }
 
 function renderEditor(): void {
@@ -1955,7 +1591,7 @@ function renderPlot(): void {
   const pointDots = captureGroups(state).map(group => group.points.map((point, index) =>
     `<circle class="point-dot" cx="${screenX(point.x)}" cy="${screenY(point.y)}" r="3" fill="${group.strokeColor}"><title>Point ${index + 1}${point.name ? `: ${escapeXml(point.name)}` : ''} · X ${point.x}, Y ${point.y}</title></circle>`
   ).join('')).join('')
-  const settled = mode === 'relay' ? relay?.settled === true : settledPosition.settled
+  const settled = relay?.settled === true
   const head = livePosition
     ? `<g class="head-marker${settled ? ' settled' : ''}" transform="translate(${screenX(livePosition.x)} ${screenY(livePosition.y)})"><title>${settled ? 'Reported position unchanged for three readings' : 'Reported position not yet settled'}</title><circle r="5" /><path d="M -9 0 H 9 M 0 -9 V 9" /></g>` : ''
   const workspace = workspaceSize

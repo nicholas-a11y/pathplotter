@@ -16,18 +16,16 @@ function parseState(value: unknown): LiveHandoverState {
   if (!record(value) || typeof value.enabled !== 'boolean') throw new Error('Invalid live ownership response.')
   const target = value.target
   if (target === null && !value.enabled) return { enabled: false, target: null }
-  if (!record(target) || !['local', 'relay', 'webtool'].includes(String(target.mode)) ||
-      typeof target.baseUrl !== 'string' || typeof target.contextRevision !== 'string' || !target.contextRevision ||
-      (target.mode === 'relay' && (typeof target.relayId !== 'string' || !target.relayId))) {
+  if (!record(target) || typeof target.baseUrl !== 'string' || typeof target.contextRevision !== 'string' ||
+      !target.contextRevision || typeof target.relayId !== 'string' || !target.relayId) {
     throw new Error('Invalid live ownership destination.')
   }
   const url = new URL(target.baseUrl)
   if (!['http:', 'https:'].includes(url.protocol) || url.username || url.password || url.hash || url.search) {
     throw new Error('Invalid live ownership destination.')
   }
-  return { enabled: value.enabled, target: { mode: target.mode as ImportTarget['mode'],
-    baseUrl: target.baseUrl, contextRevision: target.contextRevision,
-    ...(typeof target.relayId === 'string' ? { relayId: target.relayId } : {}) } }
+  return { enabled: value.enabled, target: { baseUrl: target.baseUrl, relayId: target.relayId,
+    contextRevision: target.contextRevision } }
 }
 function record(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null

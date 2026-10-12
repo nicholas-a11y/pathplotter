@@ -5,14 +5,14 @@ param(
     [ValidateRange(1, 20)][int]$Count = 10,
     [ValidateLength(0, 64)][string]$Label = '',
     [string]$InvitationId = '',
-    [string]$Relay = 'https://pathplotter-relay-v2.nicholas-leqeta.workers.dev',
+    [string]$Relay = 'https://pathplotter-relay-v3.nicholas-leqeta.workers.dev',
     [switch]$LibraryOnly
 )
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 $operatorLibraryOnly = [bool]$LibraryOnly
-. (Join-Path $PSScriptRoot 'RAP.ps1') -LibraryOnly
+. (Join-Path $PSScriptRoot 'RAP.ps1')
 
 function Invoke-OperatorInvitations([string]$Operation, [string]$Root, [string]$AdminToken, [int]$Amount, [string]$BatchLabel, [string]$Id) {
     $rootUrl = Assert-CloudRoot $Root

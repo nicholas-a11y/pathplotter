@@ -11,18 +11,18 @@ function group(type: CaptureGroup['type'] = 'polygon'): CaptureGroup {
 function point(x: number, y: number) {
   return { id: crypto.randomUUID(), name: '', x, y, labelOffsetX: 0, labelOffsetY: 0 }
 }
-const target = { mode: 'relay' as const, baseUrl: 'https://relay.example', relayId: 'example', contextRevision: 'revision' }
+const target = { baseUrl: 'https://relay.example', relayId: 'example', contextRevision: 'revision' }
 
-test('Webtool live journals preserve a distinct direct destination across reload', async () => {
+test('live journals preserve the relay destination across reload and require a RAP identifier', async () => {
   const state = group('circles')
   state.points.push(point(10, 20))
-  const destination = { mode: 'webtool' as const, baseUrl: 'http://localhost:19520', contextRevision: 'revision' }
   const queue = emptyLiveQueue()
-  enqueue(queue, await makeUpdate(buildDelta(state, 'capture')!, destination))
+  enqueue(queue, await makeUpdate(buildDelta(state, 'capture')!, target))
   const restored = parseLiveQueue(JSON.parse(JSON.stringify(queue)))
-  assert.deepEqual(restored.items[0]!.target, destination)
+  assert.deepEqual(restored.items[0]!.target, target)
   assert.equal(restored.items[0]!.phase, 'queued')
-  assert.throws(() => parseLiveQueue({ ...queue, items: [{ ...queue.items[0], target: { ...destination, mode: 'unknown' } }] }), /Invalid live update journal/)
+  const { relayId: _relayId, ...withoutRelay } = target
+  assert.throws(() => parseLiveQueue({ ...queue, items: [{ ...queue.items[0], target: withoutRelay }] }), /Invalid live update journal/)
 })
 
 test('live paths send only the next edge and Finish sends only the closing edge', () => {

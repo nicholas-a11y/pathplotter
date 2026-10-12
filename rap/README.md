@@ -1,344 +1,113 @@
-# PathPlotter RAP (portable Windows tray app)
+﻿# PathPlotter RAP (Windows connector)
 
-RAP relays **workpiece** observations from local LightBurn to an authenticated
-HTTPS relay, and imports SVGs explicitly sent by a paired browser into the
-current LightBurn project. It never jogs, fires, starts a job, or opens/replaces
-a project. No Node, Python, packages, installation, administrator permission,
-or global Windows configuration changes are required. Windows PowerShell 5.1
-and the Windows .NET Framework are used.
+RAP is a small portable Windows app that runs beside LightBurn. It reads the laser head position through LightBurn's local REST API, sends it to PathPlotter through the hosted relay, and imports SVGs that your paired browser sends. It never jogs, fires or starts the laser.
 
-## Start and consent
+RAP uses the built-in Windows PowerShell 5.1 and .NET Framework. It needs no installer, administrator access, Node or Python.
 
-1. Extract the complete `rap` folder somewhere writable. Double-click
-   **Start RAP.cmd** (or **Start RAP.vbs** to avoid even a brief command-window
-   flash). RAP starts a small Windows Forms status window and tray icon, with no
-   everyday console. A second launch activates the existing status window.
-2. On first use, paste your individual **Invitation ID** and choose **Register
-   this computer**. This is the secret handout value, not the operator's cancellation
-   UUID. The current relay and Windows computer name are used automatically.
-   **Advanced connection settings** contains the relay override, computer name,
-   **Use guided enrollment instead of an invitation**, and expired-enrollment
-   recovery. A blank Invitation ID does not silently start guided setup.
-   If guided setup is enabled by your operator, explicitly select it under
-   Advanced. RAP opens the hosted setup page and displays a comparison phrase.
-   Verify the exact phrase for this computer, complete the browser verification
-   and explicitly approve there, then confirm the matching phrase in RAP.
-   Setup checks are at least five seconds apart.
-   The service must have enrollment enabled; unavailable/full setup is not a
-   reason to approve a different phrase or silently register another computer.
-3. Open LightBurn, enable its REST API in Settings > Extensions, and keep
-   **Allow API Access From Network disabled**. Click **Request local LightBurn
-   permission** to consent to `state`, `project`, and `upload`. Bring
-   LightBurn to the foreground and approve its dialog within 30 seconds.
-4. Once a fresh verified LightBurn workpiece/context has been published
-   successfully, RAP automatically opens hosted PathPlotter **once per launch
-   only if no browser is paired**.
-   Saved current-user DPAPI credentials are reused on subsequent launches.
-   **Open PathPlotter** creates a fresh, short-lived desktop authorization each
-   time you explicitly click it. It does not consume a phone invitation.
-   If a browser is already paired, opening asks before replacing it. No
-   authorization changes until the new desktop link is redeemed successfully.
-   Reopening in the same authorized browser reuses its identity.
-5. To pair another browser/phone, select **Pair phone**. Scan the locally
-   generated expiring QR or copy its private link. Compare the exact browser
-   phrase with its approval card in RAP, then click **Approve matching phrase**
-   or **Reject**. If a browser is already paired, approval also asks to replace
-   it. Cancel keeps the existing pairing. Only one browser identity is remembered
-   per RAP; switching revokes the previous one's access. Pending or unresolved
-   imports must be finished or acknowledged before switching.
-6. Browser **Send** is authorization to import that SVG. Inspect the project
-   and placement before independently deciding to operate the laser.
+## First-time setup
 
-Do not record diagnostic sessions, enable PowerShell transcripts, or share pairing URL
-screenshots: the URL intentionally displays a short-lived invitation. Durable
-credentials, raw response errors, SVGs and coordinates are not printed.
-QR generation uses the bundled MIT-licensed Net.Codecrete QR encoder v1.6.1
-(a Project Nayuki port; source/license in `Vendor\QrCodeGenerator`). No external
-QR service receives invitation material. The phone QR/link is cleared on expiry
-or close; RAP clears its copied link only if the clipboard still contains that
-exact link. Desktop launch URLs are never displayed, copied or QR encoded.
+1. Download **PathPlotter-RAP-Windows.zip** from the [latest release](https://github.com/nicholas-a11y/pathplotter/releases/latest), or use **Get started > Find Windows download** in PathPlotter.
+2. Extract the whole ZIP to a folder you can write to, such as Documents. Do not run it from inside the ZIP.
+3. In LightBurn, enable **REST API** under **Settings > Extensions**. Leave **Allow API Access From Network** off.
+4. Double-click **Start RAP.cmd**.
+5. Paste the **Invitation ID** you were given and click **Register this computer**. Each Invitation ID registers one computer and expires after seven days.
+6. Click **Request local LightBurn permission**, bring LightBurn to the front and approve its dialog within 30 seconds.
+7. RAP opens PathPlotter in your default browser. You can now capture points.
 
-Closing the status window keeps RAP running in the tray. Tray actions are
-**Open PathPlotter**, **Pair phone**, **Paired browser**, **Status**, explicit
-local permission resets, and **Quit**. Paired browser, also under Advanced, provides revocation
-buttons. Local resets preserve the journal and are not remote revocation:
-also use LightBurn **Manage API Security** and ask the relay operator to revoke
-old agent credentials. Invalid/unreadable saved registration requires explicit
-graphical replacement consent; an unreadable journal remains a blocking error.
-For cloud authorization failures, use the explicit local-registration reset
-after consulting the operator; no automatic enrollment or import retry occurs.
+**Advanced connection settings** (a checkbox in the RAP window) shows the relay address, the computer name and the **Paired browser** list. Most people never need it.
 
-The STA UI only handles controls and messages. One controlled MTA PowerShell
-runspace owns all protocol operations and serialized imports; synchronous
-network calls never run on the form/tray thread. First-time LightBurn's own
-consent dialog and bounded HTTP requests can delay worker actions, not the UI.
-Quit waits for worker cleanup, fences incomplete imports, disposes retained
-streams/sockets, and removes the tray icon. Socket closure reports disconnect;
-slow HTTP mode only sends a disconnected update if its five-second interval permits.
-It does not force-kill an upload or erase uncertain outcomes.
+## Everyday use
 
-The launcher does **not** use an execution-policy bypass. If Windows policy
-blocks the script, use an organization-approved signed distribution and consult
-your administrator. For downloaded files, verify the release source/signature
-and follow your organization's file-unblocking procedure. RAP does not set
-execution policy, unblock files, install certificates, or modify global policy.
+- Start RAP with **Start RAP.cmd**. Starting it again just shows the running window.
+- **Open PathPlotter** opens the app on this computer.
+- **Pair phone** shows a QR code and private link. Scan it, check the phrase on the phone matches the one in RAP, then click **Approve matching phrase**.
+- Only one browser is connected at a time. Pairing a new one replaces the old one after you confirm.
+- Closing the window keeps RAP in the system tray. Right-click the tray icon and choose **Quit** to stop it.
 
-## Console commands and revocation
+## Updates
 
-### Switching to the fresh v2 relay
+RAP checks for a new version every time it starts. You can also choose **Check for updates** from the tray menu.
 
-New registrations default to `https://pathplotter-relay-v2.nicholas-leqeta.workers.dev`. Existing protected registrations keep their original relay; upgrading RAP does not silently switch them.
+When a new version is available, the version line in RAP shows **Update now to vX.Y.Z**. Click it and confirm. RAP downloads the release from GitHub, checks its SHA-256 checksum, replaces its own files and restarts. Your registration and LightBurn permission are kept.
 
-Finish/reconcile any pending import first. In the tray menu choose **Forget local registration...** and confirm, then restart the updated RAP. This preserves the import journal but removes local relay and LightBurn credentials. Revoke the old RAP permission in LightBurn's **Manage API Security**, then request and approve local permission again when prompted.
+If the relay reports that this RAP is too old, RAP pauses, shows its window and asks you to click **Update now**. Updates are refused while an import is in progress.
 
-The v2 relay uses operator invitations unless guided enrollment is explicitly configured. Generate a batch as described below and enter each individual secret in RAP's **Invitation ID** field, then choose **Register this computer**. The legacy `BOOTSTRAP_TOKEN` path is still supported, but needs a fresh value per computer; batches avoid that rotation. Browser pairing still uses **Open PathPlotter** or **Pair phone**, never the operator secret.
+If an update cannot be installed automatically, for example because the folder is read-only, download the new ZIP and extract it over the old folder.
+
+## Troubleshooting
+
+| Problem | What to do |
+| --- | --- |
+| Registration failed | Check the Invitation ID was pasted in full. Each ID works once; ask for a new one if it was already used or has expired. |
+| "Not ready" mentioning LightBurn | Check that LightBurn is running, its REST API is on and a machine is connected. |
+| "Relay disconnected" | Check the internet connection. Some company networks block WebSockets. |
+| Nothing happens on start | Run **Start RAP diagnostics.cmd** to see startup errors in a console window. |
+| Windows blocks the scripts | Follow your organization's approved procedure. Do not disable security protections. |
+
+The tray menu also has **Forget LightBurn permission** and **Forget local registration** for starting over. These do not revoke remote permissions.
+
+## Privacy and safety
+
+- Credentials are stored in `%LOCALAPPDATA%\PathPlotter\RAP`, protected for the current Windows user (DPAPI). The LightBurn API secret never leaves this computer.
+- RAP accepts only the narrow SVG vocabulary PathPlotter produces: circles and M/L/Z paths, with no scripts, external references or text.
+- Before uploading, each import is recorded in a protected journal. An import whose outcome is unclear (for example, the connection dropped mid-upload) is marked **unknown** and never resent automatically. Inspect LightBurn and reconcile it in PathPlotter.
+- LightBurn's import event does not identify which upload it belongs to. Avoid other imports while PathPlotter is sending.
+
+## For maintainers
+
+### Files
+
+| File | Purpose |
+| --- | --- |
+| `Start RAP.cmd`, `Start RAP.vbs` | Launchers: hidden, single-threaded-apartment GUI |
+| `Start RAP diagnostics.cmd` | Same GUI with a visible console for startup errors |
+| `GUI.ps1` | Windows Forms window, tray and smoke test |
+| `GUIWorker.ps1` | Background worker: registration, consent, relay loop, update actions |
+| `RAP.ps1` | Core library: LightBurn API, relay socket, import safety, storage |
+| `Updater.ps1` | GitHub release check, checksum verification and file replacement |
+| `Transport.cs`, `Desktop.cs` | Compiled helpers for sockets, the SSE stream and single-instance activation |
+| `version.txt` | RAP version, compared against GitHub releases and the relay's `MIN_RAP_VERSION` |
+| `Operator-Invitations.ps1` | Operator tool for batch invitations (not shipped in the ZIP) |
+
+### Tests
+
+Run with the built-in Windows PowerShell 5.1:
+
+```powershell
+$ps = "$env:SystemRoot\System32\WindowsPowerShell\v1.0\powershell.exe"
+& $ps -NoProfile -ExecutionPolicy Bypass -File .\rap\Test-RAP.ps1
+& $ps -NoProfile -ExecutionPolicy Bypass -STA -File .\rap\Test-GUI.ps1
+& $ps -NoProfile -ExecutionPolicy Bypass -File .\rap\Test-Operator-Invitations.ps1
+```
+
+They use local fixtures only. They make no cloud, GitHub or LightBurn calls and change no real credentials.
+
+### Releasing a new RAP version
+
+1. Update `rap/version.txt`, for example `3.1.0`.
+2. Commit and push.
+3. Tag the commit `rap-v3.1.0` and push the tag:
+
+   ```powershell
+   git tag rap-v3.1.0
+   git push origin rap-v3.1.0
+   ```
+
+4. The [release workflow](../.github/workflows/rap-release.yml) checks that the tag matches `version.txt`, runs the web, relay and RAP tests, then publishes `PathPlotter-RAP-Windows.zip` and its `.sha256` file.
+5. Running RAPs offer **Update now** at their next start or **Check for updates**.
+6. Optional, for breaking relay changes: raise `MIN_RAP_VERSION` in [relay/wrangler.jsonc](../relay/wrangler.jsonc) and redeploy the relay **after** the release is published. Older RAPs then pause and ask the user to update.
+
+To build the ZIP locally: `.\scripts\Package-RAP.ps1 -OutputPath <new path>\PathPlotter-RAP-Windows.zip`.
 
 ### Operator batch invitations
 
-For several people, use **Operator-Invitations.ps1** instead of rotating bootstrap secrets. Deploy the updated relay first and set its private `OPERATOR_ADMIN_TOKEN` secret once. Only the operator needs this tool or admin secret; users receive individual invitations.
-
-From the extracted RAP folder in Windows PowerShell 5.1:
+The operator holds a private `OPERATOR_ADMIN_TOKEN` (see [relay setup](../relay/README.md)). The tool asks for it securely; never type it as a command argument.
 
 ```powershell
-.\Operator-Invitations.ps1 -Action Generate -Count 10 -Label 'October group'
-.\Operator-Invitations.ps1 -Action List
-.\Operator-Invitations.ps1 -Action Cancel -InvitationId 'paste-the-id-from-List'
+$ps = "$env:SystemRoot\System32\WindowsPowerShell\v1.0\powershell.exe"
+& $ps -NoProfile -ExecutionPolicy Bypass -File .\rap\Operator-Invitations.ps1 -Action Generate -Count 10 -Label "Workshop March"
+& $ps -NoProfile -ExecutionPolicy Bypass -File .\rap\Operator-Invitations.ps1 -Action List
+& $ps -NoProfile -ExecutionPolicy Bypass -File .\rap\Operator-Invitations.ps1 -Action Cancel -InvitationId <uuid from List>
 ```
 
-Each command prompts for the admin secret with hidden input. It is sent only in an HTTPS authorization header, never saved or included in a URL. An explicit `-Relay` HTTPS origin override is available for an operator-managed relay. Generate accepts 1-20 invitations per batch, defaulting to 10; each expires after **seven days** and registers **one computer**. Hand each person just their `InvitationID` secret value to paste into RAP's **Invitation ID** field. They then register and approve LightBurn's local permission normally.
-
-Generation displays secrets once in your private terminal. Do not use PowerShell transcripts, recordings or shared terminals, and store handouts securely. List shows IDs, labels, batches, expiry and status but never the secrets. Cancellation uses Generate's **CancellationId** or List's **id** UUID via `-InvitationId`, not the secret entered in RAP, and cannot revoke already-registered computers. If generation times out, List identifies the uncertain batch by label/time so you can cancel it before generating replacements. The tool never automatically retries generation.
-
-The service permits 100 outstanding unused invitations, five operator requests/IP/minute, and 50 registered computers total. Invites do not reserve slots. Metadata remains available until 30 days after expiry; very large histories explicitly report a truncated list.
-
-Use **Start RAP diagnostics.cmd** for the original typed console workflow.
-Quit the tray instance before starting diagnostics (both retain the same durable
-instance lock and protected state). Diagnostics intentionally keeps manual
-`pair`/`open`/approval commands; it is not the everyday auto-launch workflow.
-
-Commands run between serialized observations. Import setup still performs
-bounded synchronous HTTP requests and SSE readiness checks; commands can be
-delayed during setup, but not by the 20-second confirmation wait.
-
-| Command | Effect |
-| --- | --- |
-| `help` | Show commands. |
-| `pair` / `open` | Create a five-minute single-use invitation / open the last displayed URL. |
-| `approve ID` / `reject ID` | Decide a currently pending, phrase-verified pairing. |
-| `browsers` | List paired browser IDs. |
-| `revoke ID` | Revoke a browser through the authenticated relay contract. |
-| `slow-http` | Explicitly opt into HTTP updates at least five seconds apart; capture, approval and job delivery are slower. |
-| `socket` | Restore normal socket transport; reconnect with a new generation. |
-| `forget-lightburn` | Forget the local LightBurn secret and stop. **Also revoke** PathPlotter RAP in LightBurn's **Manage API Security**. Restarting requires explicit pairing consent. |
-| `forget-relay` | Delete local credentials and stop, preserving the import journal. **Ask the operator to revoke the old relay agent credential**, and revoke the LightBurn entry in its UI. |
-| `quit` / Ctrl+C | Stop; publish a disconnected heartbeat when possible. |
-
-The v1 relay contract has **no agent-credential self-revocation endpoint**,
-and LightBurn has no documented HTTP secret-revocation endpoint. Forget commands
-do not pretend to revoke those remote credentials. Browser revocation does use
-the documented endpoint. An ambiguous pairing/revocation request is not
-automatically repeated; inspect the browser list/status before trying again.
-
-## State, reconnect and freshness
-
-Current-user DPAPI encrypts credentials and the durable import journal in
-`%LOCALAPPDATA%\PathPlotter\RAP`. The directory grants access only to the current
-Windows user and disables inherited ACLs. A file lock excludes duplicate RAP
-protocol workers. The desktop additionally uses a current-user mutex and
-ACL-restricted named pipe with a single fixed **show status** action, excluding
-network logons. No arbitrary command, URL or credential is accepted via IPC.
-These protections do not defend against software running as your
-Windows user or an administrator.
-
-Enrollment additionally protects `enrollment.dpapi` **before** sending its
-random 32-byte verifier. A lost start/claim reply is resumed explicitly using
-the same relay, computer name and verifier, not a new identity. The verifier
-never enters the browser URL. Claimed credentials are flushed to
-`credentials.dpapi` before the pending enrollment is removed. **Discard expired
-enrollment setup** requires explicit consent: discarding an ambiguous verifier
-can forfeit registration recovery. Existing credentials and journals are untouched.
-
-RAP targets **500 ms local observations**, without overlapping status/project/position
-reads, independently of publication and reconnect backoff. With authorized
-preview active, changed observations are published at **at most 2 Hz**. Three
-distinct identical local observations establish settled state; it is published
-once, then stationary updates wait for **15-second fresh health** or explicit
-server work. Without preview, ordinary coordinates are not continuously pushed.
-Latency and synchronous import setup can make actual observation intervals longer.
-Confirmation is cooperatively polled without waiting across main-loop iterations,
-retaining one SSE stream while local observation and socket work continue.
-This is not a hard 500 ms delivery guarantee, and the **2-second stale cutoff
-is unchanged**. API success is an observation, not proof of a newly measured controller
-position. Missing workpiece X/Y never fall back to machine coordinates or zero.
-Missing workpiece dimensions remain `null`; missing machine size, workpiece
-offset or machine-view context fails closed.
-
-Timed `/agent/start` and socket `update-result` responses supply `serverTime`. RAP
-calibrates a monotonic server-clock estimate with **full roundtrip duration**
-as its uncertainty, never the desktop wall clock. Each connected update includes
-`observedAtServer` (back-projected to the earliest instant of the local read)
-and `clockUncertaintyMs`, as well as elapsed read age. The backend computes
-`max(reported age, serverNow - observedAtServer + clockUncertaintyMs)` at receipt,
-so a buffered/delayed observation cannot look newly observed. Socket connect
-and send deadlines are five seconds; unacknowledged updates fail after five seconds.
-HTTP fallback updates retain a whole-request 1000 ms abort deadline. Missing calibration or a local sample
-exceeding 2 seconds publishes disconnected with no position/context. Browsers
-still account for receipt age and their own server-clock calibration.
-Socket reconnect uses bounded backoff (0.5–30 s); HTTP fallback reconnect never
-accelerates its five-second update interval. Local observations continue independently.
-A new agent generation fences old sessions; fresh observations are required.
-
-The built-in .NET `ClientWebSocket` authenticates
-`/v1/relays/{relayId}/agent/stream?generation=N` using the Authorization header,
-not credentials in a URL. Transport helpers only enqueue text: **16 KiB outgoing
-/ 1 MiB incoming per message** (incoming includes the existing 512 KiB SVG job),
-**16 outgoing / 32 incoming messages, 4 MiB total incoming payload**,
-strict UTF-8 and text-only receive,
-including bounded fragmented messages. All v2 JSON, pairing, capture and job
-handling remains in the single MTA worker. `work` requests force a fresh update
-even when stationary so pending jobs can be safely claimed. `capture` requests
-perform a **new local read**, correlated by UUID, and return `capture-result` with
-the original observation timing, never a cached preview or a restamped result.
-The server enforces request lifetime/context/owner/generation; a late read fails
-instead of weakening the browser's two-second freshness requirement.
-
-There is **no automatic HTTP fallback**. Expand **Advanced connection settings**
-in the status window, choose **WebSockets (recommended; reconnects automatically)**
-or **Compatibility mode - slower HTTP**, then click **Apply**. Selecting a radio
-button alone does not reconnect. Apply is unavailable during imports, and the
-worker also refuses transport changes while an import is active. The status
-reports the actual transport separately from the selected, unapplied choice.
-Select the same transport in PathPlotter. WebSockets is the default at startup.
-Use `slow-http` in diagnostics to explicitly enable reduced-rate updates
-and capture work, no faster than every five seconds. Socket mode restores normal
-operation with a new generation. No transport switch retries an uncertain upload.
-The fallback can miss a ten-second capture deadline during slow local reads,
-setup or uploads; request a new capture explicitly, never commit an old preview.
-
-API authorization failure, no machine connection, network refusal/timeouts,
-and invalid context/coordinates are distinct fixed local error categories.
-No automatic LightBurn pairing is performed on authorization failure. Check
-the Windows clock, API capability grants, and which LightBurn copy has focus.
-Use `forget-lightburn` and restart only when you intend to pair again.
-
-## Browser pairing
-
-Use **Open PathPlotter** for this computer's browser. For a phone or another browser, choose **Pair phone**, scan its QR or open/copy its link, compare the phrase and approve in RAP. The links contain the relay address and temporary authorization information; no three-letter code or manual entry is needed.
-
-Browser pairing does not require Turnstile. Guided registration of a new RAP computer is separate and still requires its enrollment configuration or an operator invitation.
-
-Saved browser access remains valid until explicitly replaced or revoked through **Paired browser**. Restarting RAP does not replace a saved phone with the desktop browser. Closing the status window merely hides RAP in the tray and is not Quit. Existing registrations and already-approved browser credentials are preserved when upgrading; the next confirmed switch replaces all previously authorized browsers. Multiple tabs in the same browser profile still share one identity and use the existing exclusive capture-control rules.
-
-## Import safety and limitations
-
-Every claimed job is serialized and checked for expiry, context revision,
-finite anchor, safe filename, immutable UTF-8 SHA-256 checksum, 512 KiB limit,
-and the existing application's constrained SVG vocabulary (root SVG, outline
-circles and M/L/Z paths only). No external references, DTDs, scripts, styles,
-embedded text, nested SVGs or arbitrary path commands are accepted.
-
-RAP opens authenticated SSE and waits for the documented **`:connected`**
-comment **before** uploading. It rechecks workpiece/context after readiness and
-after the cloud acknowledges `attempting`. A DPAPI journal is atomically
-replaced and flushed before any upload attempt. Uploads use an unbuffered,
-non-pipelined fresh connection with redirects disabled, avoiding automatic
-buffered POST replay. Only HTTP 202 is accepted;
-only the exact SSE **`event: file_imported`** with JSON boolean `success` confirms
-or explicitly fails import. Generic success/type fields are not confirmations.
-An unavailable SSE stream prevents upload; there is no polling fallback for
-import confirmation.
-
-Only one import is active, including its confirmation window. The SSE reader
-is retained after HTTP 202 and checked nonblockingly until a genuine event,
-stream closure, or a monotonic 20-second deadline after the upload response.
-The main loop continues publishing fresh observations during that window; it
-does not start a second import until the first is terminal. Terminal status is
-journaled before releasing the stream and reconciled with the cloud on subsequent
-updates. Stop, unexpected exit, or cloud generation loss disposes the stream;
-an attempted import becomes unknown, while a setup aborted before upload fails.
-
-An accepted upload without confirmation, timeout/disconnect around upload,
-unexpected upload response, or restart during claimed/attempting/accepted state
-becomes **unknown**. RAP never automatically resends it. Inspect LightBurn and
-reconcile manually; a deliberate resend must be a new browser job. Journal
-tombstones remain locally indefinitely (no SVGs or coordinates), including
-failed jobs, to prevent duplicate delivery from repeating a side effect.
-Do not delete or restore an older journal to retry a job. Corrupt DPAPI/journal
-state blocks startup rather than silently resetting.
-
-LightBurn does **not** document event-to-job correlation or import idempotency.
-RAP serializes its own jobs, but cannot distinguish unrelated imports producing
-`file_imported` during its upload window. Avoid other imports or API clients
-while RAP is importing. Context can also change between the final check and
-LightBurn applying the upload; undocumented origin changes cannot be promised
-detectable. These are protocol limitations, not an exactly-once guarantee.
-
-Cloud timestamps accept epoch milliseconds or ISO-8601 UTC strings; numeric
-generation and increasing sequence preserve fencing under the v2 transport. The tray's
-desktop launch requires the updated authenticated
-`POST /v1/relays/{relayId}/agent/browser-launch` endpoint: `{}` returns
-`{launchToken, expiresAt}`. RAP opens `#relay=...&relayId=...&launch=TOKEN`
-only in the default browser. The grant expires after two minutes and is
-single-use; it is a bearer grant, not proof of physical locality.
-Ordinary phones continue using `/pairing/new` and explicit `/pairing/decide`.
-Confirmed switches send `replaceBrowserIds` containing the exact reviewed saved
-IDs on launch issuance or phone approval. Stale confirmations fail instead of
-revoking a newly paired device. Diagnostic console approval similarly requires
-typing `REPLACE` before switching.
-The local SVG allowlist is intentionally narrow and
-matches the current app exporter; unsupported future SVG variants are rejected,
-not silently imported.
-
-## Deterministic Windows checks
-
-From the project root, run:
-
-```powershell
-& "$env:SystemRoot\System32\WindowsPowerShell\v1.0\powershell.exe" -NoLogo -NoProfile -File ".\rap\Test-RAP.ps1"
-& "$env:SystemRoot\System32\WindowsPowerShell\v1.0\powershell.exe" -NoLogo -NoProfile -STA -File ".\rap\Test-GUI.ps1"
-```
-
-The standalone script returns a nonzero exit code on failure and requires
-actual PS5.1. It parses all RAP scripts, compiles the in-memory .NET helpers,
-tests DPAPI/atomic state/ACLs, exact HMAC/SVG/freshness/context validation
-(including delayed-publication and missing-calibration cases),
-strict SSE recognition, raw HTTP transport and real ClientWebSocket
-Authorization/send/fragmentation/size/cancellation against ephemeral loopback
-**test fixtures**, and mocked approval/revocation/import ordering, fencing,
-nonblocking main-loop publication during confirmation, serial imports, timeout,
-stop/exit cleanup, duplicate delivery and restart reconciliation. Scheduling checks
-verify independent 500 ms reads, 2 Hz maximum pushes, settled-once/15-second
-health, stationary fresh capture and pairing work, explicit >=5-second HTTP
-fallback, and verifier-bound ambiguous enrollment recovery.
-It never contacts LightBurn/cloud, requests hardware
-pairing, uploads to hardware, or changes the user's real RAP state. Its isolated
-test state and compilation scratch files stay within `rap` and are removed.
-No test framework or runtime installation is needed.
-
-`Test-GUI.ps1` compiles the bundled local QR encoder, rejects desktop-grant QR
-generation, verifies fixed-action duplicate activation, and runs a real STA
-form/tray with a mocked protocol runspace. It exercises guided graphical enrollment,
-matching-phrase confirmation and >=5-second pending claim checks,
-denied and then explicitly retried local consent, healthy auto-open once,
-phone QR/link expiry, exact-phrase targeting (mismatches cannot approve),
-explicit rejection, responsive worker/UI scheduling, and graceful disconnected
-shutdown with lock/IPC release. All test state stays under `rap` and is removed;
-no real browser opens, networking, user credentials or hardware are used.
-Real-phone scanning, default-browser launch, actual LightBurn consent/hardware
-and policy-restricted distribution still require an operator-led smoke test.
-
-### Live update rollout
-
-The tray keeps the existing coordinate-publication and import protocol; it does
-not itself enable browser Live update, alter relay admission limits, or accept
-additional SVG vocabulary. Deploy it alongside the updated desktop-launch,
-browser pairing/control, browser queue and relay changes, with Live update
-default off. Before enabling live
-drawing on hardware, verify fresh coordinates during delayed confirmation,
-ordered imports, timeout/stop/restart recovery, and unchanged existing LightBurn
-objects. Inspect uncertain outcomes manually; never replay an attempted job.
-
-API shapes were verified against official
-[LightBurn-REST documentation](https://github.com/LightBurnSoftware/LightBurn-REST/tree/43d3a4ec5aeb14219f0acaefc8fe01ede57f63ac/docs)
-(`authentication.md`, `api-reference.md`, `uploading.md`, `openapi.yaml`).
-No real hardware pairing/upload or deployment has been performed.
+**Generate** prints each Invitation ID once; hand one to each person. **List** shows status (unused, used, expired, cancelled) but never the secret values. **Cancel** takes the UUID from List, not the secret. A lost Generate reply is not retried: list, cancel the uncertain ones and generate replacements.

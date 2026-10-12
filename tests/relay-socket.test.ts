@@ -35,11 +35,12 @@ test('waiting for RAP is not coordinate age, but invalid wait claims never remov
   }
 })
 
-async function setup() {
+async function setup(initial: Record<string, unknown> = fixture, control: () => Response = () => Response.json({ ok: true })) {
   const original = globalThis.fetch
   const descriptor = Object.getOwnPropertyDescriptor(globalThis, 'WebSocket')
   const paths: string[] = []
   let captureId = ''
+  let claims = 0
   Object.defineProperty(globalThis, 'WebSocket', { value: SocketFixture, configurable: true, writable: true })
   globalThis.fetch = async (url, init) => {
     const path = new URL(String(url)).pathname
@@ -49,7 +50,7 @@ async function setup() {
       captureId = JSON.parse(String(init?.body)).requestId
       return Response.json({ requestId: captureId })
     }
-    if (path.endsWith('/control')) return Response.json({ ok: true })
+    if (path.endsWith('/control')) { claims++; return control() }
     throw new Error(`Unexpected polling: ${path}`)
   }
   const client = new RelayClient({ baseUrl: 'https://relay.example', relayId: 'test', credential: 'test-only' }, () => {})
@@ -57,10 +58,10 @@ async function setup() {
   await flush()
   const socket = SocketFixture.latest
   socket.onopen?.()
-  socket.receive(fixture)
+  socket.receive(initial)
   await flush()
   return {
-    client, socket, paths, captureId: () => captureId,
+    client, socket, paths, captureId: () => captureId, claims: () => claims,
     cleanup: () => {
       client.stop()
       globalThis.fetch = original
@@ -188,52 +189,6 @@ test('a paused moving preview does not block a new verified coordinate request',
   } finally { env.cleanup() }
 })
 
-test('explicit HTTP fallback keeps protocol 2 health polling at least five seconds apart', async () => {
-  const originalFetch = globalThis.fetch
-  const polls: number[] = []
-  globalThis.fetch = async () => {
-    polls.push(performance.now())
-    return Response.json(fixture)
-  }
-  const client = new RelayClient({ baseUrl: 'https://relay.example', relayId: 'test', credential: 'test-only' }, () => {}, 'http')
-  try {
-    client.start()
-    await flush()
-    assert.equal(client.canCapture(), true)
-    await new Promise(resolve => setTimeout(resolve, 5100))
-    assert.equal(polls.length, 2)
-    assert.ok(polls[1]! - polls[0]! >= 5000)
-  } finally { client.stop(); globalThis.fetch = originalFetch }
-})
-
-test('HTTP capture starts long-poll immediately and accepts only a genuinely fresh result after server waiting', async () => {
-  const originalFetch = globalThis.fetch
-  let requestedId = '', postAt = 0, getAt = 0
-  globalThis.fetch = async (url, init) => {
-    const path = new URL(String(url)).pathname
-    if (path.endsWith('/snapshot')) return Response.json(fixture)
-    if (path.endsWith('/capture')) {
-      requestedId = JSON.parse(String(init?.body)).requestId
-      postAt = performance.now()
-      return Response.json({ requestId: requestedId })
-    }
-    assert.ok(path.endsWith(`/capture/${requestedId}`))
-    getAt = performance.now()
-    await new Promise(resolve => setTimeout(resolve, 2200))
-    return Response.json({ status: 'complete', waitMs: Math.floor(performance.now() - getAt),
-      body: { ...fixture, snapshot: { ...fixture.snapshot, sequence: 2 } } })
-  }
-  const client = new RelayClient({ baseUrl: 'https://relay.example', relayId: 'test', credential: 'test-only' }, () => {}, 'http')
-  try {
-    client.start()
-    await flush()
-    const result = await client.freshPosition()
-    assert.equal(result.sequence, 2)
-    assert.ok(getAt - postAt < 100, 'The first capture GET must not wait for the five-second regular poll.')
-    assert.ok(client.age() < 100)
-  } finally { client.stop(); globalThis.fetch = originalFetch }
-})
-
 test('socket capture subtracts only matched server waiting, never old observation age', async () => {
   const env = await setup()
   try {
@@ -250,4 +205,80 @@ test('socket capture subtracts only matched server waiting, never old observatio
       body: { ...fixture, waitMs: 0, snapshot: { ...fixture.snapshot, sequence: 3, observationAgeMs: 2001 } } })
     await rejected
   } finally { env.cleanup() }
+})
+
+test('free capture control is claimed automatically once; losing it never starts a stealing loop', async () => {
+  const env = await setup({ ...fixture, activeBrowser: false })
+  try {
+    assert.equal(env.claims(), 1)
+    assert.equal(env.client.canCapture(), true)
+    env.socket.receive({ ...fixture, activeBrowser: false, controlOccupied: true })
+    await flush()
+    assert.match(env.client.controlError, /another browser/)
+    env.socket.receive({ ...fixture, activeBrowser: false, controlOccupied: false })
+    await flush()
+    assert.equal(env.claims(), 1)
+    assert.equal(env.client.canCapture(), false)
+    await env.client.claimControl(true)
+    assert.equal(env.client.canCapture(), true)
+    assert.equal(env.claims(), 2)
+  } finally { env.cleanup() }
+})
+
+test('occupied control stays read-only and a refused automatic claim is explained', async () => {
+  const occupied = await setup({ ...fixture, activeBrowser: false, controlOccupied: true })
+  try {
+    assert.equal(occupied.claims(), 0)
+    assert.equal(occupied.client.canCapture(), false)
+  } finally { occupied.cleanup() }
+  const refused = await setup({ ...fixture, activeBrowser: false },
+    () => Response.json({ error: 'Unresolved import prevents capture handover' }, { status: 409 }))
+  try {
+    assert.equal(refused.claims(), 1)
+    assert.match(refused.client.controlError, /Unresolved import/)
+    assert.equal(refused.client.canCapture(), false)
+  } finally { refused.cleanup() }
+})
+
+test('an old preview is never treated as a fresh position', async () => {
+  const env = await setup({ ...fixture, snapshot: { ...fixture.snapshot, observationAgeMs: 2001 } })
+  try {
+    assert.equal(env.client.canCapture(), true)
+    assert.equal(env.client.hasFreshPosition(), false)
+    env.client.stop()
+    assert.equal(env.client.canCapture(), false)
+    assert.equal(env.client.snapshot, null)
+  } finally { env.cleanup() }
+})
+
+test('malformed relay updates and refused tickets fail closed', async () => {
+  const env = await setup()
+  try {
+    env.socket.receive({ protocol: 1 })
+    await flush()
+    assert.match(env.client.error, /unexpected update/)
+    assert.equal(env.client.canCapture(), false)
+  } finally { env.cleanup() }
+  const original = globalThis.fetch
+  const descriptor = Object.getOwnPropertyDescriptor(globalThis, 'WebSocket')
+  Object.defineProperty(globalThis, 'WebSocket', { value: SocketFixture, configurable: true, writable: true })
+  globalThis.fetch = async () => Response.json({ error: 'Relay access revoked' }, { status: 403 })
+  const client = new RelayClient({ baseUrl: 'https://relay.example', relayId: 'test', credential: 'test-only' }, () => {})
+  try {
+    client.start()
+    await flush()
+    assert.match(client.error, /revoked/)
+    assert.equal(client.canCapture(), false)
+  } finally {
+    client.stop()
+    globalThis.fetch = original
+    if (descriptor) Object.defineProperty(globalThis, 'WebSocket', descriptor)
+    else Reflect.deleteProperty(globalThis, 'WebSocket')
+  }
+})
+
+test('the relay can ask for a RAP update', async () => {
+  const env = await setup({ ...fixture, rapUpdateRequired: true })
+  try { assert.equal(env.client.rapUpdateRequired, true) }
+  finally { env.cleanup() }
 })

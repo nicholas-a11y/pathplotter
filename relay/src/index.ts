@@ -21,14 +21,12 @@ const LAUNCH_TOKEN_LIFETIME_MS = 2 * 60_000;
 const LAUNCH_OUTSTANDING_LIMIT = 5;
 const LAUNCH_RATE_WINDOW_MS = 10 * 60_000;
 const LAUNCH_RATE_LIMIT = 20;
-const LAUNCH_BROWSER_LIMIT = 20;
 const LIVENESS_MS = 45_000;
-const FALLBACK_MS = 5_000;
+const JOB_REAP_MS = 5_000;
 const INVITATION_LIFETIME_MS = 7 * 24 * 60 * 60_000;
 type OperatorInvitation = { id: string; batchId: string; label: string; createdAt: number; expiresAt: number; status: "unused" | "used" | "cancelled" | "expired" };
 type SocketIdentity = { role: "agent" | "browser"; browserId?: string; generation?: number; seen: number; lastMessage?: number; sequence?: number; watching?: boolean };
 type Capture = { browserId: string; generation: number; revision: string | null; created: number; sequence: number; observedAt: number; status: "pending" | "complete" | "failed"; body?: unknown; error?: string };
-type EnrollmentClaim = { status: "pending" } | { status: "complete"; relayId: string; credential: string };
 
 type JsonObject = Record<string, unknown>;
 type Snapshot = {
@@ -88,7 +86,7 @@ function errorResponse(error: unknown): Response {
   }
   // RPC preserves Error messages, not application subclasses/properties.
   if (error instanceof Error) {
-    const codes: Record<string, number> = { registration_rate_limited: 429, registration_capacity: 429, enrollment_busy: 429, enrollment_not_found: 404, unauthorized: 401 };
+    const codes: Record<string, number> = { registration_rate_limited: 429, registration_capacity: 429, unauthorized: 401 };
     const code = Object.keys(codes).find((c) => error.message === c || error.message.endsWith(`: ${c}`));
     if (code) return jsonResponse({ error: code }, codes[code]);
   }
@@ -394,25 +392,12 @@ export class ControlPlaneDO extends DurableObject<Env> {
           consumed_at INTEGER NOT NULL
         );
         CREATE TABLE IF NOT EXISTS preview_leases (relay_id TEXT PRIMARY KEY, expires_at INTEGER NOT NULL);
-        CREATE TABLE IF NOT EXISTS enrollments (
-          id TEXT PRIMARY KEY, name TEXT NOT NULL, verifier_hash TEXT NOT NULL,
-          phrase TEXT NOT NULL, expires_at INTEGER NOT NULL, status TEXT NOT NULL,
-          relay_id TEXT, wrapped_iv TEXT, wrapped_credential TEXT
-        );
         CREATE TABLE IF NOT EXISTS registered_relays (relay_id TEXT PRIMARY KEY);
         CREATE TABLE IF NOT EXISTS operator_invitations (
           id TEXT PRIMARY KEY, batch_id TEXT NOT NULL, label TEXT NOT NULL,
           token_hash TEXT NOT NULL UNIQUE, created_at INTEGER NOT NULL,
           expires_at INTEGER NOT NULL, cancelled INTEGER NOT NULL DEFAULT 0
         );
-        CREATE TABLE IF NOT EXISTS code_windows (
-          id TEXT PRIMARY KEY, relay_id TEXT NOT NULL, code TEXT NOT NULL UNIQUE,
-          generation INTEGER NOT NULL, expires_at INTEGER NOT NULL, created_at INTEGER NOT NULL,
-          status TEXT NOT NULL, claim_id TEXT UNIQUE, verifier_hash TEXT, browser_id TEXT,
-          credential_hash TEXT, wrapped_iv TEXT, wrapped_credential TEXT,
-          recovery_until INTEGER, last_recovery INTEGER
-        );
-        CREATE TABLE IF NOT EXISTS code_attempts (ip_hash TEXT NOT NULL, created_at INTEGER NOT NULL, kind TEXT NOT NULL);
       `);
       if (await ctx.storage.getAlarm() === null) await ctx.storage.setAlarm(Date.now() + 60_000);
     });
@@ -421,10 +406,7 @@ export class ControlPlaneDO extends DurableObject<Env> {
   async alarm(): Promise<void> {
     const now = Date.now();
     this.ctx.storage.sql.exec("DELETE FROM preview_leases WHERE expires_at <= ?", now);
-    this.ctx.storage.sql.exec("DELETE FROM enrollments WHERE expires_at <= ?", now);
     this.ctx.storage.sql.exec("DELETE FROM registration_rates WHERE window_start <= ?", now - 5 * 60_000);
-    this.ctx.storage.sql.exec("DELETE FROM code_windows");
-    this.ctx.storage.sql.exec("DELETE FROM code_attempts");
     this.ctx.storage.sql.exec("DELETE FROM operator_invitations WHERE expires_at <= ?", now - 30 * JOB_RETENTION_MS);
     await this.ctx.storage.setAlarm(now + 60_000);
   }
@@ -493,68 +475,7 @@ export class ControlPlaneDO extends DurableObject<Env> {
     });
   }
 
-  async enrollmentStart(name: string, verifierHash: string, ipHash: string): Promise<unknown> {
-    const now = Date.now();
-    if (this.consumeRegistrationAttempt(ipHash, null, "", now) === "rate_limited") throw new HttpError(429, "registration_rate_limited");
-    const result = this.ctx.storage.transactionSync(() => {
-      this.ctx.storage.sql.exec("DELETE FROM enrollments WHERE expires_at <= ?", now);
-      const retry = this.ctx.storage.sql.exec<{ id: string; phrase: string; expires_at: number }>("SELECT id,phrase,expires_at FROM enrollments WHERE verifier_hash = ? AND status != 'complete'", verifierHash).toArray()[0];
-      if (retry) return { requestId: retry.id, phrase: retry.phrase, expiresAt: retry.expires_at };
-      const known = this.ctx.storage.sql.exec<{ n: number }>("SELECT COUNT(*) AS n FROM registered_relays").one().n;
-      const legacy = this.ctx.storage.sql.exec<{ n: number }>("SELECT COUNT(DISTINCT relay_id) AS n FROM consumed_invitations WHERE relay_id NOT IN (SELECT relay_id FROM registered_relays)").one().n;
-      const reserved = this.ctx.storage.sql.exec<{ n: number }>("SELECT COUNT(*) AS n FROM enrollments WHERE status != 'complete'").one().n;
-      if (known + legacy + reserved >= 50) throw new HttpError(429, "registration_capacity");
-      if (reserved >= 20) throw new HttpError(429, "enrollment_busy");
-      const id = crypto.randomUUID(), phrase = randomPhrase(), expiresAt = now + PAIRING_LIFETIME_MS;
-      this.ctx.storage.sql.exec("INSERT INTO enrollments (id,name,verifier_hash,phrase,expires_at,status) VALUES (?,?,?,?,?,'pending')", id, name, verifierHash, phrase, expiresAt);
-      return { requestId: id, phrase, expiresAt };
-    });
-    await this.ctx.storage.setAlarm(now + 60_000);
-    return result;
-  }
-
-  enrollmentGet(id: string): { name: string; phrase: string; expiresAt: number; status: string } {
-    const row = this.ctx.storage.sql.exec<{ name: string; phrase: string; expires_at: number; status: string }>("SELECT name,phrase,expires_at,status FROM enrollments WHERE id = ? AND expires_at > ?", id, Date.now()).toArray()[0];
-    if (!row) throw new HttpError(404, "enrollment_not_found");
-    return { name: row.name, phrase: row.phrase, expiresAt: row.expires_at, status: row.status };
-  }
-
-  enrollmentApprove(id: string): void {
-    this.enrollmentGet(id);
-    this.ctx.storage.sql.exec("UPDATE enrollments SET status = 'approved' WHERE id = ? AND status = 'pending'", id);
-  }
-
-  async enrollmentClaim(id: string, verifier: string): Promise<{ ok: true; body: EnrollmentClaim } | { ok: false; status: number; error: string }> {
-    try {
-      return { ok: true, body: await this.claimEnrollment(id, verifier) };
-    } catch (error) {
-      return error instanceof HttpError
-        ? { ok: false, status: error.status, error: error.code }
-        : { ok: false, status: 500, error: "internal_error" };
-    }
-  }
-
-  private async claimEnrollment(id: string, verifier: string): Promise<EnrollmentClaim> {
-    const row = this.ctx.storage.sql.exec<{ verifier_hash: string; status: string; name: string; relay_id: string | null; wrapped_iv: string | null; wrapped_credential: string | null }>("SELECT * FROM enrollments WHERE id = ? AND expires_at > ?", id, Date.now()).toArray()[0];
-    if (!row || !constantTimeEqual(row.verifier_hash, await hashToken(verifier))) throw new HttpError(401, "unauthorized");
-    if (row.status === "pending") return { status: "pending" };
-    if (row.status === "complete" && row.relay_id && row.wrapped_iv && row.wrapped_credential) return { status: "complete", relayId: row.relay_id, credential: await unwrapCredential(verifier, row.wrapped_iv, row.wrapped_credential) };
-    // Persist a stable identity before external initialization; concurrent claims reconcile it.
-    const relayId = row.relay_id ?? crypto.randomUUID();
-    const credential = row.wrapped_iv && row.wrapped_credential ? await unwrapCredential(verifier, row.wrapped_iv, row.wrapped_credential) : randomToken();
-    const wrapped = await wrapCredential(verifier, credential);
-    const existing = this.ctx.storage.sql.exec<{ relay_id: string | null }>("SELECT relay_id FROM enrollments WHERE id = ?", id).one();
-    if (existing.relay_id && existing.relay_id !== relayId) return this.claimEnrollment(id, verifier);
-    this.ctx.storage.sql.exec("UPDATE enrollments SET relay_id=?,wrapped_iv=?,wrapped_credential=? WHERE id=? AND relay_id IS NULL", relayId, wrapped.iv, wrapped.ciphertext, id);
-    const saved = this.ctx.storage.sql.exec<{ wrapped_iv: string; wrapped_credential: string }>("SELECT wrapped_iv,wrapped_credential FROM enrollments WHERE id=?", id).one();
-    const stableCredential = await unwrapCredential(verifier, saved.wrapped_iv, saved.wrapped_credential);
-    await this.env.RELAYS.getByName(relayId).initializeRelay(relayId, row.name, await hashToken(stableCredential));
-    this.inventory(relayId);
-    this.ctx.storage.sql.exec("UPDATE enrollments SET status='complete',expires_at=? WHERE id=?", Date.now() + 120_000, id);
-    return { status: "complete", relayId, credential: stableCredential };
-  }
-
-  consumeRegistrationAttempt(ipHash: string, tokenHash: string | null, relayId: string, now: number, batchInvitation = false): "allowed" | "invalid" | "consumed" | "rate_limited" | "capacity" {
+  consumeRegistrationAttempt(ipHash: string, tokenHash: string | null, relayId: string, now: number): "allowed" | "invalid" | "consumed" | "rate_limited" | "capacity" {
     return this.ctx.storage.transactionSync(() => {
       const windowStart = Math.floor(now / 60_000) * 60_000;
       const row = this.ctx.storage.sql.exec<{ attempts: number }>(
@@ -572,7 +493,7 @@ export class ControlPlaneDO extends DurableObject<Env> {
       );
       this.ctx.storage.sql.exec("DELETE FROM registration_rates WHERE window_start < ?", now - 5 * 60_000);
       if (!tokenHash) return "invalid";
-      if (batchInvitation && !this.ctx.storage.sql.exec(
+      if (!this.ctx.storage.sql.exec(
         "SELECT id FROM operator_invitations WHERE token_hash=? AND cancelled=0 AND expires_at>?", tokenHash, now).toArray().length) return "invalid";
       const consumed = this.ctx.storage.sql.exec<{ token_hash: string }>(
         "SELECT token_hash FROM consumed_invitations WHERE token_hash = ?",
@@ -580,8 +501,7 @@ export class ControlPlaneDO extends DurableObject<Env> {
       ).toArray()[0];
       if (consumed) return "consumed";
       const total = this.ctx.storage.sql.exec<{ n: number }>("SELECT COUNT(*) AS n FROM (SELECT relay_id FROM registered_relays UNION SELECT relay_id FROM consumed_invitations)").one().n;
-      const reserved = this.ctx.storage.sql.exec<{ n: number }>("SELECT COUNT(*) AS n FROM enrollments WHERE status != 'complete' AND expires_at > ?", now).one().n;
-      if (total + reserved >= 50) return "capacity";
+      if (total >= 50) return "capacity";
       this.ctx.storage.sql.exec(
         "INSERT INTO consumed_invitations (token_hash, relay_id, consumed_at) VALUES (?, ?, ?)",
         tokenHash,
@@ -599,13 +519,11 @@ export class RelayDO extends DurableObject<Env> {
   private settled = false;
   private identical = 0;
   private previewUntil = 0;
-  private lastHttpUpdate = 0;
   private lastPreviewRenew = 0;
   private lastJobReap = 0;
   private agentUpdateAt = 0;
   private observedAt = 0;
   private previewEpoch = 0;
-  private readonly pollTimes = new Map<string, number>();
   private readonly captures = new Map<string, Capture>();
   constructor(ctx: DurableObjectState, env: Env) {
     super(ctx, env);
@@ -618,13 +536,8 @@ export class RelayDO extends DurableObject<Env> {
           agent_hash TEXT NOT NULL,
           generation INTEGER NOT NULL DEFAULT 0,
           lease_browser_id TEXT,
-          lease_expires_at INTEGER
-        );
-        CREATE TABLE IF NOT EXISTS snapshots (
-          singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
-          generation INTEGER NOT NULL,
-          sequence INTEGER NOT NULL,
-          payload TEXT NOT NULL
+          lease_expires_at INTEGER,
+          rap_update_required INTEGER NOT NULL DEFAULT 0
         );
         CREATE TABLE IF NOT EXISTS invitations (
           token_hash TEXT PRIMARY KEY,
@@ -683,30 +596,14 @@ export class RelayDO extends DurableObject<Env> {
           token_hash TEXT PRIMARY KEY,
           expires_at INTEGER NOT NULL,
           created_at INTEGER NOT NULL,
-          used INTEGER NOT NULL DEFAULT 0
+          used INTEGER NOT NULL DEFAULT 0,
+          replace_browser_ids TEXT
         );
         CREATE INDEX IF NOT EXISTS browser_launches_created ON browser_launches(created_at);
-        CREATE TABLE IF NOT EXISTS launch_browsers (
-          browser_id TEXT PRIMARY KEY,
-          created_at INTEGER NOT NULL
-        );
         CREATE TABLE IF NOT EXISTS job_tombstones (id TEXT PRIMARY KEY);
-        INSERT OR IGNORE INTO job_tombstones SELECT id FROM jobs;
         CREATE TABLE IF NOT EXISTS captures (id TEXT PRIMARY KEY, payload TEXT NOT NULL, created_at INTEGER NOT NULL);
         CREATE INDEX IF NOT EXISTS captures_created ON captures(created_at);
-        CREATE TABLE IF NOT EXISTS code_pairings (
-          id TEXT PRIMARY KEY, generation INTEGER NOT NULL, expires_at INTEGER NOT NULL,
-          status TEXT NOT NULL, claim_id TEXT UNIQUE, browser_id TEXT
-        );
       `);
-      if (!ctx.storage.sql.exec<{ name: string }>("PRAGMA table_info(browser_launches)").toArray().some((column) => column.name === "replace_browser_ids")) {
-        ctx.storage.sql.exec("ALTER TABLE browser_launches ADD COLUMN replace_browser_ids TEXT");
-      }
-      // Retire pending code requests without revoking previously approved browsers.
-      ctx.storage.sql.exec("UPDATE pairings SET status='rejected' WHERE status='pending' AND id IN (SELECT claim_id FROM code_pairings)");
-      ctx.storage.sql.exec("DELETE FROM code_pairings");
-      // Legacy coordinates are never promoted to a fresh observation after rehydration.
-      ctx.storage.sql.exec("DELETE FROM snapshots");
       this.sequence = Math.max(0, ...ctx.getWebSockets().map((s) => this.attachment(s)?.sequence ?? 0));
       this.agentUpdateAt = Math.max(0, ...ctx.getWebSockets().filter((s) => this.attachment(s)?.role === "agent").map((s) => this.attachment(s)?.lastMessage ?? 0));
       for (const row of ctx.storage.sql.exec<{ id: string; payload: string }>("SELECT id,payload FROM captures WHERE created_at > ?", Date.now() - JOB_RETENTION_MS).toArray()) {
@@ -750,38 +647,21 @@ export class RelayDO extends DurableObject<Env> {
       if (request.method === "POST" && route === "/browser/launch") return await this.browserLaunch(request);
       if (request.method === "GET" && route === "/stream") return await this.stream(request);
 
-      const agentStatus = route.match(/^\/(?:agent\/)?jobs\/([0-9a-f-]{36})\/status$/iu);
-      if (route.startsWith("/agent/") || route === "/pairing/new" || route === "/pairing/decide" ||
-          route === "/browsers" || route.startsWith("/browsers/") || agentStatus) {
+      if (route.startsWith("/agent/")) {
         const identity = await this.authenticateAgent(request);
         if (request.method === "GET" && route === "/agent/stream") return await this.agentStream(request, identity);
-        const captureResult = route.match(/^\/agent\/capture\/([0-9a-f-]{36})$/iu);
-        if (request.method === "POST" && captureResult) return await this.captureResult(request, requireUuid(captureResult[1]), identity);
-        if (request.method === "POST" && route === "/agent/start") return this.agentStart(identity);
-        if (request.method === "POST" && route === "/agent/update") return await this.agentUpdate(request, identity);
+        if (request.method === "POST" && route === "/agent/start") return await this.agentStart(request, identity);
         if (request.method === "POST" && route === "/agent/browser-launch") return await this.browserLaunchNew(request);
-        if (request.method === "POST" && (route === "/pairing/new" || route === "/agent/pairing/new")) return await this.pairingNew(request);
-        if (request.method === "POST" && (route === "/pairing/decide" || route === "/agent/pairing/decide")) return await this.pairingDecide(request);
-        if (request.method === "GET" && route === "/browsers") return this.listBrowsers();
-        if (request.method === "POST" && route === "/browsers/revoke") return await this.revokeBrowser(request);
+        if (request.method === "POST" && route === "/agent/pairing/new") return await this.pairingNew(request);
+        if (request.method === "POST" && route === "/agent/pairing/decide") return await this.pairingDecide(request);
+        if (request.method === "GET" && route === "/agent/browsers") return this.listBrowsers();
+        if (request.method === "POST" && route === "/agent/browsers/revoke") return await this.revokeBrowser(request);
+        const agentStatus = route.match(/^\/agent\/jobs\/([0-9a-f-]{36})\/status$/iu);
         if (request.method === "POST" && agentStatus) return await this.agentJobStatus(request, agentStatus[1].toLowerCase(), identity);
         throw new HttpError(404, "not_found");
       }
 
-      if (route === "/snapshot" && request.method === "GET") {
-        const browser = await this.authenticateBrowser(request);
-        this.checkViewerCapacity(browser.id);
-        this.fallbackLimit(`browser:${browser.id}`);
-        await this.renewPreview(true);
-        return this.browserSnapshot(browser);
-      }
       if (route === "/capture" && request.method === "POST") return await this.captureNew(request, await this.authenticateBrowser(request));
-      const capture = route.match(/^\/capture\/([0-9a-f-]{36})$/iu);
-      if (capture && request.method === "GET") {
-        const browser = await this.authenticateBrowser(request);
-        this.fallbackLimit(`capture:${browser.id}`);
-        return await this.captureGet(requireUuid(capture[1]), browser.id);
-      }
       if (route === "/control" && request.method === "POST") {
         const browser = await this.authenticateBrowser(request);
         return await this.browserControl(request, browser);
@@ -820,6 +700,7 @@ export class RelayDO extends DurableObject<Env> {
     generation: number;
     lease_browser_id: string | null;
     lease_expires_at: number | null;
+    rap_update_required: number;
   } | null {
     return this.ctx.storage.sql.exec<{
       relay_id: string;
@@ -827,8 +708,9 @@ export class RelayDO extends DurableObject<Env> {
       generation: number;
       lease_browser_id: string | null;
       lease_expires_at: number | null;
+      rap_update_required: number;
     }>(
-      "SELECT relay_id, agent_hash, generation, lease_browser_id, lease_expires_at FROM relay_meta WHERE singleton = 1",
+      "SELECT relay_id, agent_hash, generation, lease_browser_id, lease_expires_at, rap_update_required FROM relay_meta WHERE singleton = 1",
     ).toArray()[0] ?? null;
   }
 
@@ -855,7 +737,17 @@ export class RelayDO extends DurableObject<Env> {
     if (request.method !== method) throw new HttpError(405, "method_not_allowed");
   }
 
-  private agentStart(identity: AgentIdentity): Response {
+  private async agentStart(request: Request, identity: AgentIdentity): Promise<Response> {
+    const body = requiredObject(await readJson(request));
+    jsonBody(body, ["version"]);
+    const minimum = envString(this.env, "MIN_RAP_VERSION");
+    if (minimum && compareVersions(body.version, minimum) < 0) {
+      if (this.meta()?.rap_update_required !== 1) {
+        this.ctx.storage.sql.exec("UPDATE relay_meta SET rap_update_required = 1 WHERE singleton = 1");
+        this.broadcast();
+      }
+      return jsonResponse({ error: "rap_update_required", minimumVersion: minimum }, 426);
+    }
     const serverTime = Date.now();
     const generation = this.ctx.storage.transactionSync(() => {
       const meta = this.meta();
@@ -867,13 +759,11 @@ export class RelayDO extends DurableObject<Env> {
          WHERE status IN ('claimed', 'attempting', 'accepted')`,
         serverTime,
       );
-      this.ctx.storage.sql.exec("UPDATE relay_meta SET generation = ? WHERE singleton = 1", next);
-      this.ctx.storage.sql.exec("DELETE FROM snapshots WHERE singleton = 1");
+      this.ctx.storage.sql.exec("UPDATE relay_meta SET generation = ?, rap_update_required = 0 WHERE singleton = 1", next);
       return next;
     });
     this.transient = null;
     this.sequence = 0;
-    this.lastHttpUpdate = 0;
     this.agentUpdateAt = 0;
     this.settled = false;
     for (const socket of this.ctx.getWebSockets()) {
@@ -885,8 +775,7 @@ export class RelayDO extends DurableObject<Env> {
     return jsonResponse({ generation, serverTime });
   }
 
-  private async agentUpdate(request: Request, identity: AgentIdentity, socketUpdate = false, deliverWork = true): Promise<Response> {
-    this.requireMethod(request, "POST");
+  private async agentUpdate(request: Request, identity: AgentIdentity, deliverWork = true): Promise<Response> {
     const body = requiredObject(await readJson(request));
     jsonBody(body, [
       "generation",
@@ -912,7 +801,6 @@ export class RelayDO extends DurableObject<Env> {
     const meta = this.meta();
     if (!meta || meta.generation !== parsedGeneration) throw new HttpError(409, "stale_generation");
     if ((sequence as number) <= this.sequence) throw new HttpError(409, "stale_sequence");
-    if (!socketUpdate && this.lastHttpUpdate && Date.now() - this.lastHttpUpdate < FALLBACK_MS) throw new HttpError(429, "fallback_rate_limited");
 
     let connected = body.connected === true;
     let position = parsePoint(body.position);
@@ -973,8 +861,7 @@ export class RelayDO extends DurableObject<Env> {
       this.settled = connected && (body.settled === true || (body.settled === undefined && this.identical >= 3));
       this.transient = snapshot;
       this.sequence = snapshot.sequence;
-      if (!socketUpdate) this.lastHttpUpdate = receivedAt;
-      if (receivedAt - this.lastJobReap >= FALLBACK_MS) { this.reapJobs(receivedAt); this.lastJobReap = receivedAt; }
+      if (receivedAt - this.lastJobReap >= JOB_REAP_MS) { this.reapJobs(receivedAt); this.lastJobReap = receivedAt; }
       pairings = this.ctx.storage.sql.exec<{ id: string; phrase: string }>(
         "SELECT id, phrase FROM pairings WHERE status = 'pending' AND expires_at > ? ORDER BY created_at LIMIT 20",
         receivedAt,
@@ -1168,7 +1055,7 @@ export class RelayDO extends DurableObject<Env> {
         throw new HttpError(410, "pairing_expired");
       }
       if (body.approve) {
-        if (this.singleBrowser()) this.replaceBrowsers(replacing);
+        this.replaceBrowsers(replacing);
         this.ctx.storage.sql.exec(
           "INSERT INTO browsers (id, credential_hash, created_at, revoked) VALUES (?, ?, ?, 0)",
           pairing.browser_id,
@@ -1194,7 +1081,7 @@ export class RelayDO extends DurableObject<Env> {
     const expiresAt = now + LAUNCH_TOKEN_LIFETIME_MS;
     this.ctx.storage.transactionSync(() => {
       this.reapLaunches(now);
-      if (this.singleBrowser() && replacing !== null) this.checkReplacement(replacing);
+      if (replacing !== null) this.checkReplacement(replacing);
       const outstanding = this.ctx.storage.sql.exec<{ count: number }>(
         "SELECT COUNT(*) AS count FROM browser_launches WHERE used = 0 AND expires_at > ?",
         now,
@@ -1246,27 +1133,17 @@ export class RelayDO extends DurableObject<Env> {
         for (const row of rows) valid = constantTimeEqual(suppliedHash, row.credential_hash) || valid;
         if (valid) return true;
       }
-      if (this.singleBrowser()) this.replaceBrowsers(launch.replace_browser_ids === null ? null : this.replacementIds(JSON.parse(launch.replace_browser_ids)));
-      const launchBrowsers = this.ctx.storage.sql.exec<{ count: number }>(
-        `SELECT COUNT(*) AS count FROM launch_browsers
-         JOIN browsers ON browsers.id = launch_browsers.browser_id WHERE browsers.revoked = 0`,
-      ).one().count;
-      if (launchBrowsers >= LAUNCH_BROWSER_LIMIT) throw new HttpError(429, "too_many_launch_browsers");
+      this.replaceBrowsers(launch.replace_browser_ids === null ? null : this.replacementIds(JSON.parse(launch.replace_browser_ids)));
       this.ctx.storage.sql.exec(
         "INSERT INTO browsers (id, credential_hash, created_at, revoked) VALUES (?, ?, ?, 0)",
         mintedId,
         mintedHash,
         now,
       );
-      this.ctx.storage.sql.exec("INSERT INTO launch_browsers (browser_id, created_at) VALUES (?, ?)", mintedId, now);
       return false;
     });
     this.closeRevokedBrowsers();
     return jsonResponse({ credential: reused ? supplied : minted });
-  }
-
-  private singleBrowser(): boolean {
-    return envString(this.env, "SINGLE_BROWSER_ENABLED") === "true";
   }
 
   private replacementIds(value: unknown): string[] | null {
@@ -1294,7 +1171,6 @@ export class RelayDO extends DurableObject<Env> {
   private revokeBrowserState(id: string): void {
     this.ctx.storage.sql.exec("UPDATE browsers SET revoked=1 WHERE id=?", id);
     this.ctx.storage.sql.exec("DELETE FROM tickets WHERE browser_id=?", id);
-    this.ctx.storage.sql.exec("DELETE FROM launch_browsers WHERE browser_id=?", id);
     this.ctx.storage.sql.exec("UPDATE relay_meta SET lease_browser_id=NULL,lease_expires_at=NULL WHERE lease_browser_id=?", id);
   }
 
@@ -1350,11 +1226,6 @@ export class RelayDO extends DurableObject<Env> {
     return jsonResponse({});
   }
 
-  private browserSnapshot(browser: BrowserIdentity): Response {
-    const now = Date.now();
-    return jsonResponse(this.snapshotEnvelope(browser.id, now, true));
-  }
-
   private snapshotEnvelope(browserId: string, serverTime: number, renewLease: boolean): {
     serverTime: number;
     snapshot: Snapshot | null;
@@ -1365,6 +1236,7 @@ export class RelayDO extends DurableObject<Env> {
     agentOnline: boolean;
     previewActive: boolean;
     settled: boolean;
+    rapUpdateRequired: boolean;
   } {
     return this.ctx.storage.transactionSync(() => {
       const meta = this.meta();
@@ -1398,6 +1270,7 @@ export class RelayDO extends DurableObject<Env> {
         agentOnline: this.ctx.getWebSockets().some((s) => { const a = this.attachment(s); return a?.role === "agent" && a.generation === meta.generation && serverTime - a.seen < LIVENESS_MS; }) || !!(this.transient && serverTime - this.transient.receivedAt < LIVENESS_MS),
         previewActive: this.previewUntil > serverTime,
         settled: this.settled,
+        rapUpdateRequired: meta.rap_update_required === 1,
       };
     });
   }
@@ -1710,15 +1583,8 @@ export class RelayDO extends DurableObject<Env> {
     return isObject(a) && (a.role === "browser" || a.role === "agent") ? a as SocketIdentity : null;
   }
 
-  private fallbackLimit(key: string): void {
-    const now = Date.now(), last = this.pollTimes.get(key);
-    if (last !== undefined && now - last < FALLBACK_MS) throw new HttpError(429, "fallback_rate_limited");
-    this.pollTimes.set(key, now);
-  }
-
   private checkViewerCapacity(browserId: string): void {
     const viewers = new Set(this.ctx.getWebSockets().map((s) => this.attachment(s)).filter((a) => a?.role === "browser" && Date.now() - a.seen < LIVENESS_MS).map((a) => a!.browserId!));
-    for (const [key, time] of this.pollTimes) if (key.startsWith("browser:") && Date.now() - time < LIVENESS_MS) viewers.add(key.slice(8));
     if (!viewers.has(browserId) && viewers.size >= 2) throw new HttpError(429, "too_many_viewers");
   }
 
@@ -1737,8 +1603,7 @@ export class RelayDO extends DurableObject<Env> {
 
   private hasWatchers(exclude?: WebSocket): boolean {
     const now = Date.now();
-    return this.ctx.getWebSockets().some((s) => { const a = this.attachment(s); return s !== exclude && a?.role === "browser" && a.watching !== false && now - a.seen < LIVENESS_MS; }) ||
-      [...this.pollTimes.entries()].some(([key, time]) => key.startsWith("browser:") && now - time < LIVENESS_MS);
+    return this.ctx.getWebSockets().some((s) => { const a = this.attachment(s); return s !== exclude && a?.role === "browser" && a.watching !== false && now - a.seen < LIVENESS_MS; });
   }
 
   private notifyWork(): void {
@@ -1788,7 +1653,6 @@ export class RelayDO extends DurableObject<Env> {
       if (a.role === "browser" && body.type === "heartbeat") {
         if (body.watching !== undefined && typeof body.watching !== "boolean") throw new HttpError(400, "invalid_message");
         if (typeof body.watching === "boolean") { a.watching = body.watching; socket.serializeAttachment(a); }
-        this.pollTimes.delete(`browser:${a.browserId}`);
         await this.renewPreview(this.hasWatchers());
         socket.send(JSON.stringify(this.snapshotEnvelope(a.browserId!, now, true)));
         if (a.watching !== false && this.previewUntil <= now) socket.send(JSON.stringify({ v: 2, type: "error", error: "preview_busy" }));
@@ -1796,7 +1660,7 @@ export class RelayDO extends DurableObject<Env> {
       } else if (a.role === "agent" && body.type === "update" && id) {
         if (this.agentUpdateAt && now - this.agentUpdateAt < 500) throw new HttpError(429, "message_rate_limited");
         this.agentUpdateAt = now;
-        const response = await this.agentUpdate(this.messageRequest(body.body), { generation: a.generation! }, true);
+        const response = await this.agentUpdate(this.messageRequest(body.body), { generation: a.generation! });
         a.sequence = this.sequence; socket.serializeAttachment(a);
         socket.send(JSON.stringify({ v: 2, type: "update-result", id, body: await response.json() }));
       } else if (a.role === "agent" && body.type === "capture-result" && id) {
@@ -1845,31 +1709,6 @@ export class RelayDO extends DurableObject<Env> {
     return jsonResponse({ requestId: id });
   }
 
-  private async captureGet(id: string, browserId: string): Promise<Response> {
-    const c = this.captures.get(id);
-    if (!c || c.browserId !== browserId) throw new HttpError(404, "capture_not_found");
-    const validateOwner = () => {
-      const meta = this.meta();
-      if (meta?.generation !== c.generation || meta.lease_browser_id !== c.browserId || (meta.lease_expires_at ?? 0) <= Date.now()) {
-        c.status = "failed"; c.error = "capture_expired"; this.saveCapture(id, c);
-      }
-    };
-    if (c.status !== "failed") validateOwner();
-    // First status request can wait for this fresh observation, avoiding a mandatory stale 5s poll.
-    const waitStart = Date.now();
-    let waited = false;
-    while (c.status === "pending" && Date.now() - c.created < 10_000) {
-      waited = true; await new Promise((resolve) => setTimeout(resolve, 100)); validateOwner();
-    }
-    if (c.status === "complete" && (!this.transient?.context || (c.revision !== null && this.transient.context.revision !== c.revision))) {
-      c.status = "failed"; c.error = "fresh_matching_context_required"; this.saveCapture(id, c);
-    }
-    const waitMs = waited ? Math.max(0, Math.min(10_000, Date.now() - waitStart)) : 0;
-    if (c.status === "pending") { c.status = "failed"; c.error = "capture_timeout"; this.saveCapture(id, c); }
-    const body = isObject(c.body) ? { ...c.body, serverTime: Date.now(), waitMs: 0 } : c.body;
-    return jsonResponse(c.status === "complete" ? { status: c.status, body, waitMs } : { status: c.status, error: c.error, waitMs });
-  }
-
   private async captureResult(request: Request, id: string, identity: AgentIdentity): Promise<Response> {
     const c = this.captures.get(id), now = Date.now(), meta = this.meta();
     if (!c || c.status !== "pending") throw new HttpError(409, "capture_not_pending");
@@ -1880,7 +1719,7 @@ export class RelayDO extends DurableObject<Env> {
     if (typeof body.observedAtServer !== "number" || typeof body.clockUncertaintyMs !== "number" ||
       typeof body.sequence !== "number" || body.sequence <= c.sequence || body.observedAtServer <= c.observedAt ||
       body.observedAtServer + body.clockUncertaintyMs < c.created) throw new HttpError(409, "fresh_observation_required");
-    await this.agentUpdate(this.messageRequest(body), identity, true, false);
+    await this.agentUpdate(this.messageRequest(body), identity, false);
     const s = this.transient;
     const currentMeta = this.meta();
     if (currentMeta?.generation !== c.generation || currentMeta.lease_browser_id !== c.browserId || (currentMeta.lease_expires_at ?? 0) <= Date.now()) {
@@ -1909,11 +1748,10 @@ export class RelayDO extends DurableObject<Env> {
         for (const socket of this.ctx.getWebSockets()) if (this.attachment(socket)?.browserId === c.browserId) this.send(socket, { v: 2, type: "error", id, error: c.error });
       }
     }
-    for (const [key, time] of this.pollTimes) if (now - time >= LIVENESS_MS) this.pollTimes.delete(key);
     for (const s of this.ctx.getWebSockets()) { const a = this.attachment(s); if (!a || now - a.seen >= LIVENESS_MS) s.close(1008, "socket_expired"); }
     if (!this.hasWatchers()) await this.renewPreview(false);
     this.broadcast();
-    const active = this.ctx.getWebSockets().some((s) => { const a = this.attachment(s); return a && now - a.seen < LIVENESS_MS; }) || this.hasWatchers() || now - this.lastHttpUpdate < LIVENESS_MS;
+    const active = this.ctx.getWebSockets().some((s) => { const a = this.attachment(s); return a && now - a.seen < LIVENESS_MS; }) || this.hasWatchers();
     const captureDeadline = Math.min(Infinity, ...[...this.captures.values()].filter((c) => c.status === "pending").map((c) => c.created + 10_000));
     const deadline = (query: string, ...values: number[]): number => {
       const value = this.ctx.storage.sql.exec<{ deadline: number | null }>(query, ...values).one().deadline;
@@ -1989,40 +1827,28 @@ function corsResponse(response: Response, origin: string | null): Response {
   });
 }
 
-function bootstrapSecret(env: Env): string | null {
-  if (!("BOOTSTRAP_TOKEN" in env) || typeof env.BOOTSTRAP_TOKEN !== "string" || env.BOOTSTRAP_TOKEN.length < 16) {
-    return null;
-  }
-  return env.BOOTSTRAP_TOKEN;
-}
-
 async function register(request: Request, env: Env): Promise<Response> {
   if (request.method !== "POST") throw new HttpError(405, "method_not_allowed");
   const body = requiredObject(await readJson(request));
-  jsonBody(body, ["bootstrapToken", "name"]);
-  if (typeof body.bootstrapToken !== "string" || typeof body.name !== "string" ||
-      body.bootstrapToken.length < 16 || body.bootstrapToken.length > 256 ||
+  jsonBody(body, ["invitation", "name"]);
+  if (typeof body.invitation !== "string" || typeof body.name !== "string" ||
+      body.invitation.length < 16 || body.invitation.length > 256 ||
       body.name.trim().length < 1 || body.name.length > 64 || /[\u0000-\u001f\u007f]/u.test(body.name)) {
     throw new HttpError(400, "invalid_request");
   }
-  const configured = bootstrapSecret(env);
-  const suppliedHash = await hashToken(body.bootstrapToken);
-  const valid = configured !== null && constantTimeEqual(suppliedHash, await hashToken(configured));
   const ip = request.headers.get("CF-Connecting-IP") ?? "unknown";
   const ipHash = toHex(await sha256(ip));
   const relayId = crypto.randomUUID();
-  const invitationHash = suppliedHash;
   const decision = await env.CONTROL_PLANE.getByName("registration-control").consumeRegistrationAttempt(
     ipHash,
-    invitationHash,
+    await hashToken(body.invitation),
     relayId,
     Date.now(),
-    !valid,
   );
   if (decision === "rate_limited") throw new HttpError(429, "registration_rate_limited");
-  if (decision === "invalid" && !configured && envString(env, "OPERATOR_ADMIN_TOKEN").length < 32) throw new HttpError(503, "registration_unavailable");
-  if (decision === "invalid") throw new HttpError(401, "invalid_bootstrap_token");
-  if (decision === "consumed") throw new HttpError(409, "bootstrap_token_used");
+  if (decision === "invalid" && envString(env, "OPERATOR_ADMIN_TOKEN").length < 32) throw new HttpError(503, "registration_unavailable");
+  if (decision === "invalid") throw new HttpError(401, "invalid_invitation");
+  if (decision === "consumed") throw new HttpError(409, "invitation_used");
   if (decision === "capacity") throw new HttpError(429, "registration_capacity");
   const credential = randomToken();
   const name = body.name.trim();
@@ -2030,6 +1856,15 @@ async function register(request: Request, env: Env): Promise<Response> {
   if (!initialized) throw new HttpError(503, "registration_failed");
   await env.CONTROL_PLANE.getByName("registration-control").inventory(relayId);
   return jsonResponse({ relayId, credential }, 201);
+}
+
+function compareVersions(value: unknown, minimum: string): number {
+  const parse = (text: unknown) => typeof text === "string" && /^\d+\.\d+\.\d+$/u.test(text) ? text.split(".").map(Number) : null;
+  const a = parse(value), b = parse(minimum);
+  if (!b) return 0;
+  if (!a) return -1;
+  for (let i = 0; i < 3; i++) if (a[i] !== b[i]) return a[i] - b[i];
+  return 0;
 }
 
 function envString(env: Env, key: string): string {
@@ -2072,66 +1907,6 @@ async function operatorInvitations(request: Request, env: Env, path: string): Pr
   return jsonResponse(result);
 }
 
-function enrollmentConfigured(env: Env): boolean {
-  const siteKey = envString(env, "TURNSTILE_SITE_KEY");
-  return envString(env, "ENROLLMENT_CODE").length >= 6 && envString(env, "TURNSTILE_SECRET").length >= 16 &&
-    /^0x[A-Za-z0-9_-]{10,}$/u.test(siteKey) && !/^[123]x/u.test(siteKey);
-}
-
-async function verifyBrowser(request: Request, env: Env, token: unknown, action: string): Promise<void> {
-  if (typeof token !== "string" || !token || token.length > 2048) throw new HttpError(403, "turnstile_invalid");
-  let result: unknown;
-  try {
-    const response = await fetch("https://challenges.cloudflare.com/turnstile/v0/siteverify", {
-      method: "POST", headers: { "Content-Type": "application/x-www-form-urlencoded" }, signal: AbortSignal.timeout(10_000),
-      body: new URLSearchParams({ secret: envString(env, "TURNSTILE_SECRET"), response: token, remoteip: request.headers.get("CF-Connecting-IP") ?? "" }),
-    });
-    if (!response.ok) throw new Error("siteverify_failed");
-    result = await response.json();
-  } catch {
-    console.warn(JSON.stringify({ event: "verification_failed", action }));
-    throw new HttpError(403, "turnstile_invalid");
-  }
-  if (!isObject(result) || result.success !== true || result.action !== action || result.hostname !== "nicholas-a11y.github.io") throw new HttpError(403, "turnstile_invalid");
-}
-
-async function enrollment(request: Request, env: Env, path: string): Promise<Response> {
-  if (path === "/v1/enrollment/config" && request.method === "GET") {
-    const enabled = enrollmentConfigured(env), downloadUrl = envString(env, "RAP_DOWNLOAD_URL");
-    return jsonResponse({ enabled, siteKey: enabled ? envString(env, "TURNSTILE_SITE_KEY") : "", ...(downloadUrl.startsWith("https://") ? { downloadUrl } : {}) });
-  }
-  if (!enrollmentConfigured(env)) throw new HttpError(503, "enrollment_unavailable");
-  const cp = env.CONTROL_PLANE.getByName("registration-control");
-  const ipHash = await hashToken(request.headers.get("CF-Connecting-IP") ?? "unknown");
-  if (path === "/v1/enrollment/start" && request.method === "POST") {
-    const body = requiredObject(await readJson(request)); jsonBody(body, ["name", "verifier"]);
-    if (typeof body.name !== "string" || !body.name.trim() || body.name.length > 64 || /[\u0000-\u001f\u007f]/u.test(body.name) ||
-      typeof body.verifier !== "string" || fromBase64Url(body.verifier)?.length !== 32 || body.verifier.length !== 43) throw new HttpError(400, "invalid_request");
-    return jsonResponse(await cp.enrollmentStart(body.name.trim(), await hashToken(body.verifier), ipHash), 201);
-  }
-  const match = path.match(/^\/v1\/enrollment\/([0-9a-f-]{36})(\/approve|\/claim)?$/iu);
-  if (!match) throw new HttpError(404, "not_found");
-  const id = requireUuid(match[1]);
-  if (!match[2] && request.method === "GET") return jsonResponse(await cp.enrollmentGet(id));
-  if (request.method !== "POST") throw new HttpError(405, "method_not_allowed");
-  const body = requiredObject(await readJson(request));
-  if (match[2] === "/claim") {
-    jsonBody(body, ["verifier"]);
-    if (typeof body.verifier !== "string" || fromBase64Url(body.verifier)?.length !== 32 || body.verifier.length !== 43) throw new HttpError(400, "invalid_request");
-    const result = await cp.enrollmentClaim(id, body.verifier);
-    return result.ok ? jsonResponse(result.body) : jsonResponse({ error: result.error }, result.status);
-  }
-  if (match[2] !== "/approve") throw new HttpError(404, "not_found");
-  requireAllowedOrigin(request);
-  jsonBody(body, ["code", "turnstileToken"]);
-  if (await cp.consumeRegistrationAttempt(ipHash, null, "", Date.now()) === "rate_limited") throw new HttpError(429, "registration_rate_limited");
-  if (typeof body.code !== "string" || body.code.length > 256 || !constantTimeEqual(await hashToken(body.code), await hashToken(envString(env, "ENROLLMENT_CODE")))) throw new HttpError(403, "enrollment_code_invalid");
-  await cp.enrollmentGet(id);
-  await verifyBrowser(request, env, body.turnstileToken, "enrollment");
-  await cp.enrollmentApprove(id);
-  return jsonResponse({ status: "approved" });
-}
-
 export default {
   async fetch(request: Request, env: Env): Promise<Response> {
     const origin = request.headers.get("Origin");
@@ -2157,8 +1932,6 @@ export default {
         response = await register(request, env);
       } else if (url.pathname.startsWith("/v1/operator/")) {
         response = await operatorInvitations(request, env, url.pathname);
-      } else if (url.pathname.startsWith("/v1/enrollment/")) {
-        response = await enrollment(request, env, url.pathname);
       } else {
         const match = url.pathname.match(/^\/v1\/relays\/([0-9a-f-]{36})\/.*$/iu);
         if (!match) throw new HttpError(404, "not_found");

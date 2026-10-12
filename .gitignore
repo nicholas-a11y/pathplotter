@@ -22,3 +22,11 @@ dist-ssr
 *.njsproj
 *.sln
 *.sw?
+
+# Local RAP test/runtime leftovers
+rap/.test-state-*
+rap/.gui-test-*
+rap/*.dll
+rap/*.tmp
+*.zip.sha256
+PathPlotter-RAP-Windows.zip

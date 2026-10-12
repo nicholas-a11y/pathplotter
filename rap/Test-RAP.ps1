@@ -39,7 +39,8 @@ try {
         Assert ($launcher -notmatch '(?i)ExecutionPolicy|Bypass|Unrestricted')
         Assert ($guiLauncher -notmatch '(?i)ExecutionPolicy|Bypass|Unrestricted')
     }
-    . (Join-Path $PSScriptRoot 'RAP.ps1') -LibraryOnly -DataDirectory $statePath
+    . (Join-Path $PSScriptRoot 'RAP.ps1') -DataDirectory $statePath
+    . (Join-Path $PSScriptRoot 'Updater.ps1')
     $script:OriginalHttp = ${function:Invoke-Http}
     $script:CaptureHttp = $false
     # Nothing below may accidentally call actual cloud/LightBurn HTTP.
@@ -221,10 +222,10 @@ try {
         $script:Config = @{ apiRoot = 'https://relay.example'; relayId = 'synthetic-relay'; credential = 'synthetic-credential'; lightBurnSecret = 'synthetic-secret' }
         $script:CaptureHttp = $true
         try {
-            $null = Invoke-Cloud '/agent/update' @{ connected = $false }
-            Assert ($script:Wire.url -eq 'https://relay.example/v1/relays/synthetic-relay/agent/update')
-            Assert ($script:Wire.token -ceq 'synthetic-credential' -and $script:Wire.method -eq 'POST' -and $script:Wire.timeout -eq 1000)
-            $null = Invoke-Cloud '/browsers' -Body $null -Method 'GET'
+            $null = Invoke-Cloud '/agent/start' @{ version = '3.0.0' }
+            Assert ($script:Wire.url -eq 'https://relay.example/v1/relays/synthetic-relay/agent/start')
+            Assert ($script:Wire.token -ceq 'synthetic-credential' -and $script:Wire.method -eq 'POST' -and $script:Wire.timeout -eq 5000)
+            $null = Invoke-Cloud '/agent/browsers' -Body $null -Method 'GET'
             Assert ($script:Wire.method -eq 'GET' -and $null -eq $script:Wire.body)
             $culture = [Threading.Thread]::CurrentThread.CurrentCulture
             try {
@@ -284,6 +285,14 @@ try {
             finally { $fixture.Dispose() }
         }
     }
+    Check 'HTTP 426 from the relay reports that this RAP must be updated' {
+        $fixture = New-Object PathPlotterRapTests.HttpFixture(426, 'application/json', '{"error":"rap_update_required","minimumVersion":"9.0.0"}', 0)
+        try {
+            $message = ''
+            try { $null = & $script:OriginalHttp $fixture.Url 'POST' 'synthetic-test-token' @{ version = '0.0.1' } } catch { $message = $_.Exception.Message }
+            Assert ($message -ceq 'RAP_UPDATE_REQUIRED')
+        } finally { $fixture.Dispose() }
+    }
     Check 'Unbuffered raw upload transport sends immutable bytes once to test fixture, without redirect or stale-connection reuse' {
         $fixture = New-Object PathPlotterRapTests.HttpFixture(202, 'application/json', '{}', 0)
         try {
@@ -297,60 +306,24 @@ try {
         } finally { $fixture.Dispose() }
     }
 
-    $script:CommandCalls = New-Object 'Collections.Generic.List[object]'
-    $script:ConsoleBrowsers = @()
-    function Invoke-Cloud([string]$Path, $Body = @{}, [string]$Method = 'POST') {
-        $script:CommandCalls.Add(@{ path = $Path; body = $Body; method = $Method })
-        switch ($Path) {
-            '/browsers' { return @{ browsers = $script:ConsoleBrowsers } }
-            '/pairing/new' { return @{ invitation = 'synthetic-invitation'; expiresAt = (Get-ServerNow) + 60000 } }
-            default { return @{} }
-        }
-    }
-    Check 'Browser pairing requires explicit pending approval; browser revocation uses authenticated contract' {
-        $script:PendingPairings = @{}
-        Must-Throw { Invoke-ConsoleCommand 'approve unrequested' }
-        Assert ($script:CommandCalls.Count -eq 0)
+    Check 'Pending browser approvals are validated before reaching the UI' {
+        $script:Published = $null
+        function Publish-RapPairings($Pairings) { $script:Published = $Pairings }
         Show-PendingPairings @(@{ id = 'pairing-test'; phrase = 'calm river 123' })
-        Invoke-ConsoleCommand 'approve pairing-test'
-        Assert ($script:CommandCalls[1].path -eq '/pairing/decide' -and $script:CommandCalls[1].body.approve -eq $true)
-        Assert ($script:PendingPairings.Count -eq 0)
-        Invoke-ConsoleCommand 'browsers'
-        Invoke-ConsoleCommand 'revoke browser-test'
-        Assert ($script:CommandCalls[3].path -eq '/browsers/revoke' -and $script:CommandCalls[3].body.browserId -ceq 'browser-test')
-        Must-Throw { Invoke-ConsoleCommand 'revoke ../bad' }
+        Assert ($script:Published['pairing-test'] -ceq 'calm river 123' -and $script:PendingPairings.Count -eq 1)
+        Must-Throw { Show-PendingPairings @(@{ id = '../bad'; phrase = 'calm river' }) }
+        Must-Throw { Show-PendingPairings @(@{ id = 'ok'; phrase = "line`nbreak" }) }
+        $script:PendingPairings = @{}
     }
-    Check 'Console browser replacement requires explicit consent and sends only reviewed IDs' {
-        $script:ConsoleBrowsers = @(@{ id = [Guid]::NewGuid().ToString('D') })
-        $script:ConsoleReply = ''
-        function script:Read-Host([string]$Prompt) { return $script:ConsoleReply }
-        try {
-            Show-PendingPairings @(@{ id = 'switch-test'; phrase = 'EXACT SWITCH' })
-            $before = $script:CommandCalls.Count
-            Invoke-ConsoleCommand 'approve switch-test'
-            Assert ($script:CommandCalls.Count -eq $before + 1 -and $script:PendingPairings.ContainsKey('switch-test'))
-            $script:ConsoleReply = 'REPLACE'
-            Invoke-ConsoleCommand 'approve switch-test'
-            $decision = $script:CommandCalls[$script:CommandCalls.Count - 1]
-            Assert ($decision.path -ceq '/pairing/decide' -and $decision.body.replaceBrowserIds[0] -ceq $script:ConsoleBrowsers[0].id)
-            Assert (-not $script:PendingPairings.ContainsKey('switch-test'))
-        } finally {
-            Remove-Item Function:\Read-Host
-            $script:ConsoleBrowsers = @()
-        }
-    }
-    Check 'Private pairing URL uses fragment; forget commands preserve journal and do not claim remote agent revocation' {
-        $null = Show-PairingUrl 6>$null
-        Assert ($script:PairingUrl.StartsWith('https://nicholas-a11y.github.io/pathplotter/#relay='))
-        Assert ($script:PairingUrl -notmatch 'credential|synthetic-credential|synthetic-secret')
-        Write-Protected 'credentials.dpapi' $script:Config
-        Invoke-ConsoleCommand 'forget-lightburn'
-        Assert ((Read-Protected 'credentials.dpapi').lightBurnSecret -ceq '')
-        Assert $script:StopRequested
-        Invoke-ConsoleCommand 'forget-relay'
-        Assert (-not (Test-Path (Join-Path $statePath 'credentials.dpapi')) -and (Test-Path (Join-Path $statePath 'journal.dpapi')))
-        $script:Config.lightBurnSecret = 'synthetic-secret'
-        $script:StopRequested = $false
+    Check 'Saved registration is validated and missing registration is reported' {
+        [IO.File]::Delete((Join-Path $statePath 'credentials.dpapi'))
+        Assert ($null -eq (Read-SavedConfig))
+        Must-Throw { Initialize-Config }
+        Write-Protected 'credentials.dpapi' @{ apiRoot = 'https://relay.example/'; relayId = 'synthetic-relay'; credential = 'synthetic-credential'; lightBurnSecret = '' }
+        Assert ((Read-SavedConfig).apiRoot -ceq 'https://relay.example')
+        Write-Protected 'credentials.dpapi' @{ apiRoot = 'https://relay.example'; relayId = ''; credential = 'synthetic-credential'; lightBurnSecret = '' }
+        Must-Throw { Read-SavedConfig }
+        [IO.File]::Delete((Join-Path $statePath 'credentials.dpapi'))
     }
     function Get-Observation { return Fresh-Observation }
     $script:Generation = 1
@@ -367,7 +340,7 @@ try {
     function Invoke-Cloud([string]$Path, $Body = @{}, [string]$Method = 'POST') {
         if ($script:CloudReject) { throw 'Mock cloud fence/rejection.' }
         $script:Order.Add('cloud-' + $Body.status)
-        return @{ id = ($Path -split '/')[2]; status = $Body.status }
+        return @{ id = ($Path -split '/')[3]; status = $Body.status }
     }
     function New-ImportStream {
         if ($null -ne $script:RealStream) { return $script:RealStream }
@@ -560,7 +533,7 @@ try {
         $script:Config = @{ apiRoot = 'https://relay.example'; relayId = 'synthetic-relay'; credential = 'synthetic-credential'; lightBurnSecret = 'synthetic-secret' }
     }
     function Get-Observation { $script:ReadCount++; return Fresh-Observation }
-    function Read-ConsoleCommand {
+    function Read-UiCommand {
         if ($script:ScheduleMode -eq 'fatal' -and $script:CycleCount -ge 1 -and $script:Socket.Queue.Count -eq 0) { throw 'Mock interrupted main loop.' }
         $limit = 2
         if ($script:ScheduleMode -eq 'serial') { $limit = 4 }
@@ -594,7 +567,7 @@ try {
             if ($script:ScheduleMode -eq 'serial' -and $script:CycleCount -in @(2, 3)) { $job = $null }
             return @{ serverTime = 1800000000000.0; pairings = @(); job = $job; previewActive = $true }
         }
-        return @{ id = ($Path -split '/')[2]; status = $Body.status }
+        return @{ id = ($Path -split '/')[3]; status = $Body.status }
     }
     function New-AgentSocket {
         $mock = New-Object PSObject -Property @{ IsOpen = $true; IsFinished = $false; Failure = ''; Queue = (New-Object 'Collections.Generic.Queue[string]') }
@@ -717,16 +690,10 @@ try {
     $script:TimingLimit = 16200
     $script:ReadCount = 0
     function Get-Observation { $script:ReadCount++; return Fresh-Observation }
-    function Read-ConsoleCommand { if ($script:TimingClock.ElapsedMilliseconds -ge $script:TimingLimit) { $script:StopRequested = $true } }
+    function Read-UiCommand { if ($script:TimingClock.ElapsedMilliseconds -ge $script:TimingLimit) { $script:StopRequested = $true } }
     function Invoke-Cloud([string]$Path, $Body = @{}, [string]$Method = 'POST') {
         if ($Path -eq '/agent/start') { return @{ generation = 11; serverTime = 1800000000000.0 } }
         $script:TimingHttp.Add(@{ path = $Path; tick = $script:Clock.ElapsedMilliseconds; body = $Body })
-        if ($Path -eq '/agent/update') {
-            $captures = @()
-            if ($script:TimingHttp.Count -eq 1) { $captures = @([Guid]::NewGuid().ToString()) }
-            return @{ serverTime = 1800000000000.0; previewActive = $false; pairings = @(); job = $null; captures = $captures }
-        }
-        if ($Path -like '/agent/capture/*') { return @{} }
         throw 'Unexpected timing fixture cloud call.'
     }
     function New-AgentSocket {
@@ -744,7 +711,7 @@ try {
     }
     Check 'Local 500ms reads remain independent: maximum 2Hz preview, settled once, fresh 15s idle health, no HTTP updates' {
         $script:Journal = @{}; Save-Journal
-        $script:SlowHttp = $false; $script:TimingClock.Restart()
+        $script:TimingClock.Restart()
         Start-Rap
         Assert ($script:ReadCount -ge 30 -and $script:TimingHttp.Count -eq 0)
         Assert ($script:TimingMessages.Count -eq 4) 'Stationary socket published too often or omitted health.'
@@ -755,45 +722,79 @@ try {
         Assert ($script:TimingMessages[3].tick - $script:TimingMessages[2].tick -ge 15000)
         Assert ($script:TimingMessages[3].body.observationAgeMs -lt 600 -and $script:TimingMessages[3].body.connected)
     }
-    Check 'Explicit HTTP fallback polls no faster than 5s and dispatches a genuinely fresh capture' {
-        Set-RapTransport $true
-        $script:TimingLimit = 10200; $script:TimingClock.Restart(); $script:TimingHttp.Clear()
-        $before = $script:ReadCount
-        Start-Rap
-        $updates = @($script:TimingHttp | Where-Object { $_.path -eq '/agent/update' })
-        $captures = @($script:TimingHttp | Where-Object { $_.path -like '/agent/capture/*' })
-        Assert ($updates.Count -eq 3 -and $captures.Count -eq 1 -and $script:ReadCount - $before -ge 20)
-        Assert ($updates[1].tick - $updates[0].tick -ge 5000 -and $updates[2].tick - $updates[1].tick -ge 5000)
-        Assert ($captures[0].body.sequence -gt $updates[0].body.sequence -and $captures[0].body.observationAgeMs -lt 100)
-        Set-RapTransport $false
-    }
-    Check 'Verifier DPAPI precedes enrollment start; ambiguous start resumes same verifier; claim persists credential before verifier deletion' {
-        $script:Config = $null; $script:EnrollmentAttempts = 0; $script:ClaimAttempts = 0; $script:SavedVerifier = ''
-        function Invoke-Http([string]$Url, [string]$Method, [string]$Token, $Body = $null, [hashtable]$Headers = @{}, [int]$TimeoutMs = 5000, [switch]$Raw) {
-            Assert ($Token -eq '' -and $Url -notmatch [regex]::Escape([string](Get-Field $Body 'verifier')))
-            if ($Url -like '*/start') {
-                $script:EnrollmentAttempts++
-                $pending = Read-Protected 'enrollment.dpapi'
-                Assert ($pending.verifier -ceq $Body.verifier -and $pending.verifier -match '^[A-Za-z0-9_-]{43}$')
-                if ($script:EnrollmentAttempts -eq 1) { $script:SavedVerifier = $Body.verifier; throw 'Simulated lost start response.' }
-                Assert ($Body.verifier -ceq $script:SavedVerifier)
-                return @{ requestId = 'fixture-enrollment'; phrase = 'AMBER RIVER'; expiresAt = 1800000600000.0 }
-            }
-            if ($Url -like '*/claim') {
-                $script:ClaimAttempts++
-                Assert ($Body.verifier -ceq $script:SavedVerifier)
-                if ($script:ClaimAttempts -eq 1) { return @{ status = 'pending' } }
-                return @{ status = 'complete'; relayId = 'enrolled-relay'; credential = 'enrolled-credential' }
-            }
-            throw 'Unexpected enrollment fixture call.'
+    Check 'Relay version refusal pauses RAP, reports Update now and backs off' {
+        $script:Healths = New-Object 'Collections.Generic.List[string]'
+        $script:StartBodies = New-Object 'Collections.Generic.List[object]'
+        function Invoke-Cloud([string]$Path, $Body = @{}, [string]$Method = 'POST') {
+            if ($Path -ceq '/agent/start') { $script:StartBodies.Add($Body); throw 'RAP_UPDATE_REQUIRED' }
+            throw 'Unexpected cloud call after version refusal.'
         }
-        Must-Throw { Start-Enrollment 'https://fixture.invalid' 'Fixture PC' }
-        $pending = Start-Enrollment 'https://fixture.invalid' 'Fixture PC'
-        Assert ((Get-EnrollmentUrl $pending) -ceq 'https://nicholas-a11y.github.io/pathplotter/#enroll=fixture-enrollment&relay=https%3A%2F%2Ffixture.invalid')
-        Must-Throw { Start-Enrollment 'https://another.invalid' 'Fixture PC' }
-        Assert (-not (Complete-Enrollment $pending) -and $null -eq $script:Config)
-        Assert (Complete-Enrollment $pending)
-        Assert ((Read-Protected 'credentials.dpapi').credential -ceq 'enrolled-credential' -and -not [IO.File]::Exists((Join-Path $statePath 'enrollment.dpapi')))
+        function Publish-RapHealth([string]$Message, [bool]$Connected) { if (-not $Connected) { $script:Healths.Add($Message) } }
+        $script:TimingLimit = 1500; $script:TimingClock.Restart()
+        Start-Rap
+        Assert ($script:StartBodies.Count -eq 1 -and $script:StartBodies[0].version -ceq $script:RapVersion)
+        Assert ($script:UpdateRequired -and $script:Healths[$script:Healths.Count - 1] -match 'Update now')
+        $script:UpdateRequired = $false
+    }
+    Check 'RAP version file is a plain semantic version' {
+        Assert ($script:RapVersion -match '^\d+\.\d+\.\d+$' -and $script:RapVersion -ceq ([IO.File]::ReadAllText((Join-Path $PSScriptRoot 'version.txt')).Trim()))
+    }
+    Check 'Updater accepts only rap-vX.Y.Z GitHub releases, compares versions numerically and stays on GitHub HTTPS' {
+        $release = ConvertTo-RapRelease @{ tag_name = 'rap-v3.10.2' }
+        Assert ($release.version -ceq '3.10.2' -and $release.zipUrl -ceq 'https://github.com/nicholas-a11y/pathplotter/releases/download/rap-v3.10.2/PathPlotter-RAP-Windows.zip' -and $release.hashUrl -ceq ($release.zipUrl + '.sha256'))
+        foreach ($tag in @('v3.1.0', 'rap-v3.1', 'rap-v3.1.0-beta', 'rap-v3.1.0/../x')) { Must-Throw { ConvertTo-RapRelease @{ tag_name = $tag } } }
+        Assert ((Test-RapNewer '3.0.10' '3.0.9') -and -not (Test-RapNewer '3.0.0' '3.0.0') -and -not (Test-RapNewer '2.9.9' '3.0.0'))
+        foreach ($url in @('https://github.com/x', 'https://api.github.com/x', 'https://objects.githubusercontent.com/x', 'https://release-assets.githubusercontent.com/x')) { Assert (Test-UpdateHost ([Uri]$url)) $url }
+        foreach ($url in @('http://github.com/x', 'https://github.com.evil.example/x', 'https://evilgithubusercontent.com/x', 'https://github.com:8443/x')) { Assert (-not (Test-UpdateHost ([Uri]$url))) $url }
+    }
+    Check 'Updater verifies the checksum, refuses unsafe archives and replaces files with rollback' {
+        $work = Join-Path ([IO.Path]::GetTempPath()) ('pathplotter-rap-test-' + [Guid]::NewGuid().ToString('N'))
+        $target = Join-Path $work 'install'
+        [void][IO.Directory]::CreateDirectory($target)
+        try {
+            Add-Type -AssemblyName System.IO.Compression
+            function New-TestZip([hashtable]$Files) {
+                $memory = New-Object IO.MemoryStream
+                $archive = New-Object IO.Compression.ZipArchive($memory, [IO.Compression.ZipArchiveMode]::Create, $true)
+                foreach ($name in $Files.Keys) {
+                    $writer = New-Object IO.StreamWriter($archive.CreateEntry($name).Open())
+                    try { $writer.Write($Files[$name]) } finally { $writer.Dispose() }
+                }
+                $archive.Dispose()
+                return ,$memory.ToArray()
+            }
+            function Get-TestHash([byte[]]$Bytes) {
+                $sha = [Security.Cryptography.SHA256]::Create()
+                try { return (-join ($sha.ComputeHash($Bytes) | ForEach-Object { $_.ToString('x2') })) + '  PathPlotter-RAP-Windows.zip' } finally { $sha.Dispose() }
+            }
+            $files = @{}
+            foreach ($name in $script:UpdateRequiredFiles) { $files[$name] = 'new ' + $name }
+            $files['version.txt'] = '3.9.0'
+            $files['Vendor/QrCodeGenerator/QrCode.cs'] = 'new vendor'
+            foreach ($name in @('RAP.ps1', 'version.txt')) { [IO.File]::WriteAllText((Join-Path $target $name), 'old ' + $name) }
+            $script:TestZip = New-TestZip $files
+            $script:TestHash = Get-TestHash $script:TestZip
+            function Invoke-UpdateDownload([string]$Url, [int]$MaxBytes) {
+                if ($Url.EndsWith('.sha256')) { return ,$script:Utf8.GetBytes($script:TestHash) }
+                return ,$script:TestZip
+            }
+            $release = ConvertTo-RapRelease @{ tag_name = 'rap-v3.9.0' }
+            $good = $script:TestHash
+            $script:TestHash = ('0' * 64) + '  PathPlotter-RAP-Windows.zip'
+            Must-Throw { Install-RapUpdate $release $target }
+            Assert ([IO.File]::ReadAllText((Join-Path $target 'RAP.ps1')) -ceq 'old RAP.ps1')
+            $script:TestHash = $good
+            Must-Throw { Install-RapUpdate (ConvertTo-RapRelease @{ tag_name = 'rap-v3.9.1' }) $target }
+            Assert ([IO.File]::ReadAllText((Join-Path $target 'version.txt')) -ceq 'old version.txt')
+            Install-RapUpdate $release $target
+            Assert ([IO.File]::ReadAllText((Join-Path $target 'RAP.ps1')) -ceq 'new RAP.ps1')
+            Assert ([IO.File]::ReadAllText((Join-Path $target 'version.txt')) -ceq '3.9.0')
+            Assert ([IO.File]::ReadAllText((Join-Path $target 'Vendor\QrCodeGenerator\QrCode.cs')) -ceq 'new vendor')
+            $unsafe = @{} + $files; $unsafe['../escape.txt'] = 'x'
+            $script:TestZip = New-TestZip $unsafe; $script:TestHash = Get-TestHash $script:TestZip
+            Must-Throw { Install-RapUpdate $release $target }
+            Assert (-not [IO.File]::Exists((Join-Path $work 'escape.txt')))
+        } finally { if ([IO.Directory]::Exists($work)) { [IO.Directory]::Delete($work, $true) } }
     }
 } finally {
     if (Get-Command Stop-Import -ErrorAction SilentlyContinue) { Stop-Import }

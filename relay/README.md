@@ -1,124 +1,73 @@
-# PathPlotter relay Worker
+﻿# PathPlotter relay Worker
 
-This package implements the HTTPS relay API and its per-relay SQLite Durable Object. It does not serve or modify the frontend or RAP.
+A Cloudflare Worker with SQLite-backed Durable Objects that connects PathPlotter browsers to RAP. Each registered RAP has its own `RelayDO`. A single `ControlPlaneDO` handles registration, invitations, capacity and preview limits. The relay does not serve the web app or RAP.
 
-## Hosted deployment
+## Deploy
 
-The current Worker is `pathplotter-relay-v2`, at `https://pathplotter-relay-v2.nicholas-leqeta.workers.dev`. It has fresh Durable Object namespaces; registrations on the earlier test Worker are not copied. The website and RAP defaults target this address.
+The hosted Worker is `pathplotter-relay-v3` at `https://pathplotter-relay-v3.nicholas-leqeta.workers.dev`. The web app ([src/onboarding.ts](../src/onboarding.ts)) and RAP ([rap/GUI.ps1](../rap/GUI.ps1)) default to this address.
 
 ```powershell
+cd relay
+npm ci
 npm run check
 npm test
-npx wrangler deploy --config .\wrangler.jsonc --keep-vars --dry-run
 npx wrangler deploy --config .\wrangler.jsonc --keep-vars
+npx wrangler secret put OPERATOR_ADMIN_TOKEN   # once; at least 32 random characters
 ```
 
-Operator registration requires a private `BOOTSTRAP_TOKEN` Worker secret. Set it in the Cloudflare dashboard or using `npx wrangler secret put BOOTSTRAP_TOKEN`; never put the value in a command argument or chat. Each invitation is single-use. Replace it with a new random value before registering another computer. Guided enrollment remains unavailable unless separately configured below.
+`OPERATOR_ADMIN_TOKEN` authorizes creating invitations. Keep it private and never hand it out. Enter it only at the secret prompt, not as a command argument.
 
-### Batch invitations (preferred for several people)
+Configuration in [wrangler.jsonc](./wrangler.jsonc):
 
-Configure **one** private random `OPERATOR_ADMIN_TOKEN` secret of at least 32 characters. This is separate from all registration invitations and must never be handed out. After deploying this version:
+| Variable | Meaning |
+| --- | --- |
+| `MIN_RAP_VERSION` | Oldest RAP allowed to connect. Older RAPs get HTTP 426 and ask the user to click **Update now**. Raise it only after the matching RAP release is published. |
+
+Registrations are stored in this Worker's Durable Objects. Deploying under a new Worker name starts with no registrations, so every RAP must register again with a new Invitation ID.
+
+## Invitations
+
+New computers register only with an operator-issued **Invitation ID**. Use [rap/Operator-Invitations.ps1](../rap/README.md#operator-batch-invitations) to generate, list and cancel them.
+
+- Up to 20 invitations per batch, each single-use and valid for seven days. At most 100 unused invitations can be outstanding.
+- Only hashes are stored, so an invitation's secret cannot be recovered after creation.
+- The service is capped at 50 registered computers.
+- Registration and operator requests are each limited to five per IP per minute. Operator routes reject any browser `Origin`.
+
+## API summary
+
+All bodies are JSON. Allowed browser origins are `https://nicholas-a11y.github.io` and local Vite development origins.
+
+**Registration and operator**
+
+- `POST /v1/register {invitation, name}` returns `{relayId, credential}`.
+- `POST /v1/operator/invitations {count, label}`, `GET /v1/operator/invitations` and `POST /v1/operator/invitations/:id/cancel`, all with `Authorization: Bearer <OPERATOR_ADMIN_TOKEN>`.
+
+**RAP** (`/v1/relays/:relayId/agent/...`, bearer RAP credential)
+
+- `start {version}` begins a new generation. It returns 426 if `version` is below `MIN_RAP_VERSION`.
+- `stream` is the RAP WebSocket for observations, captures and jobs.
+- `browser-launch` creates a two-minute, single-use link for **Open PathPlotter**.
+- `pairing/new` and `pairing/decide` create and approve phone QR pairings.
+- `browsers` and `browsers/revoke` list and revoke the paired browser.
+- `jobs/:id/status` reports import progress.
+
+**Browser** (`/v1/relays/:relayId/...`)
+
+- `pairing/request` and `pairing/status` handle QR pairing. `browser/launch` redeems a RAP launch link.
+- `ticket` and then `stream` open the browser WebSocket.
+- `control` and `control/release` claim and release capture control. `capture` requests a fresh observation (at most 2 s old).
+- `jobs`, `jobs/:id` and `jobs/:id/resolve` handle SVG imports, limited to 512 KiB each and 1,000 per RAP per 24 hours.
+
+Only one browser identity is authorized per RAP. Approving a new browser replaces the previous one. Moving previews are limited to two updates per second, and to two previewing RAPs service-wide. Temporary snapshots, jobs and pairing requests are deleted by Durable Object alarms within 24 hours.
+
+## Development
 
 ```powershell
-npx wrangler secret put OPERATOR_ADMIN_TOKEN
-```
-
-Use the private PowerShell tool described in [RAP operator instructions](../rap/README.md#operator-batch-invitations) to generate, list and cancel invitations. Users paste their individual secret token into RAP's **Invitation ID** field, not the metadata/cancellation UUID; the registration wire protocol is unchanged.
-
-The operator-only API has no browser access:
-
-- Bearer-authenticated `POST /v1/operator/invitations {count,label}` creates 1-20 invitations, all expiring seven days after creation. Response contains `batchId` and `{id,batchId,label,createdAt,expiresAt,status,token}` per invitation. Tokens are cryptographically random 256-bit values and returned only on creation; only hashes are stored.
-- `GET /v1/operator/invitations` returns metadata/status, never token values. Status is `unused`, `used`, `expired` or `cancelled`. Metadata expires 30 days after invitation expiry; listing returns the latest 1000 records and an explicit `truncated` flag.
-- `POST /v1/operator/invitations/:id/cancel {}` idempotently cancels an unused invitation. Used invitations return `409`; cancellation is not revocation of a registered RAP.
-- All operator routes reject any `Origin` header. Operator attempts are capped at five/IP/minute, including failed authorization, independently of registration's five/IP/minute limit. At most 100 unexpired, unused invitations may be outstanding. The existing 50-computer service capacity is unchanged; invitations do not reserve registration slots.
-- `/v1/register` atomically validates expiry/cancellation and consumes each batch invitation once, even under concurrent requests. Legacy `BOOTSTRAP_TOKEN` remains available but is no longer needed for batches.
-
-Creation is not automatically retried. If its response is lost, list recent batches by label/time, cancel the uncertain invitations and generate replacements. Plaintext invitations cannot be recovered from the relay. Registration reply loss can consume an invitation without delivering a RAP credential; issue a replacement after checking the setup rather than repeatedly retrying the same consumed value.
-
-## Local development and checks
-
-```powershell
-npm install
-npm run check
-npm test
+npm ci
+npm run check   # wrangler types + tsc
+npm test        # Vitest in the Workers runtime
 npm run dev
 ```
 
-`npm run check` regenerates the binding/runtime declarations with Wrangler and type-checks the Worker and runtime tests. `npm test` runs the HTTP contract against Cloudflare's Workers runtime with SQLite-backed Durable Objects. Root CI can run these without changing the root application scripts using `npm --prefix relay run check` and `npm --prefix relay test`.
-
-Public device enrollment is **disabled by default**. An operator must configure `ENROLLMENT_CODE` (at least six characters) and `TURNSTILE_SECRET` (at least sixteen characters) as Worker secrets, plus a production `TURNSTILE_SITE_KEY` in Worker variables. Dummy/test sitekeys are not accepted. Optionally set `RAP_DOWNLOAD_URL` to an HTTPS release download. No secret or real sitekey is supplied in this package. Siteverify must return `success:true`, action `enrollment`, and hostname exactly `nicholas-a11y.github.io`; network, non-JSON and verification errors fail closed.
-
-The existing `/v1/register` invitation route remains available when `BOOTSTRAP_TOKEN` is configured. Its invitation is consumed once and its hash retained permanently. Existing relay/browser credentials remain valid. Never put real secrets in configuration, source, logs, or a committed `.dev.vars` file.
-
-## API behavior
-
-### RAP links and QR pairing
-
-New browsers use RAP's desktop launch link or phone QR/link invitation. Phone requests require explicit matching-phrase desktop approval. Browser pairing needs no Turnstile; guided computer enrollment retains its existing verification requirements.
-
-`SINGLE_BROWSER_ENABLED: "true"` (the default) limits new authorization to one saved
-browser identity per RAP. RAP asks before switching devices. Agent launch issuance
-and phone approval accept optional `replaceBrowserIds`, the exact UUID set the user
-confirmed. Existing browsers without confirmation yield `409 browser_replacement_required`;
-changed IDs yield `409 browser_changed`. Pending imports or unacknowledged unknown
-outcomes yield `409 unresolved_imports`. Desktop replacement happens only on redemption,
-not when the link is issued; the checks run again atomically with revocation and the
-new grant. Revocation clears tickets/control, closes old sockets, and invalidates
-outstanding desktop launches. Same-browser credentials are reused without revocation.
-Existing multi-browser authorizations are not silently deleted on upgrade; the next
-confirmed switch consolidates them. Set the flag to `"false"` only to intentionally
-retain legacy multi-browser authorization. This is a saved-identity policy, not a
-one-tab restriction. Deploy the relay and matching RAP together.
-
-Three-letter pairing routes and the enablement variable have been removed. Older clients receive `404 not_found` for those routes, even if a previous deployment still has the old variable. Deploy this relay together with the matching website/RAP update. Existing registered computers and approved browser credentials remain valid.
-
-Legacy code tables remain for upgrade cleanup, not active pairing. On RelayDO initialization, unapproved legacy code requests are rejected without affecting QR requests or approved browsers. The control-plane alarm clears old code reservations and encrypted recovery results. Durable Object bindings and migration history are unchanged.
-
-- RAP agent routes include `POST /pairing/new`, `POST /pairing/decide`, `GET /browsers`, `POST /browsers/revoke` and `POST /jobs/:jobId/status`, relative to `/v1/relays/:relayId`. The earlier `/agent/pairing/...` and `/agent/jobs/...` forms remain aliases; both require the agent credential.
-
-- Browser origins are restricted to `https://nicholas-a11y.github.io`, `http://localhost:5173`, and `http://127.0.0.1:5173`; CORS is not used as authentication.
-- Each relay ID maps to an independent SQLite DO. Agent and browser bearer credentials are random 256-bit values; only hashes are stored. Pairing approval is per relay, and the browser credential is AES-GCM wrapped using the pending token and returned only to a request authenticated by that token.
-- Agent start returns `{generation,serverTime}`; each update includes `observedAtServer` and `clockUncertaintyMs`, with conservative calibration uncertainty. Connected samples without valid calibration are rejected and clear live position/context. Live coordinates are **memory-only**; the legacy SQL snapshot table is cleared on initialization and never rewritten. Socket attachments retain generation/sequence fencing across hibernation, but not coordinates. After hibernation an agent `work` message requests a new observation. At receipt, age is `max(observationAgeMs, serverNow - observedAtServer + clockUncertaintyMs)`. Delayed samples cannot create or claim import jobs once older than two seconds.
-- Browser control is an explicit **45-second** lease, compatible with 15-second heartbeats. Only authenticated incoming browser heartbeats, control requests, or permitted HTTP snapshot reads renew it; outgoing broadcasts never renew control or take over another browser. Jobs remain validated constrained SVG documents of at most 512 KiB each, with 1,000 admissions per rolling 24 hours and ten pending SVG payloads. Claims remain atomic and serialized; generation changes make active jobs `unknown`, never queued for replay. Terminal SVG bodies are removed. Job metadata expires after 24 hours, but permanent ID-only tombstones reject reuse of retired IDs. Retrying an ID/checksum during retention reconciles the existing result without consuming another admission.
-- Desktop launch: RAP calls agent-authenticated `POST /agent/browser-launch` with `{replaceBrowserIds?}` and receives `{launchToken,expiresAt}`. RAP places only this token in the URL fragment it opens; it is never printed, copied or QR-encoded. The browser (allowed origin, no bearer) calls `POST /browser/launch` with `{launchToken,credential?}` and receives `{credential}`. A supplied credential that is a valid, unrevoked browser credential of this relay is returned unchanged; otherwise a new scoped browser credential is minted subject to the single-browser replacement policy above. Tokens are 256-bit, stored only as hashes in a table separate from phone invitations, expire after two minutes and are consumed atomically once (`404 launch_token_not_found`, `409 launch_token_used`, `410 launch_token_expired`). Issuance is bounded separately from phone invitations: at most 5 unused tokens (`429 too_many_launch_tokens`) and 20 issued per rolling 10 minutes (`429 launch_rate_limited`); the legacy policy allows at most 20 unrevoked launch-minted browsers (`429 too_many_launch_browsers`; revoke one via `/browsers/revoke`). A launch token is a short-lived bearer grant, not proof of physical locality. Phone pairing (`/pairing/request` + `/pairing/decide`) still requires explicit approval.
-- `POST /control` with `{}` claims only a free lease (`409 browser_lease_occupied` otherwise). `{"takeover":true}` explicitly switches an occupied lease. Moving control to a browser that does not already hold the live lease is refused with `409 unresolved_imports` while another browser has a queued/claimed/attempting/accepted job or an unacknowledged `unknown` job; lease expiry does not bypass this. Unknown jobs of revoked browsers do not block. The check and lease switch share one transaction with job admission, and the previous controller sees `activeBrowser:false` on its next snapshot/stream message and cannot admit jobs.
-- `POST /jobs/:jobId/resolve` with `{}` (owning browser only) acknowledges an `unknown` job so it no longer blocks control moves; other statuses return `409 job_not_unknown`. Resolved unknown jobs report `resolved:true` in job results.
-- `GET /snapshot` and browser socket events return `{serverTime,snapshot,activeBrowser,controlOccupied,job,protocol:2,agentOnline,previewActive,settled}`. `POST /ticket` issues a single-use 30-second ticket; `/stream?ticket=...` consumes it with an allowed browser Origin. Durable credentials never appear in stream URLs. Browser revocation is checked on every incoming message and broadcast. Job admission and transitions broadcast the current job result.
-
-## Version 2 sockets and fresh capture
-
-After `/agent/start`, RAP opens `/agent/stream?generation=N` using its Authorization header (no browser Origin required). Duplicate connections replace the older agent socket; stale generations are fenced. Agent messages are `{v:2,type:"update",id:<UUID>,body:<existing update body>}`, optionally with `body.settled`. Replies are `{v:2,type:"update-result",id,body:{serverTime,pairings,job,previewActive,captures}}`. Server `work` messages have `{pairings,job:null,previewActive}`: **RAP must take and publish a fresh observation on every work message**, even when idle, so queued work is safely claimed in the subsequent update result. Server job replies can exceed 512 KiB after JSON escaping; RAP needs a bounded receive limit of at least 1 MiB.
-
-Browser heartbeats are `{v:2,type:"heartbeat",watching:boolean}` every 15 seconds and on visibility changes. Hidden sockets retain health/control liveness but do not request preview allocation. Sockets expire after 45 seconds without application traffic. Each relay allows at most two browser sockets; the control plane admits at most two previewing relays globally through renewable 45-second leases, renewed no more frequently than every 15 seconds. Capacity denial is `preview_busy`; enrollment and socket connections remain intact. Incoming socket JSON is limited to 16 KiB. Ordinary agent updates are limited to two per second; malformed, unauthorized, stale and unsupported messages produce `{v:2,type:"error",error,id?}`.
-
-`POST /capture {requestId:<UUID>}` requires active browser ownership. It creates one pending request per browser, at most ten pending and 1,000 retained per relay, with a ten-second deadline. A pending retry with the same ID reconciles the request; completed IDs cannot be replayed. RAP receives `{v:2,type:"capture",id}` and returns `{v:2,type:"capture-result",id,body:<genuinely new observation update>}`. Results require a strictly newer sequence and observation timestamp than the request baseline, a timestamp not definitively before request creation after allowing clock uncertainty, conservative age within two seconds, and unchanged generation, owner and matching workspace context. RAP must physically read after the correlated command; these timestamp checks do not independently prove hardware behavior. The browser receives a correlated `capture-result` with snapshot envelope or an explicit error. No point is committed automatically.
-
-For HTTP fallback, accepted `/agent/update` calls and browser `/snapshot` polls must be at least **five seconds apart** (`429 fallback_rate_limited` otherwise). Updates return pending capture IDs in `captures`; RAP can POST the new observation to `/agent/capture/:id`. The first authenticated GET `/capture/:id` can start immediately after POST and **waits bounded by the original ten-second deadline**. Subsequent status requests are limited to one per five seconds. It returns `{status:"complete",body:<envelope>,waitMs}` or `{status:"failed",error,waitMs}`. Subtract top-level `waitMs` only from that GET's measured round trip. Socket result envelopes carry their own `waitMs`, measured from server receipt of the capture request to completion; subtract it from the correlated socket capture elapsed time. Never subtract waiting from observation age or clock uncertainty. Cached completions report zero wait, current envelope `serverTime`, and the unchanged original snapshot `receivedAt`/age. Clients must include `serverTime - receivedAt` and remaining transit uncertainty in freshness checks; fallback can legitimately fail as too slow.
-
-## Enrollment endpoints and cleanup
-
-- `GET /v1/enrollment/config`: `{enabled,siteKey,downloadUrl?}`.
-- `POST /v1/enrollment/start {name,verifier}`: `{requestId,phrase,expiresAt}`. Verifier must be 32 random bytes encoded as 43-character base64url; only its hash is stored. Repeating the pending verifier reconciles a lost start response.
-- `GET /v1/enrollment/:id`: public `{name,phrase,expiresAt,status}`; never exposes verifier or credentials.
-- `POST /v1/enrollment/:id/approve {code,turnstileToken}`: browser-Origin, shared-code and Siteverify gated.
-- `POST /v1/enrollment/:id/claim {verifier}`: `{status:"pending"}` or `{status:"complete",relayId,credential}`. Only the verifier holder obtains the strong credential. An encrypted verifier-bound response is retained for two minutes to reconcile a lost claim response; RAP must persist it using DPAPI before discarding its pending verifier.
-
-Self-enrollment reserves capacity atomically: 50 total devices, including registered relays and legacy IDs known through consumed invitations, with at most twenty pending requests and five attempts per client IP per minute. There is **no daily enrollment quota**. The operator must inventory any legacy devices absent from the existing invitation ledger before enabling enrollment; `ControlPlaneDO.inventory(relayId)` admits known IDs without rotating or invalidating their credentials.
-
-Durable Object alarms run cleanup independently of incoming traffic. Pending capture deadlines schedule early alarms; retention alarms are scheduled at or before the earliest job/pairing 24-hour deadline. Active connections receive periodic liveness cleanup; inactive relays schedule only their next actual cleanup deadline and stop alarms entirely when no temporary state remains. Coordinates are transient; capture results expire within 24 hours; expired temporary tickets, invitations, launches, enrollment reconciliation material and rate windows are removed. Enrollment records, browser credentials, invitation consumption and job ID replay tombstones remain. Local collection backups and RAP import tombstones are unaffected. Cloudflare alarms are at-least-once and can be retried/delayed by the platform; physical deletion timing cannot be guaranteed during a platform outage, while expired data is logically unusable. Permanent replay tombstones intentionally accumulate and require operator storage monitoring.
-
-Runtime tests cover HTTP bounds, socket role/Origin and viewer caps, hibernation with sequence fencing, global preview admission/expiry, conservative capture/long-poll/replay safety, Turnstile action/hostname/verifier gating, legacy enrollment inventory and scheduled retention preserving credentials. Actual production Turnstile verification, cloud resource usage and Windows/LightBurn hardware behavior remain external release checks.
-
-## Hosted pilot release checks (operator-only)
-
-Before enabling public enrollment or describing the hosted pilot as validated:
-
-1. Inventory legacy relay IDs and confirm the total admission count; configure the production sitekey and secrets through the operator's existing secret-management process.
-2. Exercise a real Turnstile approval on the production hostname/action, reject replayed tokens and wrong hostnames/actions, and verify verifier-only claim reconciliation without credentials in browser URLs or logs.
-3. Verify three relays contend for only two preview allocations, a third browser socket per relay is rejected, hidden/crashed viewers release capacity, reconnect never steals control, and revocation immediately stops access.
-4. Measure watched, stationary, hidden, idle and reduced-rate fallback traffic, Durable Object requests/duration/SQL activity, alarm execution and storage growth against the operator's Cloudflare account allowances. The caps are enforcement boundaries, not a measured cost ceiling; do not enable billing upgrades automatically.
-5. Verify original observation timing through fresh socket/HTTP captures, workspace changes, restart/hibernation, uncertain imports and explicit recovery using Windows PowerShell 5.1 and actual LightBurn hardware. Confirm temporary payload cleanup and retained authorization/replay fences.
-
-These checks have **not** been performed against hosted infrastructure or hardware by this backend implementation. Local checks pass (`npm run check`, 32 Workers-runtime tests); real Turnstile and hosted usage measurements remain release prerequisites. User-facing text should describe a free service without provider-plan terminology or promises of perpetual availability.
-
-No remote deployment has been performed.
+Never commit secrets or a `.dev.vars` file containing real values.

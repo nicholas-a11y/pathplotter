@@ -1,9 +1,8 @@
 #requires -Version 5.1
-[CmdletBinding()]
-param(
-    [switch]$LibraryOnly,
-    [string]$DataDirectory = (Join-Path $env:LOCALAPPDATA 'PathPlotter\RAP')
-)
+# Core RAP library. GUI.ps1 is the only entry point: GUIWorker.ps1 dot-sources
+# this file and replaces the UI hooks (Initialize-Config, Publish-RapHealth,
+# Publish-RapPairings and Read-UiCommand).
+param([string]$DataDirectory = (Join-Path $env:LOCALAPPDATA 'PathPlotter\RAP'))
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
@@ -11,7 +10,7 @@ Add-Type -AssemblyName System.Security
 if (-not ('PathPlotterRap.EventStream' -as [type])) {
     $compiler = New-Object CodeDom.Compiler.CompilerParameters
     $compiler.GenerateInMemory = $true
-    $compiler.TempFiles = New-Object CodeDom.Compiler.TempFileCollection($PSScriptRoot, $false)
+    $compiler.TempFiles = New-Object CodeDom.Compiler.TempFileCollection([IO.Path]::GetTempPath(), $false)
     [void]$compiler.ReferencedAssemblies.Add('System.dll')
     [void]$compiler.ReferencedAssemblies.Add('System.Core.dll')
     Add-Type -Path (Join-Path $PSScriptRoot 'Transport.cs') -CompilerParameters $compiler
@@ -28,16 +27,21 @@ $script:ServerTick = 0L
 $script:ClockUncertainty = $null
 $script:Sequence = 0L
 $script:PendingPairings = @{}
-$script:CommandBuffer = ''
 $script:StopRequested = $false
 $script:ActiveImport = $null
 $script:LightBurnRoot = 'http://127.0.0.1:19520'
 $script:UiBridge = $null
-$script:SlowHttp = $false
 $script:Socket = $null
 $script:PreviewActive = $false
 $script:LastObservationHealth = ''
-$script:DefaultRelay = 'https://pathplotter-relay-v2.nicholas-leqeta.workers.dev'
+$script:DefaultRelay = 'https://pathplotter-relay-v3.nicholas-leqeta.workers.dev'
+$script:UpdateRequired = $false
+$script:RapVersion = '0.0.0'
+$versionFile = Join-Path $PSScriptRoot 'version.txt'
+if ([IO.File]::Exists($versionFile)) {
+    $versionText = [IO.File]::ReadAllText($versionFile).Trim()
+    if ($versionText -match '^\d+\.\d+\.\d+$') { $script:RapVersion = $versionText }
+}
 
 function New-AgentSocket {
     $url = $script:Config.apiRoot -replace '^https:', 'wss:'
@@ -51,7 +55,6 @@ function Send-AgentMessage([string]$Type, [string]$Id, $Body) {
 function Publish-ObservationHealth($Observation, $Body) {
     $health = $Observation.error + ' Cloud connected.'
     if ($Observation.connected) { $health = 'LightBurn workpiece/context verified; cloud connected.' }
-    if ($script:SlowHttp) { $health += ' Slow HTTP fallback (at least 5 seconds); capture and approvals respond more slowly.' }
     $fresh = $Body.connected -and ($Observation.observationAgeMs + $script:Clock.ElapsedMilliseconds - $Observation.tick -le 2000)
     Publish-RapHealth $health ([bool]$fresh)
     if ($health -cne $script:LastObservationHealth) { Write-Host $health; $script:LastObservationHealth = $health }
@@ -107,64 +110,14 @@ function Get-ObservationSignature($Observation) {
     return (@{ connected = $Observation.connected; position = $Observation.position; context = $Observation.context; error = $Observation.error } | ConvertTo-Json -Depth 20 -Compress)
 }
 
-function Set-RapTransport([bool]$Slow) {
-    Stop-Import
-    if ($null -ne $script:Socket) { $script:Socket.Dispose(); $script:Socket = $null }
-    $script:SlowHttp = $Slow
-    $script:Generation = $null
-    $script:ServerTime = $null
-    $script:ClockUncertainty = $null
-    $script:PendingPairings = @{}
-}
-
-function Start-Enrollment([string]$Api, [string]$Name) {
-    $api = Assert-CloudRoot $Api
-    if ([string]::IsNullOrWhiteSpace($Name) -or $Name.Length -gt 80 -or $Name -match '[\x00-\x1f]') { throw 'Invalid computer name.' }
-    $pending = Read-Protected 'enrollment.dpapi'
-    if ($null -ne $pending) {
-        if ($pending.apiRoot -cne $api -or $pending.name -cne $Name) { throw 'Resume the saved enrollment using the same relay and computer name.' }
-    } else {
-        $bytes = New-Object byte[] 32
-        $rng = [Security.Cryptography.RandomNumberGenerator]::Create()
-        try { $rng.GetBytes($bytes) } finally { $rng.Dispose() }
-        $verifier = [Convert]::ToBase64String($bytes).TrimEnd('=').Replace('+', '-').Replace('/', '_')
-        $pending = @{ apiRoot = $api; name = $Name; verifier = $verifier; requestId = $null; phrase = $null; expiresAt = $null }
-        Write-Protected 'enrollment.dpapi' $pending
-    }
-    if ($null -eq $pending.requestId) {
-        $result = Invoke-Http ($api + '/v1/enrollment/start') 'POST' '' @{ name = $Name; verifier = $pending.verifier }
-        $id = Get-Field $result 'requestId'
-        $phrase = Get-Field $result 'phrase'
-        if ($id -isnot [string] -or $id -notmatch '^[A-Za-z0-9_-]{1,128}$' -or $phrase -isnot [string] -or
-            $phrase -notmatch '^[A-Za-z0-9 -]{1,120}$') { throw 'Invalid enrollment response.' }
-        $expiry = Convert-Time (Get-Field $result 'expiresAt')
-        $pending.requestId = $id; $pending.phrase = $phrase; $pending.expiresAt = $expiry
-        Write-Protected 'enrollment.dpapi' $pending
-    }
-    return $pending
-}
-
-function Get-EnrollmentUrl($Pending) {
-    return 'https://nicholas-a11y.github.io/pathplotter/#enroll=' + [Uri]::EscapeDataString($Pending.requestId) +
-        '&relay=' + [Uri]::EscapeDataString($Pending.apiRoot)
-}
-
-function Complete-Enrollment($Pending) {
-    # Claim is verifier-bound and idempotent. A lost reply is recovered with
-    # the same DPAPI verifier, never by creating a second computer.
-    $result = Invoke-Http ($Pending.apiRoot + '/v1/enrollment/' + $Pending.requestId + '/claim') 'POST' '' @{ verifier = $Pending.verifier }
-    if ((Get-Field $result 'status') -ceq 'pending') { return $false }
-    if ((Get-Field $result 'status') -cne 'complete' -or (Get-Field $result 'relayId') -isnot [string] -or
-        [string]::IsNullOrEmpty($result.relayId) -or (Get-Field $result 'credential') -isnot [string] -or
-        [string]::IsNullOrEmpty($result.credential)) { throw 'Invalid enrollment claim.' }
-    $registration = @{ apiRoot = $Pending.apiRoot; relayId = $result.relayId; credential = $result.credential; lightBurnSecret = '' }
-    Write-Protected 'credentials.dpapi' $registration
-    $script:Config = $registration
-    [IO.File]::Delete((Join-Path $script:DataDirectory 'enrollment.dpapi'))
-    return $true
-}
-
+# UI hooks; GUIWorker.ps1 replaces these.
 function Publish-RapHealth([string]$Message, [bool]$Connected) { }
+function Publish-RapPairings($Pairings) { }
+function Read-UiCommand { }
+function Initialize-Config {
+    $script:Config = Read-SavedConfig
+    if ($null -eq $script:Config) { throw 'RAP is not registered.' }
+}
 
 function Get-Field($Object, [string]$Name) {
     if ($null -eq $Object) { return $null }
@@ -339,6 +292,7 @@ function Invoke-Http([string]$Url, [string]$Method, [string]$Token, $Body = $nul
             $code = [int]$_.Exception.Response.StatusCode
             $_.Exception.Response.Close()
         }
+        if ($code -eq 426) { throw 'RAP_UPDATE_REQUIRED' }
         if ($code -eq 401 -or $code -eq 403) { throw "HTTP authorization failed ($code). Check clock, permissions or revoke/re-pair explicitly." }
         if ($code -ne 0) { throw "HTTP request rejected ($code)." }
         throw 'HTTP network/timeout failure; no side-effect request is retried.'
@@ -354,13 +308,11 @@ function Invoke-Http([string]$Url, [string]$Method, [string]$Token, $Body = $nul
 
 function Invoke-Cloud([string]$Path, $Body = @{}, [string]$Method = 'POST') {
     $relay = [Uri]::EscapeDataString([string]$script:Config.relayId)
-    $timeout = 5000
-    if ($Path -eq '/agent/update') { $timeout = 1000 }
-    return Invoke-Http ($script:Config.apiRoot + '/v1/relays/' + $relay + $Path) $Method $script:Config.credential $Body -TimeoutMs $timeout
+    return Invoke-Http ($script:Config.apiRoot + '/v1/relays/' + $relay + $Path) $Method $script:Config.credential $Body
 }
 
 function Get-ApprovedBrowserIds {
-    $result = Invoke-Cloud '/browsers' -Body $null -Method 'GET'
+    $result = Invoke-Cloud '/agent/browsers' -Body $null -Method 'GET'
     $rows = Get-Field $result 'browsers'
     if ($rows -isnot [array]) { throw 'Invalid browser list.' }
     $ids = @()
@@ -574,7 +526,7 @@ function Send-Record([string]$Id) {
     $record = $script:Journal[$Id]
     $body = @{ generation = $script:Generation; status = $record.status }
     if ($record.error) { $body.error = $record.error }
-    $result = Invoke-Cloud ('/jobs/' + [Uri]::EscapeDataString($Id) + '/status') $body
+    $result = Invoke-Cloud ('/agent/jobs/' + [Uri]::EscapeDataString($Id) + '/status') $body
     if ((Get-Field $result 'id') -cne $Id -or (Get-Field $result 'status') -cne $record.status) { throw 'Cloud did not acknowledge the import state.' }
     $record.pending = $false
     Save-Journal
@@ -717,70 +669,14 @@ function Invoke-Import($Job, $Observation) {
     }
 }
 
-function Read-Secret([string]$Prompt) {
-    $secure = Read-Host $Prompt -AsSecureString
-    $ptr = [Runtime.InteropServices.Marshal]::SecureStringToBSTR($secure)
-    try { return [Runtime.InteropServices.Marshal]::PtrToStringBSTR($ptr) }
-    finally { [Runtime.InteropServices.Marshal]::ZeroFreeBSTR($ptr); $secure.Dispose() }
-}
-
-function Initialize-Config {
-    $script:Config = Read-Protected 'credentials.dpapi'
-    if ($null -eq $script:Config) {
-        $apiInput = Read-Host ('HTTPS relay origin (Enter for ' + $script:DefaultRelay + '; advanced override)')
-        if ([string]::IsNullOrWhiteSpace($apiInput)) { $apiInput = $script:DefaultRelay }
-        $api = Assert-CloudRoot $apiInput
-        $name = Read-Host 'Computer name shown by the relay'
-        if ([string]::IsNullOrWhiteSpace($name) -or $name.Length -gt 80 -or $name -match '[\x00-\x1f]') { throw 'Computer name must be 1-80 printable characters.' }
-        $bootstrap = Read-Secret 'Optional single-use invitation (Enter for guided browser enrollment)'
-        try {
-            if ([string]::IsNullOrWhiteSpace($bootstrap)) {
-                $pending = Start-Enrollment $api $name
-                Write-Host ('Compare this phrase in your browser: ' + $pending.phrase)
-                Start-Process (Get-EnrollmentUrl $pending)
-                if ((Read-Host 'Only if the browser shows that exact phrase for this computer, type CONFIRM; then explicitly approve there') -cne 'CONFIRM') { throw 'Enrollment not confirmed.' }
-                $deadline = $script:Clock.ElapsedMilliseconds + 600000
-                while ($script:Clock.ElapsedMilliseconds -lt $deadline) {
-                    if (Complete-Enrollment $pending) { break }
-                    Start-Sleep -Milliseconds 5000
-                }
-                if ($null -eq $script:Config) { throw 'Enrollment timed out; resume explicitly using protected verifier.' }
-            } else {
-                $result = Invoke-Http ($api + '/v1/register') 'POST' '' @{ bootstrapToken = $bootstrap; name = $name }
-                if ((Get-Field $result 'relayId') -isnot [string] -or [string]::IsNullOrEmpty($result.relayId) -or
-                    (Get-Field $result 'credential') -isnot [string] -or [string]::IsNullOrEmpty($result.credential)) { throw 'Registration returned no identity; no automatic retry.' }
-                $script:Config = @{ apiRoot = $api; relayId = $result.relayId; credential = $result.credential; lightBurnSecret = '' }
-                Write-Protected 'credentials.dpapi' $script:Config
-            }
-        }
-        finally { $bootstrap = $null }
-    } else {
-        $script:Config.apiRoot = Assert-CloudRoot $script:Config.apiRoot
-        if ((Get-Field $script:Config 'relayId') -isnot [string] -or [string]::IsNullOrEmpty($script:Config.relayId) -or
-            (Get-Field $script:Config 'credential') -isnot [string] -or [string]::IsNullOrEmpty($script:Config.credential) -or
-            (Get-Field $script:Config 'lightBurnSecret') -isnot [string]) { throw 'Local relay credentials are incomplete.' }
-    }
-    if ([string]::IsNullOrEmpty($script:Config.lightBurnSecret)) {
-        Write-Host 'Enable the REST API in LightBurn Settings > Extensions. Keep network API access disabled.'
-        if ((Read-Host 'Request local LightBurn pairing (state, project, upload)? Type PAIR to consent') -cne 'PAIR') { throw 'Local pairing was not authorized.' }
-        Write-Host 'Bring LightBurn to the foreground and approve its dialog within 30 seconds.'
-        $pair = Invoke-Http ($script:LightBurnRoot + '/api/connect') 'POST' '' @{ application_name = 'PathPlotter RAP'; capabilities = @('state', 'project', 'upload') } -TimeoutMs 35000
-        if ((Get-Field $pair 'status') -cne 'ok' -or (Get-Field $pair 'secret') -isnot [string] -or [string]::IsNullOrEmpty($pair.secret)) { throw 'LightBurn pairing did not return a valid secret.' }
-        $script:Config.lightBurnSecret = $pair.secret
-        Write-Protected 'credentials.dpapi' $script:Config
-    }
-}
-
-function Show-PairingUrl {
-    $pair = Invoke-Cloud '/pairing/new'
-    if ((Get-Field $pair 'invitation') -isnot [string] -or [string]::IsNullOrEmpty($pair.invitation) -or
-        (Convert-Time (Get-Field $pair 'expiresAt')) -le (Get-ServerNow)) { throw 'Cloud returned an invalid or expired browser invitation.' }
-    $url = 'https://nicholas-a11y.github.io/pathplotter/#relay=' + [Uri]::EscapeDataString($script:Config.apiRoot) +
-        '&relayId=' + [Uri]::EscapeDataString($script:Config.relayId) + '&invite=' + [Uri]::EscapeDataString($pair.invitation)
-    Write-Host 'Private single-use pairing URL (expires within five minutes; do not share screenshots):'
-    Write-Host $url
-    Write-Host 'Use on your phone, or type open to open this invitation on this computer.'
-    $script:PairingUrl = $url
+function Read-SavedConfig {
+    $saved = Read-Protected 'credentials.dpapi'
+    if ($null -eq $saved) { return $null }
+    $saved.apiRoot = Assert-CloudRoot $saved.apiRoot
+    if ((Get-Field $saved 'relayId') -isnot [string] -or [string]::IsNullOrEmpty($saved.relayId) -or
+        (Get-Field $saved 'credential') -isnot [string] -or [string]::IsNullOrEmpty($saved.credential) -or
+        (Get-Field $saved 'lightBurnSecret') -isnot [string]) { throw 'Local relay credentials are incomplete.' }
+    return $saved
 }
 
 function Show-PendingPairings($Pairings) {
@@ -792,91 +688,9 @@ function Show-PendingPairings($Pairings) {
         if ($id -isnot [string] -or $id -notmatch '^[A-Za-z0-9_-]{1,128}$' -or
             $phrase -isnot [string] -or $phrase -notmatch '^[A-Za-z0-9 -]{1,120}$') { throw 'Invalid browser approval request.' }
         $next[$id] = $phrase
-        if (-not $script:PendingPairings.ContainsKey($id)) {
-            Write-Host ("Browser asks to pair: " + $id + " / phrase: " + $phrase)
-            Write-Host ("Compare the phrase on your browser; type approve " + $id + " or reject " + $id)
-        }
     }
     $script:PendingPairings = $next
-}
-
-function Invoke-ConsoleCommand([string]$Command) {
-    $parts = $Command.Trim() -split '\s+', 2
-    $argument = ''
-    if ($parts.Count -gt 1) { $argument = $parts[1] }
-    switch ($parts[0].ToLowerInvariant()) {
-        'help' { Write-Host 'Commands: pair | open | approve ID | reject ID | browsers | revoke ID | slow-http (explicit >=5s fallback) | socket | forget-lightburn | forget-relay | quit' }
-        'slow-http' { Set-RapTransport $true }
-        'socket' { Set-RapTransport $false }
-        'pair' { Show-PairingUrl }
-        'open' {
-            if (-not (Get-Variable PairingUrl -Scope Script -ErrorAction SilentlyContinue)) { throw 'Create an invitation with pair first.' }
-            Start-Process $script:PairingUrl
-        }
-        { $_ -in @('approve', 'reject') } {
-            if (-not $script:PendingPairings.ContainsKey($argument)) { throw 'No matching pending pairing. Refresh and compare its phrase first.' }
-            $decision = @{ pairingId = $argument; approve = ($parts[0].ToLowerInvariant() -eq 'approve') }
-            if ($decision.approve) {
-                $ids = Get-ApprovedBrowserIds
-                if ($ids.Count -gt 0) {
-                    if ((Read-Host 'Replace the paired browser? Its access will end; finish or resolve imports first. Type REPLACE to confirm') -cne 'REPLACE') {
-                        Write-Host 'Replacement cancelled; existing browser remains paired.'
-                        return
-                    }
-                    $decision.replaceBrowserIds = $ids
-                }
-            }
-            $null = Invoke-Cloud '/pairing/decide' $decision
-            $script:PendingPairings.Remove($argument)
-            Write-Host 'Pairing decision sent.'
-        }
-        'browsers' {
-            $result = Invoke-Cloud '/browsers' -Body $null -Method 'GET'
-            if (-not (Test-Field $result 'browsers') -or (Get-Field $result 'browsers') -isnot [array]) { throw 'Cloud returned no valid browser list.' }
-            foreach ($browser in @((Get-Field $result 'browsers'))) {
-                $id = Get-Field $browser 'id'
-                if ($id -isnot [string] -or $id -notmatch '^[A-Za-z0-9_-]{1,128}$') { throw 'Invalid browser list.' }
-                Write-Host ('Browser: ' + $id)
-            }
-        }
-        'revoke' {
-            if ($argument -notmatch '^[A-Za-z0-9_-]{1,128}$') { throw 'Supply a browser ID from browsers.' }
-            $null = Invoke-Cloud '/browsers/revoke' @{ browserId = $argument }
-            Write-Host 'Browser revocation sent.'
-        }
-        'forget-lightburn' {
-            $script:Config.lightBurnSecret = ''
-            Write-Protected 'credentials.dpapi' $script:Config
-            Write-Host 'Local LightBurn secret forgotten. Revoke PathPlotter RAP in LightBurn Manage API Security; restart to explicitly pair again.'
-            $script:StopRequested = $true
-        }
-        'forget-relay' {
-            [IO.File]::Delete((Join-Path $script:DataDirectory 'credentials.dpapi'))
-            Write-Host 'Local credentials removed; journal preserved. Ask the relay operator to revoke the old agent credential. LightBurn security entry must be revoked in its UI.'
-            $script:StopRequested = $true
-        }
-        'quit' { $script:StopRequested = $true }
-        '' { }
-        default { Write-Host 'Unknown command; type help.' }
-    }
-}
-
-function Read-ConsoleCommand {
-    if ([Console]::IsInputRedirected) { return }
-    while ([Console]::KeyAvailable) {
-        $key = [Console]::ReadKey($true)
-        if ($key.Key -eq [ConsoleKey]::Enter) {
-            Write-Host ''
-            $command = $script:CommandBuffer
-            $script:CommandBuffer = ''
-            try { Invoke-ConsoleCommand $command } catch { Write-Host 'Command failed. Cloud/network authorization or input invalid; no automatic approval/revocation retry.' }
-        } elseif ($key.Key -eq [ConsoleKey]::Backspace) {
-            if ($script:CommandBuffer.Length -gt 0) { $script:CommandBuffer = $script:CommandBuffer.Substring(0, $script:CommandBuffer.Length - 1); [Console]::Write("`b `b") }
-        } elseif (-not [char]::IsControl($key.KeyChar) -and $script:CommandBuffer.Length -lt 256) {
-            $script:CommandBuffer += $key.KeyChar
-            [Console]::Write($key.KeyChar)
-        }
-    }
+    Publish-RapPairings ([hashtable]$next.Clone())
 }
 
 function Start-Rap {
@@ -893,7 +707,6 @@ function Start-Rap {
         $script:Generation = $null
         $script:ServerTime = $null
         $script:ClockUncertainty = $null
-        Write-Host 'RAP running. Browser Send authorizes SVG import only, never laser start/jog/fire. Type help for commands; Ctrl+C or quit stops.'
         $backoff = 500
         $lastHealth = ''
         $nextRead = 0L
@@ -909,7 +722,7 @@ function Start-Rap {
         $script:ForcePublish = $true
         $script:PreviewActive = $false
         while (-not $script:StopRequested) {
-            Read-ConsoleCommand
+            Read-UiCommand
             Update-Import
             if ($script:StopRequested) { break }
             $now = $script:Clock.ElapsedMilliseconds
@@ -923,7 +736,8 @@ function Start-Rap {
             try {
                 if ($null -eq $script:Generation -and $now -ge $nextConnect) {
                     $requestTick = $script:Clock.ElapsedMilliseconds
-                    $start = Invoke-Cloud '/agent/start'
+                    $start = Invoke-Cloud '/agent/start' @{ version = $script:RapVersion }
+                    $script:UpdateRequired = $false
                     Set-ClockCalibration $start $requestTick
                     $generation = Get-Field $start 'generation'
                     if (-not (Test-Number $generation) -or $generation -lt 1 -or [Math]::Floor($generation) -ne $generation) { throw 'Invalid cloud generation.' }
@@ -933,45 +747,28 @@ function Start-Rap {
                     $script:OutstandingUpdates.Clear()
                     $script:CaptureIds.Clear()
                     $nextPush = 0L
-                    if (-not $script:SlowHttp) { $script:Socket = New-AgentSocket }
+                    $script:Socket = New-AgentSocket
                 }
                 if ($null -ne $script:Generation) {
-                    if (-not $script:SlowHttp) {
-                        if ($script:Socket.IsFinished) { throw $script:Socket.Failure }
-                        Receive-AgentMessages
-                        foreach ($id in @($script:OutstandingUpdates.Keys)) {
-                            if ($script:Clock.ElapsedMilliseconds - $script:OutstandingUpdates[$id].tick -gt 5000) { throw 'Socket update acknowledgment timed out.' }
-                        }
+                    if ($script:Socket.IsFinished) { throw $script:Socket.Failure }
+                    Receive-AgentMessages
+                    foreach ($id in @($script:OutstandingUpdates.Keys)) {
+                        if ($script:Clock.ElapsedMilliseconds - $script:OutstandingUpdates[$id].tick -gt 5000) { throw 'Socket update acknowledgment timed out.' }
                     }
                     $now = $script:Clock.ElapsedMilliseconds
                     $settled = $observation.connected -and $sameReadings -ge 3
-                    $due = $script:SlowHttp -or $script:ForcePublish -or $now - $lastPush -ge 15000 -or
+                    $due = $script:ForcePublish -or $now - $lastPush -ge 15000 -or
                         ($script:PreviewActive -and ($signature -cne $publishedSignature -or $settled -ne $publishedSettled))
-                    if ($due -and $now -ge $nextPush -and ($script:SlowHttp -or $script:Socket.IsOpen)) {
+                    if ($due -and $now -ge $nextPush -and $script:Socket.IsOpen) {
                         $script:Sequence++
                         $body = New-ObservationUpdate $observation
                         $body.settled = [bool]$settled
                         $requestTick = $script:Clock.ElapsedMilliseconds
                         $script:ForcePublish = $false
-                        if ($script:SlowHttp) {
-                            # Set the deadline before HTTP so even failures cannot accelerate polling.
-                            $nextPush = $requestTick + 5000
-                            $result = Invoke-Cloud '/agent/update' $body
-                            Set-ClockCalibration $result $requestTick
-                            Publish-ObservationHealth $observation $body
-                            Invoke-AgentWork $result
-                            foreach ($capture in @((Get-Field $result 'captures'))) {
-                                if ($null -eq $capture) { continue }
-                                $parsed = [Guid]::Empty
-                                if ($capture -isnot [string] -or -not [Guid]::TryParse($capture, [ref]$parsed)) { throw 'Invalid fallback capture ID.' }
-                                $null = Invoke-Cloud ('/agent/capture/' + $capture) (New-FreshCapture)
-                            }
-                        } else {
-                            $id = [Guid]::NewGuid().ToString()
-                            $script:OutstandingUpdates[$id] = @{ tick = $requestTick; observation = $observation; body = $body }
-                            Send-AgentMessage 'update' $id $body
-                            $nextPush = $requestTick + 500
-                        }
+                        $id = [Guid]::NewGuid().ToString()
+                        $script:OutstandingUpdates[$id] = @{ tick = $requestTick; observation = $observation; body = $body }
+                        Send-AgentMessage 'update' $id $body
+                        $nextPush = $requestTick + 500
                         $lastPush = $requestTick
                         $publishedSignature = $signature
                         $publishedSettled = $settled
@@ -984,6 +781,7 @@ function Start-Rap {
                     }
                 }
             } catch {
+                $updateRequired = $_.Exception.Message -ceq 'RAP_UPDATE_REQUIRED'
                 # Failed cloud publications never preserve a visible live snapshot locally.
                 $script:Generation = $null
                 $script:ServerTime = $null
@@ -991,10 +789,15 @@ function Start-Rap {
                 $script:PendingPairings = @{}
                 if ($null -ne $script:Socket) { $script:Socket.Dispose(); $script:Socket = $null }
                 Stop-Import
-                $health = 'Cloud disconnected, unauthorized, fenced, or invalid response. Fresh samples withheld; reconnecting. Slow HTTP fallback requires explicit opt-in.'
+                $health = 'Relay disconnected. Coordinates paused; reconnecting.'
+                if ($updateRequired) {
+                    $script:UpdateRequired = $true
+                    $health = 'This RAP version is too old for the relay. Click Update now.'
+                    $backoff = 30000
+                }
                 Publish-RapHealth $health $false
                 if ($lastHealth -ne $health) { Write-Host $health; $lastHealth = $health }
-                $nextConnect = $script:Clock.ElapsedMilliseconds + [Math]::Max($backoff, $(if ($script:SlowHttp) { 5000 } else { 0 }))
+                $nextConnect = $script:Clock.ElapsedMilliseconds + $backoff
                 $backoff = [Math]::Min(30000, $backoff * 2)
             }
             Start-Sleep -Milliseconds 25
@@ -1002,19 +805,7 @@ function Start-Rap {
     } finally {
         try { Stop-Import } finally {
             if ($null -ne $script:Socket) { $script:Socket.Dispose(); $script:Socket = $null }
-            if ($script:SlowHttp -and $null -ne $script:Generation -and $null -ne $script:Config -and -not [string]::IsNullOrEmpty($script:Config.credential) -and
-                $script:Clock.ElapsedMilliseconds - $lastPush -ge 5000) {
-                try {
-                    $script:Sequence++
-                    $null = Invoke-Cloud '/agent/update' @{ generation = $script:Generation; sequence = $script:Sequence; connected = $false; position = $null; context = $null; observationAgeMs = 0; observedAtServer = $null; clockUncertaintyMs = $null; error = 'RAP stopped.' }
-                } catch { }
-            }
             if ($null -ne $lock) { $lock.Dispose() }
         }
     }
-}
-
-if (-not $LibraryOnly) {
-    try { Start-Rap }
-    catch { Write-Host 'RAP could not start. Check HTTPS registration, local consent/API access, DPAPI state, and script policy. No secrets or raw server errors are printed.'; exit 1 }
 }
