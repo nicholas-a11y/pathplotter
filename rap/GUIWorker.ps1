@@ -252,7 +252,7 @@ function Invoke-UiCommand($Command) {
         'forget-lightburn' {
             $script:Config.lightBurnSecret = ''
             Write-Protected 'credentials.dpapi' $script:Config
-            Send-Ui 'notice' 'Local LightBurn permission forgotten. Also revoke PathPlotter RAP in LightBurn Manage API Security. Quit and restart to request permission again.'
+            Send-Ui 'notice' 'Local LightBurn permission forgotten. Also revoke PathPlotter RAP in LightBurn Manage API Security. Quit and restart RAP, then click Request local LightBurn permission to grant it again.'
             $script:StopRequested = $true
         }
         'forget-relay' {

@@ -14,7 +14,7 @@ RAP uses the built-in Windows PowerShell 5.1 and .NET Framework. It needs no ins
 6. RAP connects to the relay and opens PathPlotter in your default browser, so the browser is paired straight away. LightBurn does not need to be running yet.
 7. Click **Request local LightBurn permission**, bring LightBurn to the front and approve its dialog within 30 seconds. This is only needed once, and only before you capture points. Until LightBurn is ready, RAP and PathPlotter say "LightBurn not ready" and capture stays disabled.
 
-**Advanced connection settings** (a checkbox in the RAP window) shows the relay address, the computer name and the **Paired browser** list. Most people never need it.
+**Advanced connection settings** (a checkbox in the RAP window) shows the relay address and computer name while registering, and afterwards the **Paired browser** list for revoking a browser. Most people never need it.
 
 ## Everyday use
 

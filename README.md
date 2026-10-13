@@ -39,8 +39,8 @@ Keep LightBurn's **Allow API Access From Network** setting **off**.
 2. In LightBurn enable **REST API** in **Settings > Extensions**.
 3. Double-click **Start RAP.cmd**.
 4. Paste your **Invitation ID** and click **Register this computer**.
-5. Click **Request local LightBurn permission**, bring LightBurn to the front and approve within 30 seconds.
-6. RAP opens PathPlotter in your browser and connects automatically.
+5. RAP connects to the relay and opens PathPlotter in your browser, which pairs automatically. LightBurn does not need to be ready yet.
+6. Before capturing, connect your machine in LightBurn, click **Request local LightBurn permission** in RAP, bring LightBurn to the front and approve within 30 seconds. This is needed once. Until LightBurn is ready, PathPlotter shows **LightBurn not ready** and capture stays disabled.
 
 Later, start RAP and click **Open PathPlotter**. A browser that was paired before can also use **Connection > Reconnect**.
 
