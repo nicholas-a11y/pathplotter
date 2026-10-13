@@ -1351,7 +1351,7 @@ function renderAll(): void {
   renderPlot()
 }
 
-const LIGHTBURN_NOT_READY_HINT = 'RAP is connected, but LightBurn is not ready. Open LightBurn with its REST API on and a machine connected, and grant RAP permission in the RAP window.'
+const LIGHTBURN_NOT_READY_HINT = 'RAP is connected, but cannot read LightBurn yet. Check the reason shown in the RAP window: LightBurn must be running with its REST API on, RAP must have permission, and a machine must be connected in LightBurn (Devices/Laser window).'
 // RAP can pair a browser before it can read LightBurn; capture waits for a workspace context.
 function lightBurnNotReady(): boolean {
   return relay?.isOnline() === true && relay.hasReportedState && !relay.snapshot?.context
