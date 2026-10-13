@@ -5,7 +5,8 @@ $onlyWorkerFunctions = [bool]$LibraryOnly
 . (Join-Path $PSScriptRoot 'RAP.ps1') -DataDirectory $DataDirectory
 . (Join-Path $PSScriptRoot 'Updater.ps1')
 $script:UiBridge = $Bridge
-$script:Healthy = $false
+$script:CloudReady = $false
+$script:ConsentJob = $null
 $script:AutoOpened = $false
 $script:HostedApp = 'https://nicholas-a11y.github.io/pathplotter/'
 $script:LatestRelease = $null
@@ -53,21 +54,96 @@ function Initialize-Config {
             Send-Ui 'notice' 'Registration failed. Check the Invitation ID (it may be used up, revoked or expired) and your internet connection, then try again.'
         } finally { $command.invitation = $null; $invitation = $null }
     }
-    while ([string]::IsNullOrEmpty($script:Config.lightBurnSecret)) {
-        Send-Ui 'consent'
-        $null = Wait-Ui 'consent'
-        try {
-            $pair = Invoke-Http ($script:LightBurnRoot + '/api/connect') 'POST' '' @{ application_name = 'PathPlotter RAP'; capabilities = @('state', 'project', 'upload') } -TimeoutMs 35000
-            if ((Get-Field $pair 'status') -cne 'ok' -or (Get-Field $pair 'secret') -isnot [string] -or [string]::IsNullOrEmpty($pair.secret)) { throw 'LightBurn consent denied.' }
-            $script:Config.lightBurnSecret = $pair.secret
-            Write-Protected 'credentials.dpapi' $script:Config
-        } catch { Send-Ui 'notice' 'LightBurn did not grant access. Enable its local REST API, keep network API access disabled, bring LightBurn forward and approve its dialog within 30 seconds. Retry only with consent.' }
-    }
+    # LightBurn permission is optional here: the relay session (and browser pairing)
+    # starts without it, and the user grants it later with the Request permission button.
+    if ([string]::IsNullOrEmpty($script:Config.lightBurnSecret)) { Send-Ui 'consent' }
     Send-Ui 'configured'
 }
 
+# Seams for the non-blocking LightBurn consent request (replaced by the GUI test fixture).
+function Start-LightBurnConnect {
+    $request = [Net.HttpWebRequest]::Create($script:LightBurnRoot + '/api/connect')
+    $request.Method = 'POST'
+    $request.AllowAutoRedirect = $false
+    $request.Proxy = $null
+    $request.Timeout = 35000
+    $request.ReadWriteTimeout = 35000
+    $request.ContentType = 'application/json'
+    $bytes = $script:Utf8.GetBytes((@{ application_name = 'PathPlotter RAP'; capabilities = @('state', 'project', 'upload') } | ConvertTo-Json -Compress))
+    $request.ContentLength = $bytes.Length
+    $deadline = New-Object PathPlotterRap.RequestDeadline($request, 35000)
+    try {
+        $stream = $request.GetRequestStream()
+        try { $stream.Write($bytes, 0, $bytes.Length) } finally { $stream.Dispose() }
+        return @{ request = $request; deadline = $deadline; result = $request.BeginGetResponse($null, $null) }
+    } catch { $deadline.Dispose(); throw }
+}
+
+function Test-LightBurnConnectReady($Job) { return $Job.result.IsCompleted }
+
+function Complete-LightBurnConnect($Job) {
+    $response = $null
+    try {
+        $response = [Net.HttpWebResponse]$Job.request.EndGetResponse($Job.result)
+        if ([int]$response.StatusCode -lt 200 -or [int]$response.StatusCode -ge 300 -or $response.ContentType -notmatch '^application/json(?:;|$)') { throw 'LightBurn consent denied.' }
+        $input = $response.GetResponseStream()
+        $buffer = New-Object byte[] 4096
+        $output = New-Object IO.MemoryStream
+        try {
+            while (($count = $input.Read($buffer, 0, $buffer.Length)) -gt 0) {
+                if ($output.Length + $count -gt 65536) { throw 'LightBurn response exceeded its bound.' }
+                $output.Write($buffer, 0, $count)
+            }
+            return ($script:Utf8.GetString($output.ToArray()) | ConvertFrom-Json)
+        } finally { $input.Dispose(); $output.Dispose() }
+    } finally {
+        if ($null -ne $response) { $response.Close() }
+        $Job.deadline.Dispose()
+    }
+}
+
+function Stop-LightBurnConnect {
+    $job = $script:ConsentJob
+    $script:ConsentJob = $null
+    if ($null -ne $job -and $job.ContainsKey('request')) {
+        try { $job.request.Abort() } catch { }
+        try { $job.deadline.Dispose() } catch { }
+    }
+}
+
+function Start-LightBurnConsent {
+    if ($null -ne $script:ConsentJob) { return }
+    try {
+        $script:ConsentJob = Start-LightBurnConnect
+        Send-Ui 'consent-pending'
+    } catch {
+        $script:ConsentJob = $null
+        Send-Ui 'consent-done' $false
+        Send-Ui 'notice' 'LightBurn did not respond. Open LightBurn, enable its REST API, keep network API access disabled, then try again.'
+    }
+}
+
+function Update-LightBurnConsent {
+    $job = $script:ConsentJob
+    if ($null -eq $job -or -not (Test-LightBurnConnectReady $job)) { return }
+    $script:ConsentJob = $null
+    $granted = $false
+    try {
+        $pair = Complete-LightBurnConnect $job
+        if ((Get-Field $pair 'status') -cne 'ok' -or (Get-Field $pair 'secret') -isnot [string] -or [string]::IsNullOrEmpty($pair.secret)) { throw 'LightBurn consent denied.' }
+        $script:Config.lightBurnSecret = $pair.secret
+        Write-Protected 'credentials.dpapi' $script:Config
+        $granted = $true
+    } catch {
+        Send-Ui 'notice' 'LightBurn did not grant access. Enable its local REST API, keep network API access disabled, bring LightBurn forward and approve its dialog within 30 seconds. Retry only with consent.'
+    }
+    $pair = $null
+    Send-Ui 'consent-done' $granted
+    if ($granted) { $script:ForcePublish = $true }
+}
+
 function Get-DesktopLaunchUrl($ReplacementIds = $null) {
-    if (-not $script:Healthy) { throw 'Wait for a healthy connection.' }
+    if (-not $script:CloudReady) { throw 'Wait for the relay connection.' }
     $body = @{}
     if ($null -ne $ReplacementIds) { $body.replaceBrowserIds = @($ReplacementIds) }
     $launch = Invoke-Cloud '/agent/browser-launch' $body
@@ -78,10 +154,10 @@ function Get-DesktopLaunchUrl($ReplacementIds = $null) {
         '&relayId=' + [Uri]::EscapeDataString($script:Config.relayId) + '&launch=' + [Uri]::EscapeDataString($token)
 }
 
-function Publish-RapHealth([string]$Message, [bool]$Connected) {
-    $script:Healthy = $Connected
-    Send-Ui 'health' @{ message = $Message; connected = $Connected; importing = ($null -ne $script:ActiveImport) }
-    if ($Connected -and -not $script:AutoOpened -and -not $Bridge.StopRequested) {
+function Publish-RapHealth([string]$Message, [bool]$Connected, [bool]$CloudReady = $Connected) {
+    $script:CloudReady = $CloudReady
+    Send-Ui 'health' @{ message = $Message; connected = $Connected; cloud = $CloudReady; importing = ($null -ne $script:ActiveImport) }
+    if ($CloudReady -and -not $script:AutoOpened -and -not $Bridge.StopRequested) {
         # One attempt per normal launch, never on a reconnect or ordinary invitation.
         $script:AutoOpened = $true
         try {
@@ -124,7 +200,7 @@ function Invoke-UiCommand($Command) {
             Send-Ui 'desktop' (Get-DesktopLaunchUrl $Command.replaceBrowserIds)
         }
         'phone' {
-            if (-not $script:Healthy) { throw 'Wait for a healthy connection.' }
+            if (-not $script:CloudReady) { throw 'Wait for the relay connection.' }
             $pair = Invoke-Cloud '/agent/pairing/new'
             $token = Get-Field $pair 'invitation'
             $expiry = Convert-Time (Get-Field $pair 'expiresAt')
@@ -184,6 +260,7 @@ function Invoke-UiCommand($Command) {
             Send-Ui 'notice' 'Local credentials removed; import journal preserved. Ask the operator to revoke the old relay credential and revoke the LightBurn permission. Quit and restart to register.'
             $script:StopRequested = $true
         }
+        'consent' { Start-LightBurnConsent }
         'check-update' { Update-RapReleaseInfo -Explicit }
         'update' {
             if ($null -ne $script:ActiveImport) { Send-Ui 'notice' 'Wait for the current import to finish, then click Update now again.'; return }
@@ -205,6 +282,7 @@ function Read-UiCommand {
         $script:AnnouncedUpdateRequired = $script:UpdateRequired
         Update-RapReleaseInfo
     }
+    Update-LightBurnConsent
     # One action per cycle; protocol/import processing cannot be starved by clicks.
     $command = $null
     if ($Bridge.Commands.TryDequeue([ref]$command)) {
@@ -227,4 +305,4 @@ if ($onlyWorkerFunctions) { return }
 Send-RapVersion
 try { Start-Rap }
 catch { Send-Ui 'fatal' 'RAP could not start. Check registration, local permissions, protected state and the instance lock. Do not delete the import journal to retry imports.' }
-finally { Send-Ui 'stopped' }
+finally { Stop-LightBurnConnect; Send-Ui 'stopped' }

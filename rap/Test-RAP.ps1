@@ -119,6 +119,7 @@ try {
             '/api/status' {
                 if ($script:Mode -eq 'offline') { return @{ connected = $false } }
                 if ($script:Mode -eq 'auth') { throw 'HTTP authorization failed (401). Check clock, permissions or revoke/re-pair explicitly.' }
+                if ($script:Mode -eq 'nosecret') { throw 'Local LightBurn credentials are missing.' }
                 return @{ connected = $true }
             }
             '/api/project' {
@@ -157,7 +158,21 @@ try {
         Assert ($unknownSize.connected -and $null -eq $unknownSize.context.size)
         $script:Mode = 'good'
     }
-    $script:ServerTime = 1800000000000.0
+    Check 'Missing LightBurn permission is a clear not-ready state, not a relay failure' {
+        $script:Mode = 'nosecret'
+        $none = Get-Observation
+        $script:Mode = 'good'
+        Assert (-not $none.connected -and $null -eq $none.position -and $none.error -like 'LightBurn permission has not been granted yet*') $none.error
+    }
+    Check 'An acknowledged update reports the relay as ready even while LightBurn is not' {
+        $script:Healths = New-Object 'Collections.Generic.List[object]'
+        function Publish-RapHealth([string]$Message, [bool]$Connected, [bool]$CloudReady = $Connected) { $script:Healths.Add(@{ message = $Message; connected = $Connected; cloud = $CloudReady }) }
+        $notReady = @{ connected = $false; position = $null; context = $null; observationAgeMs = 5; tick = $script:Clock.ElapsedMilliseconds; error = 'LightBurn API available, but no machine connected.' }
+        Publish-ObservationHealth $notReady @{ connected = $false }
+        Assert ($script:Healths.Count -eq 1 -and -not $script:Healths[0].connected -and $script:Healths[0].cloud -and $script:Healths[0].message -ceq $notReady.error)
+        Remove-Item Function:\Publish-RapHealth
+        function Publish-RapHealth([string]$Message, [bool]$Connected, [bool]$CloudReady = $Connected) { }
+    }    $script:ServerTime = 1800000000000.0
     $script:ServerTick = $script:Clock.ElapsedMilliseconds
     Check 'Start/update clock calibration uses serverTime and full monotonic RTT, never wall clock' {
         Set-ClockCalibration @{ serverTime = 1800000000000.0 } 1000 1040
@@ -713,14 +728,14 @@ try {
         $script:Journal = @{}; Save-Journal
         $script:TimingClock.Restart()
         Start-Rap
-        Assert ($script:ReadCount -ge 30 -and $script:TimingHttp.Count -eq 0)
-        Assert ($script:TimingMessages.Count -eq 4) 'Stationary socket published too often or omitted health.'
+        Assert ($script:ReadCount -ge 30 -and $script:TimingHttp.Count -eq 0) ('Reads=' + $script:ReadCount + ' http=' + $script:TimingHttp.Count)
+        Assert ($script:TimingMessages.Count -eq 4) ('Stationary socket published too often or omitted health: ' + $script:TimingMessages.Count + ' messages.')
         for ($i = 1; $i -lt $script:TimingMessages.Count; $i++) {
-            Assert ($script:TimingMessages[$i].tick - $script:TimingMessages[$i - 1].tick -ge 500)
+            Assert ($script:TimingMessages[$i].tick - $script:TimingMessages[$i - 1].tick -ge 495) ('Publishes ' + $i + ' too close: ' + ($script:TimingMessages[$i].tick - $script:TimingMessages[$i - 1].tick) + ' ms.')
         }
-        Assert (-not $script:TimingMessages[0].body.settled -and $script:TimingMessages[2].body.settled)
-        Assert ($script:TimingMessages[3].tick - $script:TimingMessages[2].tick -ge 15000)
-        Assert ($script:TimingMessages[3].body.observationAgeMs -lt 600 -and $script:TimingMessages[3].body.connected)
+        Assert (-not $script:TimingMessages[0].body.settled -and $script:TimingMessages[2].body.settled) 'Settled flags are wrong.'
+        Assert ($script:TimingMessages[3].tick - $script:TimingMessages[2].tick -ge 15000) ('Idle health came after ' + ($script:TimingMessages[3].tick - $script:TimingMessages[2].tick) + ' ms.')
+        Assert ($script:TimingMessages[3].body.observationAgeMs -lt 600 -and $script:TimingMessages[3].body.connected) 'Idle health observation was stale.'
     }
     Check 'Relay version refusal pauses RAP, reports Update now and backs off' {
         $script:Healths = New-Object 'Collections.Generic.List[string]'

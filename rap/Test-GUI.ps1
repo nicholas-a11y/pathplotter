@@ -129,6 +129,44 @@ try {
     Invoke-UiCommand @{ action = 'decide-replace'; id = 'replacement-phone'; phrase = 'EXACT SWITCH'; approve = $true; replaceBrowserIds = $script:ApprovedBrowserIds }
     if ($script:WireCalls[$script:WireCalls.Count - 1].body.replaceBrowserIds[0] -cne $script:ApprovedBrowserIds[0]) { throw 'Phone switch omitted replacement IDs.' }
     Write-Host 'PASS one-browser GUI protocol: restart preserves existing pairing, explicit desktop/phone replacement confirmation and exact identity fencing.'
+    # Browser pairing needs only the relay session; LightBurn readiness is independent.
+    $script:AutoOpened = $false; $script:ApprovedBrowserIds = @(); $script:WireCalls.Clear(); $script:CloudReady = $false
+    Publish-RapHealth 'LightBurn not listening' $false $false
+    if ($script:WireCalls.Count -ne 0 -or $script:CloudReady) { throw 'Pairing was available without a relay session.' }
+    $rejected = $false
+    try { Invoke-UiCommand @{ action = 'phone' } } catch { $rejected = $true }
+    if (-not $rejected) { throw 'Phone pairing was allowed without a relay session.' }
+    Publish-RapHealth 'LightBurn not listening' $false $true
+    if (-not $script:CloudReady -or $script:WireCalls.Count -ne 2 -or $script:WireCalls[1].path -cne '/agent/browser-launch') { throw 'A relay session without LightBurn did not allow desktop pairing.' }
+    Invoke-UiCommand @{ action = 'phone' }
+    if ($script:WireCalls[$script:WireCalls.Count - 1].path -cne '/agent/pairing/new') { throw 'A relay session without LightBurn did not allow phone pairing.' }
+    $ev = $null; $health = $null; function Clear-Events { $drop = $null; while ($bridge.Events.TryDequeue([ref]$drop)) { } }; function Read-Events { $items = @(); $item = $null; while ($bridge.Events.TryDequeue([ref]$item)) { $items += ,$item }; return ,$items }
+    Clear-Events
+    Publish-RapHealth 'LightBurn not listening' $false $true
+    foreach ($ev in (Read-Events)) { if ($ev.kind -ceq 'health') { $health = $ev.value } }
+    if ($health.connected -or -not $health.cloud) { throw 'Health event did not report relay ready and LightBurn not ready separately.' }
+    Write-Host 'PASS relay session pairs browsers while LightBurn is not ready; the LightBurn state is reported separately.'
+    # LightBurn permission is requested without blocking and is stored only when granted.
+    Initialize-Storage
+    $script:Config = @{ apiRoot = 'https://fixture.invalid'; relayId = 'fixture-relay'; credential = 'fixture-only'; lightBurnSecret = '' }
+    $script:ConsentAnswer = @{ status = 'denied' }
+    function Start-LightBurnConnect { return @{ ready = $true } }
+    function Test-LightBurnConnectReady($Job) { return $Job.ready }
+    function Complete-LightBurnConnect($Job) { return $script:ConsentAnswer }
+    Clear-Events
+    Start-LightBurnConsent
+    Start-LightBurnConsent
+    Update-LightBurnConsent
+    $kinds = @(foreach ($ev in (Read-Events)) { [string]$ev.kind + ':' + $ev.value })
+    if (($kinds -join ',') -cne 'consent-pending:,notice:LightBurn did not grant access. Enable its local REST API, keep network API access disabled, bring LightBurn forward and approve its dialog within 30 seconds. Retry only with consent.,consent-done:False' -or $script:Config.lightBurnSecret -ne '') { throw 'Denied LightBurn consent was stored or not reported: ' + ($kinds -join ',') }
+    $script:ConsentAnswer = @{ status = 'ok'; secret = 'fixture-granted' }
+    Start-LightBurnConsent
+    Update-LightBurnConsent
+    $kinds = @(foreach ($ev in (Read-Events)) { [string]$ev.kind + ':' + $ev.value })
+    if (($kinds -join ',') -cne 'consent-pending:,consent-done:True' -or $script:Config.lightBurnSecret -cne 'fixture-granted' -or (Read-SavedConfig).lightBurnSecret -cne 'fixture-granted') { throw 'Granted LightBurn consent was not stored: ' + ($kinds -join ',') }
+    $script:Config.lightBurnSecret = ''
+    [IO.File]::Delete((Join-Path $state 'credentials.dpapi'))
+    Write-Host 'PASS LightBurn permission is a non-blocking request, ignores duplicate clicks, stores only a granted secret and reports denial.'
     & (Join-Path $PSScriptRoot 'GUI.ps1') -SmokeTest -DataDirectory $state
     $lock = New-Object IO.FileStream((Join-Path $state 'instance.lock'), 'OpenOrCreate', 'ReadWrite', 'None')
     $lock.Dispose()

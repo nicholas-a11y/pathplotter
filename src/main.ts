@@ -567,7 +567,7 @@ function relayChanged(): void {
   }
   livePosition = fresh && snapshot?.position ? { ...snapshot.position } : null
   workspaceSize = snapshot?.context?.size ?? null
-  connectionStateEl.textContent = fresh ? 'Ready to capture' : relay?.isOnline() ? 'Read-only · Take control' : 'Capture unavailable'
+  connectionStateEl.textContent = fresh ? 'Ready to capture' : relay?.isOnline() ? (lightBurnNotReady() ? 'LightBurn not ready' : 'Read-only · Take control') : 'Capture unavailable'
   connectionStateEl.classList.toggle('ok', fresh)
   updateDro(snapshot?.position ?? null, fresh)
   if (relay?.controlError) must<HTMLElement>('relayMessage').textContent = relay.controlError
@@ -680,7 +680,8 @@ async function takeCaptureControl(): Promise<boolean> {
     if (sessionEnded) throw new Error('Session ended. Use Connection > Reconnect.')
     if (!relay) throw new Error('Pair with RAP first.')
     if (relay.activeBrowser && relay.canCapture()) { setStatus('Already paired and ready to capture.'); return true }
-    if (!relay.isOnline() || !relay.snapshot?.context) throw new Error('RAP is offline or its workspace is unavailable. Check LightBurn and RAP, then click Reconnect.')
+    if (!relay.isOnline()) throw new Error('RAP is offline. Check that RAP is running, then click Reconnect.')
+    if (!relay.snapshot?.context) throw new Error(LIGHTBURN_NOT_READY_HINT + ' This browser takes capture control automatically once LightBurn is ready.')
     if (uploadInFlight || liveDispatching || liveRecoveryInFlight) throw new Error('Wait for the import result before requesting control.')
     const takeover = relay.controlOccupied
     if (takeover && !window.confirm('Take capture control from the other browser? Its capture stops; pending or unresolved imports must be reconciled first.')) return false
@@ -1350,11 +1351,18 @@ function renderAll(): void {
   renderPlot()
 }
 
+const LIGHTBURN_NOT_READY_HINT = 'RAP is connected, but LightBurn is not ready. Open LightBurn with its REST API on and a machine connected, and grant RAP permission in the RAP window.'
+// RAP can pair a browser before it can read LightBurn; capture waits for a workspace context.
+function lightBurnNotReady(): boolean {
+  return relay?.isOnline() === true && relay.hasReportedState && !relay.snapshot?.context
+}
+
 function captureBlockReason(): { label: string; hint: string } | null {  if (handoverPending || handoverStopping) return { label: 'Transferring live control', hint: 'Wait for the current operation and safe tab handover to finish.' }
   if (otherTabOwnsLive) return { label: 'Another tab owns Live update', hint: 'Click Take control or enable Live update here to request a safe transfer.' }
   if (requestInFlight || (uploadInFlight && !liveDispatching) || liveRecoveryInFlight) return { label: 'Operation in progress', hint: 'Wait for the current capture, import or recovery operation to finish.' }
   if (liveQueue().paused) return { label: 'Live update paused', hint: liveQueue().paused }
   if (relay?.rapUpdateRequired) return { label: 'Update RAP', hint: 'This RAP version is too old for the relay. Open RAP and click Update now.' }
+  if (lightBurnNotReady()) return { label: 'LightBurn not ready', hint: LIGHTBURN_NOT_READY_HINT }
   if (!relay?.canCapture()) return {
     label: relay?.isOnline() ? 'Read-only · Take control' : 'Capture unavailable',
     hint: relay?.error || relay?.controlError || (relay?.isOnline() ? 'Click Take control to capture from this browser.' : 'Waiting for RAP to connect. Click Help if you need to download or start it.'),
@@ -1390,7 +1398,7 @@ function renderControls(): void {
   if (captureBlock) {
     if (blockSince === null) blockSince = performance.now()
     const blockAge = performance.now() - blockSince
-    const isConnectionBlock = captureBlock.label === 'Capture unavailable' || captureBlock.label === 'Read-only · Take control'
+    const isConnectionBlock = captureBlock.label === 'Capture unavailable' || captureBlock.label === 'Read-only · Take control' || captureBlock.label === 'LightBurn not ready'
     if (!isConnectionBlock || blockAge >= CONNECTION_DEBOUNCE_MS) {
       statusTextEl.textContent = captureBlock.hint
       statusTextSince = 0

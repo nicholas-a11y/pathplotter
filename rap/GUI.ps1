@@ -195,22 +195,32 @@ function Handle-UiEvent($Event) {
             Show-RapWindow
         }
         'consent' {
-            $d.busy = $false; $d.setup.Visible = $false; $d.consent.Visible = $true; $d.consent.Enabled = $true
-            $d.status.Text = 'Open LightBurn, enable REST API in Settings > Extensions, keep network API access disabled. Click below, bring LightBurn forward, then approve its own dialog within 30 seconds.'
-            Show-RapWindow
+            # LightBurn permission is optional until capturing; the relay and browser pairing work without it.
+            $d.consentNeeded = $true; $d.consentPending = $false
+            $d.consentHelp.Visible = $true; $d.consent.Visible = $true; $d.consent.Enabled = $true
         }
-        'configured' { $d.configured = $true; $d.busy = $false; $d.setup.Visible = $false; $d.registrationAdvanced.Visible = $false; $d.consent.Visible = $false; $d.status.Text = 'Connecting to LightBurn and relay...' }
+        'consent-pending' { $d.consentPending = $true; $d.consent.Enabled = $false }
+        'consent-done' {
+            $d.consentPending = $false
+            if ($Event.value) { $d.consentNeeded = $false; $d.consentHelp.Visible = $false; $d.consent.Visible = $false }
+            else { $d.consent.Enabled = $true }
+        }
+        'configured' { $d.configured = $true; $d.busy = $false; $d.setup.Visible = $false; $d.registrationAdvanced.Visible = $false; $d.status.Text = 'Connecting to the relay...' }
         'recovery' {
             $d.busy = $false; $d.recovery.Visible = $true
             $d.status.Text = 'Saved registration is invalid or unreadable. Replace only local credentials with explicit consent below. The import journal is preserved; ask the operator to revoke the old agent credential and revoke the old LightBurn entry.'
             Show-RapWindow
         }
         'health' {
-            $d.healthy = $Event.value.connected
+            # healthy means the relay session is up (enough to pair browsers); lightBurn is the capture-ready state.
+            $d.healthy = [bool]$Event.value.cloud
+            $d.lightBurn = [bool]$Event.value.connected
             $d.importing = [bool]$Event.value.importing
-            $d.status.Text = $(if ($d.healthy) { 'Connected. ' } else { 'Not ready. ' }) + $Event.value.message
+            if ($d.lightBurn) { $d.status.Text = 'Connected. ' + $Event.value.message }
+            elseif ($d.healthy) { $d.status.Text = 'Relay connected: you can open PathPlotter and pair a browser now.' + [Environment]::NewLine + 'LightBurn not ready: ' + $Event.value.message }
+            else { $d.status.Text = 'Not ready. ' + $Event.value.message }
             if ($Event.value.importing) { $d.status.Text += ' Import in progress; never automatically retried.' }
-            $d.tray.Text = 'PathPlotter RAP - ' + $(if ($d.healthy) { 'Connected' } else { 'Not ready' })
+            $d.tray.Text = 'PathPlotter RAP - ' + $(if ($d.lightBurn) { 'Connected' } elseif ($d.healthy) { 'LightBurn not ready' } else { 'Not ready' })
             if (-not $d.healthy) { Show-Approvals @{} }
         }
         'version' {
@@ -253,7 +263,7 @@ function Handle-UiEvent($Event) {
         'fatal' { $d.status.Text = $Event.value; $d.failed = $true; Show-RapWindow }
         'fixture' { $d.fixtureEvents.Add($Event.value) }
         'stopped' {
-            $d.stopped = $true; $d.busy = $false; $d.healthy = $false
+            $d.stopped = $true; $d.busy = $false; $d.healthy = $false; $d.lightBurn = $false
             if ($d.closing) { $d.form.Close() }
             else { $d.status.Text += ' RAP stopped. Quit and restart after correcting the issue.'; Show-RapWindow }
         }
@@ -286,7 +296,7 @@ function Start-RapDesktop {
     }
     $d = @{
         bridge = (New-Object PathPlotterRap.UiBridge); clock = [Diagnostics.Stopwatch]::StartNew()
-        activation = $activation; configured = $false; healthy = $false; busy = $false; closing = $false; stopped = $false; failed = $false
+        activation = $activation; configured = $false; healthy = $false; lightBurn = $false; consentNeeded = $false; consentPending = $false; busy = $false; closing = $false; stopped = $false; failed = $false
         phone = $null; phoneImage = $null; phoneUrl = ''; phoneDeadline = 0L; browsers = $null; switchRequest = $null
         pairings = @{}; pairingSignature = ''; smoke = [bool]$SmokeTest; smokeOpens = 0; smokePhones = 0; smokeStage = 0; smokeConsentTicks = 0
         fixtureEvents = (New-Object 'Collections.Generic.List[string]')
@@ -295,24 +305,34 @@ function Start-RapDesktop {
     $worker = $null; $runspace = $null; $async = $null
     try {
         $d.form = New-Object Windows.Forms.Form
-        $d.form.Text = 'PathPlotter RAP'; $d.form.ClientSize = New-Object Drawing.Size(610, 470)
-        $d.form.StartPosition = 'CenterScreen'; $d.form.MinimumSize = New-Object Drawing.Size(630, 500)
+        # The window sizes itself to its content so no empty space is left below the controls.
+        $d.form.Text = 'PathPlotter RAP'
+        $d.form.StartPosition = 'CenterScreen'
+        $d.form.FormBorderStyle = 'FixedSingle'; $d.form.MaximizeBox = $false
+        $d.form.AutoSize = $true; $d.form.AutoSizeMode = 'GrowAndShrink'
         $layout = New-Object Windows.Forms.FlowLayoutPanel
-        $layout.Dock = 'Fill'; $layout.FlowDirection = 'TopDown'; $layout.WrapContents = $false; $layout.AutoScroll = $true
+        $layout.Dock = 'None'; $layout.Location = New-Object Drawing.Point(0, 0)
+        $layout.AutoSize = $true; $layout.AutoSizeMode = 'GrowAndShrink'
+        $layout.FlowDirection = 'TopDown'; $layout.WrapContents = $false
+        $layout.Padding = New-Object Windows.Forms.Padding(8, 8, 8, 8)
         $d.form.Controls.Add($layout)
         $d.status = New-Object Windows.Forms.Label
-        $d.status.Text = 'Starting RAP...'; $d.status.Size = New-Object Drawing.Size(585, 65); $layout.Controls.Add($d.status)
+        $d.status.Text = 'Starting RAP...'; $d.status.AutoSize = $true; $d.status.MaximumSize = New-Object Drawing.Size(585, 0)
+        $d.status.Margin = New-Object Windows.Forms.Padding(3, 3, 3, 8); $layout.Controls.Add($d.status)
         $d.notice = New-Object Windows.Forms.Label
-        $d.notice.Size = New-Object Drawing.Size(585, 55); $d.notice.ForeColor = [Drawing.Color]::DarkRed; $layout.Controls.Add($d.notice)
+        $d.notice.AutoSize = $true; $d.notice.MaximumSize = New-Object Drawing.Size(585, 0); $d.notice.Visible = $false
+        $d.notice.Margin = New-Object Windows.Forms.Padding(3, 0, 3, 8)
+        $d.notice.ForeColor = [Drawing.Color]::DarkRed; $layout.Controls.Add($d.notice)
+        $d.notice.Add_TextChanged({ param($sender, $eventArgs) $sender.Visible = $sender.Text.Length -gt 0 })
         $actions = New-Object Windows.Forms.FlowLayoutPanel
-        $actions.Size = New-Object Drawing.Size(585, 45); $layout.Controls.Add($actions)
+        $actions.AutoSize = $true; $actions.AutoSizeMode = 'GrowAndShrink'; $layout.Controls.Add($actions)
         $d.open = New-UiButton 'Open PathPlotter' @{ action = 'open' }
         $d.pair = New-UiButton 'Pair phone' @{ action = 'phone' }
         $d.list = New-UiButton 'Paired browser' @{ action = 'browsers' }
         foreach ($button in @($d.open, $d.pair)) { $button.Enabled = $false; $actions.Controls.Add($button) }
         $d.list.Enabled = $false
         $versionRow = New-Object Windows.Forms.FlowLayoutPanel
-        $versionRow.Size = New-Object Drawing.Size(585, 35); $layout.Controls.Add($versionRow)
+        $versionRow.AutoSize = $true; $versionRow.AutoSizeMode = 'GrowAndShrink'; $layout.Controls.Add($versionRow)
         $d.versionLabel = New-Object Windows.Forms.Label
         $d.versionLabel.AutoSize = $true; $d.versionLabel.Margin = New-Object Windows.Forms.Padding(3, 8, 3, 3)
         $d.versionLabel.Text = 'RAP'; $versionRow.Controls.Add($d.versionLabel)
@@ -326,10 +346,10 @@ function Start-RapDesktop {
         })
         $versionRow.Controls.Add($d.update)
         $d.setup = New-Object Windows.Forms.FlowLayoutPanel
-        $d.setup.Size = New-Object Drawing.Size(580, 90); $d.setup.FlowDirection = 'TopDown'; $d.setup.WrapContents = $false; $d.setup.Visible = $false
+        $d.setup.AutoSize = $true; $d.setup.AutoSizeMode = 'GrowAndShrink'; $d.setup.FlowDirection = 'TopDown'; $d.setup.WrapContents = $false; $d.setup.Visible = $false
         $layout.Controls.Add($d.setup)
         $d.registrationAdvanced = New-Object Windows.Forms.FlowLayoutPanel
-        $d.registrationAdvanced.Size = New-Object Drawing.Size(560, 110)
+        $d.registrationAdvanced.AutoSize = $true; $d.registrationAdvanced.AutoSizeMode = 'GrowAndShrink'
         $d.registrationAdvanced.FlowDirection = 'TopDown'; $d.registrationAdvanced.WrapContents = $false
         foreach ($field in @(@('Relay origin', 'api'), @('Computer name', 'name'), @('Invitation ID', 'invitation'))) {
             $parent = $(if ($field[1] -ceq 'invitation') { $d.setup } else { $d.registrationAdvanced })
@@ -362,6 +382,10 @@ function Start-RapDesktop {
         $d.advancedPanel.Controls.Add($d.registrationAdvanced)
         $d.advancedPanel.Controls.Add($d.list)
         $layout.Controls.Add($d.advancedPanel)
+        $d.consentHelp = New-Object Windows.Forms.Label
+        $d.consentHelp.AutoSize = $true; $d.consentHelp.MaximumSize = New-Object Drawing.Size(585, 0); $d.consentHelp.Visible = $false
+        $d.consentHelp.Text = 'To capture points, give RAP permission to read LightBurn. Open LightBurn, enable REST API in Settings > Extensions (keep network API access disabled), click below, bring LightBurn forward, then approve its own dialog within 30 seconds. You can pair a browser first.'
+        $layout.Controls.Add($d.consentHelp)
         $d.consent = New-UiButton 'Request local LightBurn permission (state, project, upload)' @{ action = 'consent' }
         $d.consent.Visible = $false; $layout.Controls.Add($d.consent)
         $d.recovery = New-Object Windows.Forms.Button
@@ -378,7 +402,7 @@ function Start-RapDesktop {
         $layout.Controls.Add($d.approvals)
         $safety = New-Object Windows.Forms.Label
         $safety.Text = 'Send imports SVG only. RAP never jogs, fires or starts the laser. Closing this window keeps RAP in the tray. Choose Quit to stop.'
-        $safety.Size = New-Object Drawing.Size(585, 45); $layout.Controls.Add($safety)
+        $safety.AutoSize = $true; $safety.MaximumSize = New-Object Drawing.Size(585, 0); $layout.Controls.Add($safety)
         $d.tray = New-Object Windows.Forms.NotifyIcon
         $d.tray.Icon = [Drawing.SystemIcons]::Application; $d.tray.Text = 'PathPlotter RAP - Starting'; $d.tray.Visible = $true
         $menu = New-Object Windows.Forms.ContextMenuStrip
@@ -445,7 +469,7 @@ function Start-RapDesktop {
                     else { $s.phoneExpiry.Text = 'Expires in ' + [Math]::Ceiling($remaining / 1000) + ' seconds.' }
                 }
                 if ($s.smoke) {
-                    if ($s.busy -and $s.consent.Visible) { $s.smokeConsentTicks++ }
+                    if ($s.consentPending) { $s.smokeConsentTicks++ }
                     Step-GuiSmoke
                 }
             } catch {
@@ -490,12 +514,18 @@ function Step-GuiSmoke {
                 [void](Submit-Ui @{ action = 'register'; api = 'https://fixture.invalid'; name = 'Fixture PC'; invitation = 'fixture-invitation-id' }); $s.smokeStage = 1
             }
         }
-        1 { if ($s.consent.Visible) { [void](Submit-Ui @{ action = 'consent' }); $s.smokeStage = 2 } }
+        1 {
+            # The relay session starts without LightBurn permission, so browser pairing is available first.
+            if ($s.healthy -and $s.consent.Visible -and $s.consentHelp.Visible -and $s.smokeOpens -eq 1 -and -not $s.busy) {
+                if (-not $s.open.Enabled -or -not $s.pair.Enabled -or $s.fixtureEvents.Contains('consent-denied')) { throw 'Browser pairing was not available before LightBurn permission.' }
+                [void](Submit-Ui @{ action = 'consent' }); $s.smokeStage = 2
+            }
+        }
         2 {
-            if ($s.consent.Visible -and -not $s.busy -and $s.fixtureEvents.Contains('consent-denied')) {
+            if ($s.consent.Visible -and $s.consent.Enabled -and -not $s.consentPending -and -not $s.busy -and $s.fixtureEvents.Contains('consent-denied') -and -not $s.fixtureEvents.Contains('consent-granted')) {
                 [void](Submit-Ui @{ action = 'consent' })
             }
-            if ($s.healthy -and $s.smokeOpens -eq 1 -and -not $s.busy) { [void](Submit-Ui @{ action = 'phone' }); $s.smokeStage = 3 }
+            if ($s.fixtureEvents.Contains('consent-granted') -and -not $s.consent.Visible -and $s.healthy -and -not $s.busy) { [void](Submit-Ui @{ action = 'phone' }); $s.smokeStage = 3 }
         }
         3 {
             if ($s.smokePhones -eq 1 -and $s.pairings.ContainsKey('fixture-pair') -and -not $s.busy) {

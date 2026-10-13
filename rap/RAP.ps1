@@ -53,10 +53,11 @@ function Send-AgentMessage([string]$Type, [string]$Id, $Body) {
 }
 
 function Publish-ObservationHealth($Observation, $Body) {
-    $health = $Observation.error + ' Cloud connected.'
+    $health = [string]$Observation.error
     if ($Observation.connected) { $health = 'LightBurn workpiece/context verified; cloud connected.' }
     $fresh = $Body.connected -and ($Observation.observationAgeMs + $script:Clock.ElapsedMilliseconds - $Observation.tick -le 2000)
-    Publish-RapHealth $health ([bool]$fresh)
+    # The relay acknowledged this update, so browsers can be paired even while LightBurn is not ready.
+    Publish-RapHealth $health ([bool]$fresh) $true
     if ($health -cne $script:LastObservationHealth) { Write-Host $health; $script:LastObservationHealth = $health }
 }
 
@@ -111,7 +112,7 @@ function Get-ObservationSignature($Observation) {
 }
 
 # UI hooks; GUIWorker.ps1 replaces these.
-function Publish-RapHealth([string]$Message, [bool]$Connected) { }
+function Publish-RapHealth([string]$Message, [bool]$Connected, [bool]$CloudReady = $Connected) { }
 function Publish-RapPairings($Pairings) { }
 function Read-UiCommand { }
 function Initialize-Config {
@@ -423,6 +424,7 @@ function Get-Observation {
     } catch {
         $errorText = 'LightBurn returned invalid or unavailable workpiece/context data.'
         if ($_.Exception.Message -eq 'No connected LightBurn machine.') { $errorText = 'LightBurn API available, but no machine connected.' }
+        elseif ($_.Exception.Message -like 'Local LightBurn credentials are missing*') { $errorText = 'LightBurn permission has not been granted yet. Click Request local LightBurn permission.' }
         elseif ($_.Exception.Message -like 'HTTP authorization failed*') { $errorText = 'LightBurn API authorization failed. Check Windows clock and Manage API Security; re-pair only with consent.' }
         elseif ($_.Exception.Message -like 'HTTP network/timeout failure*') { $errorText = 'LightBurn not listening or timed out. Open LightBurn and enable its REST API.' }
         return @{ connected = $false; position = $null; context = $null; observationAgeMs = $timer.ElapsedMilliseconds; tick = $script:Clock.ElapsedMilliseconds; error = $errorText }

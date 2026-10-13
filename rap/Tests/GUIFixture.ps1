@@ -6,14 +6,18 @@ function Invoke-Http([string]$Url, [string]$Method, [string]$Token, $Body = $nul
         Send-Ui 'fixture' 'registered'
         return @{ relayId = 'fixture-relay'; credential = 'fixture-only' }
     }
-    if ($Url -ceq 'http://127.0.0.1:19520/api/connect') {
-        $script:FixtureConsentAttempts++
-        Start-Sleep -Milliseconds 1000
-        if ($script:FixtureConsentAttempts -eq 1) { Send-Ui 'fixture' 'consent-denied'; return @{ status = 'denied' } }
-        Send-Ui 'fixture' 'consent-granted'
-        return @{ status = 'ok'; secret = 'fixture-only' }
-    }
     throw 'Unexpected network call forbidden by GUI fixture.'
+}
+# The real consent request is non-blocking; the fixture completes it after one second.
+function Start-LightBurnConnect {
+    $script:FixtureConsentAttempts++
+    return @{ readyAt = $script:Clock.ElapsedMilliseconds + 1000; attempt = $script:FixtureConsentAttempts }
+}
+function Test-LightBurnConnectReady($Job) { return $script:Clock.ElapsedMilliseconds -ge $Job.readyAt }
+function Complete-LightBurnConnect($Job) {
+    if ($Job.attempt -eq 1) { Send-Ui 'fixture' 'consent-denied'; return @{ status = 'denied' } }
+    Send-Ui 'fixture' 'consent-granted'
+    return @{ status = 'ok'; secret = 'fixture-only' }
 }
 $script:FixturePairRejected = $false
 function Invoke-Cloud([string]$Path, $Body = @{}, [string]$Method = 'POST') {
