@@ -142,11 +142,9 @@ function Install-RapUpdate($Release, [string]$TargetDirectory = $PSScriptRoot) {
 }
 
 function Start-RapRelaunch([string]$Directory = $PSScriptRoot) {
-    # A hidden helper waits for this process to exit (releasing the instance
-    # lock) and then starts the updated RAP through its normal launcher.
-    $launcher = (Join-Path $Directory 'Start RAP.vbs').Replace("'", "''")
-    $script = "Wait-Process -Id $PID -ErrorAction SilentlyContinue; Start-Process -FilePath 'wscript.exe' -ArgumentList ('`"' + '$launcher' + '`"')"
-    $encoded = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($script))
-    $powershell = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
-    Start-Process -FilePath $powershell -ArgumentList @('-NoLogo', '-NoProfile', '-WindowStyle', 'Hidden', '-EncodedCommand', $encoded) -WindowStyle Hidden
+    # Start the normal launcher directly (no hidden encoded PowerShell helper,
+    # which security software flags). The new RAP waits for this process to exit.
+    $launcher = Join-Path $Directory 'Start RAP.vbs'
+    $wscript = Join-Path $env:SystemRoot 'System32\wscript.exe'
+    Start-Process -FilePath $wscript -ArgumentList ('"' + $launcher + '" ' + $PID)
 }

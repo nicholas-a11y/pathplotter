@@ -3,6 +3,7 @@
 param(
     [switch]$LibraryOnly,
     [switch]$SmokeTest,
+    [ValidateRange(0, 2147483647)][int]$WaitForProcessId = 0,
     [string]$DataDirectory = (Join-Path $env:LOCALAPPDATA 'PathPlotter\RAP')
 )
 Set-StrictMode -Version Latest
@@ -270,6 +271,11 @@ function Request-RapQuit {
 function Start-RapDesktop {
     if ([Threading.Thread]::CurrentThread.ApartmentState -ne 'STA') { throw 'Start RAP GUI with Windows PowerShell -STA.' }
     Initialize-DesktopTypes
+    if ($WaitForProcessId -gt 0) {
+        # After an update the previous RAP is exiting; wait for it to release the instance lock.
+        $previous = Get-Process -Id $WaitForProcessId -ErrorAction SilentlyContinue
+        if ($previous) { [void]$previous.WaitForExit(30000) }
+    }
     [Windows.Forms.Application]::EnableVisualStyles()
     $activation = New-Object PathPlotterRap.Activation((Get-ActivationKey $DataDirectory))
     if (-not $activation.Owner) {
