@@ -771,8 +771,10 @@ window.setInterval(() => {
 }, 1000)
 const OPERATION_HINT_DELAY_MS = 1500
 const STATUS_AUTO_CLEAR_MS = 4000
+const CONNECTION_DEBOUNCE_MS = 600
 let operationBusySince: number | null = null
 let statusTextSince = 0
+let blockSince: number | null = null
 renderAll()
 resetConnection()
 setupOnboarding()
@@ -1364,15 +1366,24 @@ function renderControls(): void {
   }
   const captureBlock = operationBusySince !== null && Date.now() - operationBusySince < OPERATION_HINT_DELAY_MS ? null : blockReason
   // One unified status line: block reason takes priority, otherwise show recent feedback.
+  // Debounce transient connection glitches during startup so they don't flash.
   if (captureBlock) {
-    statusTextEl.textContent = captureBlock.hint
-    statusTextSince = 0
-  } else if (statusTextSince && performance.now() - statusTextSince > STATUS_AUTO_CLEAR_MS) {
-    statusTextEl.textContent = ''
-    statusTextSince = 0
-  } else if (!statusTextSince) {
-    // A block hint was showing but just cleared — wipe it.
-    statusTextEl.textContent = ''
+    if (blockSince === null) blockSince = performance.now()
+    const blockAge = performance.now() - blockSince
+    const isConnectionBlock = captureBlock.label === 'Capture unavailable' || captureBlock.label === 'Read-only · Take control'
+    if (!isConnectionBlock || blockAge >= CONNECTION_DEBOUNCE_MS) {
+      statusTextEl.textContent = captureBlock.hint
+      statusTextSince = 0
+    }
+  } else {
+    blockSince = null
+    if (statusTextSince && performance.now() - statusTextSince > STATUS_AUTO_CLEAR_MS) {
+      statusTextEl.textContent = ''
+      statusTextSince = 0
+    } else if (!statusTextSince) {
+      // A block hint was showing but just cleared — wipe it.
+      statusTextEl.textContent = ''
+    }
   }
   if (sessionEnded) {
     connectionStateEl.textContent = 'Session ended'
