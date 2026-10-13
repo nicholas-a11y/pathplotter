@@ -307,11 +307,6 @@ export class RelayClient {
     this.claimInFlight = false
   }
 
-  async endSession(): Promise<void> {
-    this.stop()
-    await this.request('/control/release', {})
-  }
-
   private rejectRead(error: Error): void {
     const pending = this.pendingRead
     if (!pending) return

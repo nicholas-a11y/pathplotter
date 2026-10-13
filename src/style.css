@@ -28,7 +28,6 @@ h2 { font-size: 1.2rem; }
   gap: 8px;
 }
 .app-header { padding: 0 2px; }
-#collectionSummary { color: #586575; }
 .status-chip {
   margin-left: auto;
   font-size: 12px;
@@ -37,16 +36,77 @@ h2 { font-size: 1.2rem; }
   background: #dce1e7;
 }
 .status-chip.ok { color: #12643b; background: #d4eddf; }
+/* DRO readout: large machine-style X/Y position display. */
+.dro {
+  margin-left: auto;
+  display: flex;
+  gap: 14px;
+  font-variant-numeric: tabular-nums;
+  font-size: 1.55rem;
+  font-weight: 600;
+  letter-spacing: 0.01em;
+  color: #12643b;
+  line-height: 1.1;
+}
+.dro.stale { color: #8a94a2; font-weight: 400; }
+.dro .dro-axis span { font-weight: 700; }
+.dro.stale .dro-axis span { font-weight: 400; }
 .toolbar { padding: 8px; background: #fff; border-radius: 8px; }
-.live-update-bar { display: flex; flex-wrap: wrap; align-items: center; gap: 8px 12px; padding: 8px; background: #fff; border-radius: 8px; }
-#liveUpdateStatus { font-size: 12px; flex: 1; min-width: 220px; }
-.workspace-status { display: flex; justify-content: space-between; flex-wrap: wrap; gap: 4px 12px; font-size: 12px; padding: 0 4px; }
-#liveText { flex-basis: 100%; font-variant-numeric: tabular-nums; color: #596676; }
+/* Large toggle switch for Live update. */
+.switch {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-height: 44px;
+  padding: 0 10px;
+  border: 1px solid #c5cdd8;
+  border-radius: 6px;
+  background: #f8f9fb;
+  cursor: pointer;
+  font-size: 13px;
+}
+.switch input { position: absolute; opacity: 0; width: 1px; height: 1px; }
+.switch-track {
+  width: 40px;
+  height: 22px;
+  border-radius: 11px;
+  background: #c5cdd8;
+  position: relative;
+  transition: background 0.15s;
+  flex: none;
+}
+.switch-track::after {
+  content: '';
+  position: absolute;
+  top: 2px;
+  left: 2px;
+  width: 18px;
+  height: 18px;
+  border-radius: 50%;
+  background: #fff;
+  transition: left 0.15s;
+}
+.switch input:checked + .switch-track { background: #2865bd; }
+.switch input:checked + .switch-track::after { left: 20px; }
+.switch input:focus-visible + .switch-track { outline: 2px solid #2865bd; outline-offset: 2px; }
+.switch input:disabled + .switch-track { opacity: 0.45; }
+.live-recovery-row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px 12px;
+  padding: 8px;
+  background: #fff;
+  border-radius: 8px;
+  font-size: 12px;
+}
+.live-recovery-row[hidden] { display: none; }
+#liveUpdateStatus { flex: 1; min-width: 220px; }
+.workspace-status { display: flex; flex-wrap: wrap; gap: 4px 12px; font-size: 12px; padding: 0 4px; min-height: 0; }
 .hint { color: #667384; font-size: 12px; }
-/* Each status line owns a full row with reserved height, so text changes never shift the plot. */
-#statusText, #captureBlockHint, #liveText { flex-basis: 100%; min-height: 2.8em; }
-#captureBlockHint { visibility: hidden; }
-#captureBlockHint.visible { visibility: visible; color: #a42c2c; }
+/* Unified status line: always reserves one line of space to prevent layout shift. */
+#statusText { flex-basis: 100%; color: #a42c2c; font-size: 12px; min-height: 1.4em; }
+#statusText:empty { visibility: hidden; }
 
 button, input, select { font: inherit; }
 button {
@@ -86,9 +146,20 @@ button:disabled { opacity: 0.45; cursor: not-allowed; }
 #plot .head-marker.settled { stroke: #000; }
 #plot .rulers { font-size: 11px; fill: #647285; font-variant-numeric: tabular-nums; }
 .export-bar { padding: 0 2px; }
-.export-bar > .hint { margin-right: auto; }
-#exportStatus { flex-basis: 100%; font-size: 12px; }
-#exportStatus:empty { display: none; }
+/* Backup dialog: large touch-friendly actions. */
+.backup-actions { display: flex; flex-wrap: wrap; gap: 10px; }
+.backup-actions button { flex: 1 1 180px; min-height: 48px; }
+.backup-import {
+  flex: 1 1 180px;
+  min-height: 48px;
+  justify-content: center;
+  border: 1px solid #c5cdd8;
+  border-radius: 6px;
+  background: #f8f9fb;
+  padding: 8px 13px;
+  cursor: pointer;
+}
+.backup-import input { position: absolute; opacity: 0; width: 1px; height: 1px; }
 
 dialog {
   width: min(620px, calc(100vw - 24px));
@@ -135,9 +206,10 @@ td input { min-width: 75px; }
 @media (max-width: 600px) {
   #app { padding: 8px; gap: 8px; }
   .app-header { gap: 6px; }
-  #collectionSummary { order: 4; flex-basis: 100%; font-size: 12px; }
+  .dro { font-size: 1.25rem; gap: 10px; }
   .toolbar { gap: 6px; }
   .toolbar button { flex: 1 1 28%; padding: 8px; font-size: 12px; }
+  .switch { flex: 1 1 100%; justify-content: center; }
   #plot { height: max(360px, calc(100svh - 310px)); }
   .export-bar button { flex: 1; padding: 8px; font-size: 12px; }
   .export-bar > .hint { flex-basis: 100%; }

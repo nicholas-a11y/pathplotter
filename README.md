@@ -35,7 +35,7 @@ Keep LightBurn's **Allow API Access From Network** setting **off**.
 
 ## Connect for the first time
 
-1. In the web app open **Get started > Find Windows download**, or go to the [latest release](https://github.com/nicholas-a11y/pathplotter/releases/latest). Download **PathPlotter-RAP-Windows.zip** and extract the whole ZIP somewhere writable.
+1. In the web app click **Help > Find Windows download**, or go to the [latest release](https://github.com/nicholas-a11y/pathplotter/releases/latest). Download **PathPlotter-RAP-Windows.zip** and extract the whole ZIP somewhere writable.
 2. In LightBurn enable **REST API** in **Settings > Extensions**.
 3. Double-click **Start RAP.cmd**.
 4. Paste your **Invitation ID** and click **Register this computer**.
@@ -60,7 +60,7 @@ Only one browser is connected to a RAP at a time; pairing a phone replaces the c
 2. Position the head with the machine's normal controls. Watch the live crosshair and coordinate readout.
 3. Click **Capture point** for each position, or press **Space** when no dialog, text field or button has focus.
 4. Click **Finish** (or press **Enter**) when the shape has enough points.
-5. To collect another shape, change settings if needed and click **Resume**, then capture and finish the next group.
+5. To collect another shape, change settings if needed and click **Capture point** again to start a new group, then capture and finish.
 6. Use **Edit points** to adjust names, coordinates or label offsets.
 7. Click **Download SVG**, or **Send to LightBurn** to import the whole collection into the current project.
 
@@ -89,37 +89,17 @@ The crosshair turns black once LightBurn reports the same X/Y three times in a r
 
 **Capture point asks RAP for a fresh reading** rather than reusing the preview. The reading must be no more than 2 seconds old; otherwise no point is saved. Moving previews are limited to 2 updates per second.
 
-## Send once, or draw with Live update
-
-### Download SVG / Send to LightBurn
+## Send to LightBurn
 
 **Download SVG** exports the full collection and works without a connection.
 
 **Send to LightBurn** imports the full collection at its workpiece position. It does not replace earlier artwork, save the project or start a job; sending again adds duplicates. Wait for the reported outcome before sending again, and avoid other imports while PathPlotter is sending: LightBurn's import event does not say which upload it belongs to.
 
-### Live update to LightBurn
+## Saved points and recovery
 
-Live update is **off by default**. Use it to see new geometry appear in LightBurn as you capture.
+### Autosave
 
-1. Start a new, empty group (Finish the current one first if needed).
-2. Choose the shape, colours and labels.
-3. Tick **Live update to LightBurn** and accept the warning.
-4. Capture normally. For a polygon, **Finish** sends the closing edge.
-5. Untick Live update when done. Queued updates still finish sending.
-
-Each circle, and each path segment after the first point, is imported as a separate object. Labels are sent once per point. Up to **20 updates** can be waiting at once; capture pauses when the queue is full. The status bar shows the queue, for example `Off · 0/20 pending · 0 confirmed`.
-
-**This is append-only drawing, not synchronization.** Editing or deleting points later changes PathPlotter only. A visually closed outline made of separate edges may need joining in LightBurn before fills or offsets. While a group is being live-updated its points, Undo and settings are locked, and Clear points, session import and full Send are blocked.
-
-Each RAP can make **1,000 imports per 24 hours**; every live update counts as one.
-
-## Saved points, control and recovery
-
-### Autosave and backups
-
-Your groups, current capture and live-update queue are saved in this browser only. They are not shared between devices or browser profiles.
-
-Use **Session > Export session JSON** for a backup and **Import collection JSON** to restore one. Backups contain points and settings, never pairing credentials or LightBurn secrets. Backups with unsent live updates cannot be imported, so artwork is never replayed into the wrong project.
+Your groups and current capture are saved in this browser only. They are not shared between devices or browser profiles.
 
 ### Why a button is disabled
 
@@ -130,15 +110,7 @@ The status line explains the actual reason. Common cases:
 | Waiting for fresh coordinates | Check RAP, LightBurn and the machine connection. |
 | Another tab or browser has capture control | Click **Take control** and confirm. |
 | Workspace confirmation needed | If the saved points belong to this machine and origin, use **Connection > Advanced > Confirm workspace for existing points**. Otherwise export a backup and clear the old points. Confirming does not move or re-measure points. |
-| Capture finished | Click **Resume** to start the next group. |
 | Finish disabled but points exist | Finish needs enough points in the **current** group. |
-| Live queue full or paused | Wait for imports to finish, or use the recovery steps below. |
-
-### End session and switching tabs
-
-**End session** saves your points, disconnects this browser and releases capture control. Pairing is kept, and RAP and LightBurn keep running; use **Connection > Reconnect** to continue. It is refused while an import is still unresolved.
-
-Within one browser, opening Live update in another tab hands the queue over safely: the old tab stops, saves its queue and becomes read-only. This needs a browser with Web Locks and BroadcastChannel support.
 
 ### Interrupted imports
 
@@ -146,12 +118,6 @@ If a full Send is interrupted, open **Connection > Advanced**:
 
 - **Check last import** asks RAP for the outcome. It never resends.
 - **Acknowledge uncertain import** is for when the outcome is unknown. Inspect LightBurn first; this clears the warning without retrying or deleting anything.
-
-If Live update was interrupted, it is off after reload and any saved queue is paused:
-
-1. Inspect LightBurn. Use **Check live import** to ask about the last update.
-2. For failed or uncertain updates, check LightBurn, then use **Acknowledge import outcome**.
-3. Choose **Resume queued updates** to continue, or **Abandon unsent updates**. Abandoning keeps your points and never removes LightBurn artwork.
 
 PathPlotter never resends an import whose outcome is unknown, so a missing piece may need adding manually but nothing is silently duplicated.
 
@@ -184,7 +150,7 @@ The dev server connects to the hosted relay like the live site. To pair it, clic
 
 ### Real-machine check
 
-Use a disposable LightBurn project without running the laser. Check circle positions and diameter, horizontal and vertical segments, polygon closure, colours, upright labels and multiple groups. For Live update, check that nothing is duplicated, the queue drains, and a reload or dropped connection never repeats an import.
+Use a disposable LightBurn project without running the laser. Check circle positions and diameter, horizontal and vertical segments, polygon closure, colours, upright labels and multiple groups.
 
 ## Further reading
 
@@ -192,3 +158,4 @@ Use a disposable LightBurn project without running the laser. Check circle posit
 - [Relay deployment and API](relay/README.md)
 - [LightBurn REST API](https://github.com/LightBurnSoftware/LightBurn-REST)
 - [Original marking-mode discussion](https://forum.lightburnsoftware.com/t/marking-mode-like-found-in-xtool-studio/193060)
+- [Hidden UI features](HIDDEN-FEATURES.md) — Live update, Backup, and other features that are present in the code but hidden from the default UI

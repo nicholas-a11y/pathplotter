@@ -31,34 +31,38 @@ if (!app) {
 app.innerHTML = `
   <header class="app-header">
     <h1>PathPlotter</h1>
-    <span id="collectionSummary"></span>
+    <div id="dro" class="dro" title="Laser head position reported by RAP">
+      <span class="dro-axis">X <span id="droX">–</span></span>
+      <span class="dro-axis">Y <span id="droY">–</span></span>
+    </div>
     <div class="status-chip" id="connectionState">Disconnected</div>
     <button id="connectionBtn" class="secondary">Connection</button>
-    <button id="endSessionBtn" class="secondary">End session</button>
-    <button id="getStartedBtn" class="secondary">Get started</button>
+    <button id="getStartedBtn" class="secondary">Help</button>
   </header>
 
   <nav class="toolbar" aria-label="Capture actions">
     <button id="captureBtn" class="primary">Capture point</button>
+    <button id="undoBtn" class="secondary">Undo</button>
     <button id="quickControlBtn" class="primary" hidden>Take control</button>
     <button id="finishBtn">Finish</button>
-    <button id="undoBtn" class="secondary">Undo</button>
-    <button id="settingsBtn" class="secondary">Capture settings</button>
-    <button id="pointsBtn" class="secondary">Edit points</button>
-    <button id="clearBtn" class="secondary">Clear points</button>
+    <label class="switch" title="Send each captured circle or segment to LightBurn as you capture" hidden>
+      <input id="liveUpdateToggle" type="checkbox" />
+      <span class="switch-track" aria-hidden="true"></span>
+      <span class="switch-label">Live update</span>
+    </label>
+    <button id="settingsBtn" class="secondary">Settings</button>
+    <button id="pointsBtn" class="secondary">Points</button>
+    <button id="clearBtn" class="secondary">Clear</button>
   </nav>
-  <section class="live-update-bar" aria-label="Live update controls">
-    <label class="check"><input id="liveUpdateToggle" type="checkbox" />Live update to LightBurn</label>
-    <span id="liveUpdateStatus" role="status">Off. Enable at a new group to append circles or segments.</span>
+  <div id="liveRecoveryRow" class="live-recovery-row" hidden>
+    <span id="liveUpdateStatus" role="status"></span>
     <button id="liveCheckBtn" class="secondary" hidden>Check live import</button>
     <button id="liveResumeBtn" class="secondary" hidden>Resume queued updates</button>
     <button id="liveReconcileBtn" class="secondary" hidden>Acknowledge import outcome</button>
     <button id="liveAbandonBtn" class="danger" hidden>Abandon unsent updates</button>
-  </section>
+  </div>
   <div class="workspace-status">
-    <p id="statusText" role="status">Ready. Open PathPlotter from RAP to connect.</p>
-    <p id="captureBlockHint" role="status"></p>
-    <p id="liveText">No head position available.</p>
+    <p id="statusText" role="status" aria-live="polite"></p>
   </div>
   <section class="plot-shell" aria-label="Workpiece workspace">
     <svg id="plot" role="img" aria-label="Workpiece coordinates plot"></svg>
@@ -66,8 +70,7 @@ app.innerHTML = `
   <footer class="export-bar">
     <button id="downloadSvgBtn" class="secondary">Download SVG</button>
     <button id="sendBtn" class="primary">Send to LightBurn</button>
-    <button id="sessionBtn" class="secondary">Session</button>
-    <p id="exportStatus" role="status"></p>
+    <button id="sessionBtn" class="secondary" hidden>Backup</button>
   </footer>
 
   <dialog id="connectionDialog" aria-labelledby="connectionTitle">
@@ -126,7 +129,7 @@ app.innerHTML = `
           <label>Label offset Y (mm)<input id="labelOffsetY" type="number" step="any" required /></label>
         </div>
       </fieldset>
-      <p class="hint">Finish locks the current group's shape and settings. Resume starts a new group using these settings. Finished points remain editable. Space captures; Enter finishes outside dialogs and text fields.</p>
+      <p class="hint">Finish locks the current group's shape and settings. Capture point again to start a new group using these settings. Finished points remain editable. Space captures; Enter finishes outside dialogs and text fields.</p>
       <button type="submit" class="primary">Apply settings</button>
     </form>
   </dialog>
@@ -158,13 +161,13 @@ app.innerHTML = `
 
   <dialog id="sessionDialog" aria-labelledby="sessionTitle">
     <header class="dialog-header">
-      <h2 id="sessionTitle">Session backup</h2>
+      <h2 id="sessionTitle">Backup</h2>
       <button data-close="sessionDialog">Close</button>
     </header>
-    <p class="hint">All finished groups and the current capture are saved in this browser. Session files contain points and settings, never pairing credentials.</p>
-    <div class="row">
-      <button id="saveSessionBtn" class="secondary">Export session JSON</button>
-      <label>Import collection JSON<input id="loadSessionInput" type="file" accept="application/json" /></label>
+    <p class="hint">Your points are saved in this browser automatically. A backup file contains points and settings — never pairing credentials.</p>
+    <div class="backup-actions">
+      <button id="saveSessionBtn" class="secondary">Save backup file</button>
+      <label class="backup-import">Restore a backup<input id="loadSessionInput" type="file" accept="application/json" /></label>
     </div>
     <p id="sessionMessage" role="status"></p>
   </dialog>
@@ -172,11 +175,9 @@ app.innerHTML = `
 
 const connectionStateEl = must<HTMLDivElement>('connectionState')
 const statusTextEl = must<HTMLParagraphElement>('statusText')
-const liveTextEl = must<HTMLParagraphElement>('liveText')
 const plotEl = must<SVGSVGElement>('plot')
 let lastPlotMarkup = ''
 const pointsTableEl = must<HTMLTableSectionElement>('pointsTable')
-const exportStatusEl = must<HTMLParagraphElement>('exportStatus')
 
 let savedStateError = ''
 let state: Collection = loadState()
@@ -196,8 +197,6 @@ let requestInFlight = false
 let uploadInFlight = false
 let connectionInFlight = false
 let sessionEnded = false
-let endingSession = false
-let sessionReleaseFailed = false
 let workspaceSize: { x: number; y: number } | null = null
 // Sticky plot view bounds; renderPlot only ever expands them.
 let plotView: { minX: number; minY: number; maxX: number; maxY: number } | null = null
@@ -377,7 +376,7 @@ async function verifyImportTarget(target: ImportTarget): Promise<void> {
 
 must<HTMLInputElement>('liveUpdateToggle').addEventListener('change', async event => {
   const toggle = event.currentTarget as HTMLInputElement
-  if (sessionEnded || endingSession) { toggle.checked = false; return }
+  if (sessionEnded) { toggle.checked = false; return }
   if (toggle.checked) {
     try {
       if (await takeLiveOwnership()) return
@@ -542,13 +541,13 @@ window.addEventListener('storage', async event => {
 
 function resetConnection(): void {
   sessionEnded = false
-  sessionReleaseFailed = false
   relay?.stop()
   livePosition = null
   workspaceSize = null
   plotView = null
   connectionStateEl.textContent = 'Disconnected'
   connectionStateEl.classList.remove('ok')
+  updateDro(null, false)
   relay?.start()
   renderAll()
 }
@@ -569,12 +568,23 @@ function relayChanged(): void {
   workspaceSize = snapshot?.context?.size ?? null
   connectionStateEl.textContent = fresh ? 'Ready to capture' : relay?.isOnline() ? 'Read-only · Take control' : 'Capture unavailable'
   connectionStateEl.classList.toggle('ok', fresh)
-  liveTextEl.textContent = relay?.error ? `Relay: ${relay.error}` :
-    snapshot?.position ? `Preview: X ${snapshot.position.x.toFixed(3)}, Y ${snapshot.position.y.toFixed(3)} mm · observation age ${(relay!.age() / 1000).toFixed(1)} s${!relay?.previewActive ? ' · moving preview paused' : ''} · capture verifies a new reading${fresh ? '' : ' · offline or another browser has control'}${relay?.connectionNotice ? ` · ${relay.connectionNotice}` : ''}` :
-    'Waiting for a fresh RAP workpiece position.'
+  updateDro(snapshot?.position ?? null, fresh)
   if (relay?.controlError) must<HTMLElement>('relayMessage').textContent = relay.controlError
   renderControls()
   renderPlot()
+}
+
+// DRO readout: large X/Y display. Keeps the last known position, dimmed, when no fresh reading exists.
+function updateDro(position: { x: number; y: number } | null, fresh: boolean): void {
+  const dro = must<HTMLDivElement>('dro')
+  if (position) {
+    must<HTMLElement>('droX').textContent = position.x.toFixed(3)
+    must<HTMLElement>('droY').textContent = position.y.toFixed(3)
+  }
+  dro.classList.toggle('stale', !fresh)
+  dro.title = position
+    ? `Laser head position reported by RAP${fresh ? '' : ` · last shown reading is ${(relay!.age() / 1000).toFixed(1)} s old`}`
+    : 'Laser head position reported by RAP'
 }
 
 function contextKey(): string | null {
@@ -641,7 +651,6 @@ async function connectBrowserLink(link: BrowserLink, requestControl = false): Pr
 must<HTMLButtonElement>('pairRelayBtn').addEventListener('click', async () => {
   const button = must<HTMLButtonElement>('pairRelayBtn')
   try {
-    if (endingSession) return
     if (connectionInFlight) throw new Error('Wait for the current connection request.')
     if (sessionEnded) { sessionEnded = false; relay?.start(); renderControls() }
     if (!relay) {
@@ -657,7 +666,7 @@ must<HTMLButtonElement>('pairRelayBtn').addEventListener('click', async () => {
 })
 async function takeCaptureControl(): Promise<boolean> {
   try {
-    if (sessionEnded || endingSession) throw new Error('Session ended. Use Connection > Reconnect.')
+    if (sessionEnded) throw new Error('Session ended. Use Connection > Reconnect.')
     if (!relay) throw new Error('Pair with RAP first.')
     if (relay.activeBrowser && relay.canCapture()) { setStatus('Already paired and ready to capture.'); return true }
     if (!relay.isOnline() || !relay.snapshot?.context) throw new Error('RAP is offline or its workspace is unavailable. Check LightBurn and RAP, then click Reconnect.')
@@ -671,41 +680,6 @@ async function takeCaptureControl(): Promise<boolean> {
   } catch (error) { must<HTMLParagraphElement>('relayMessage').textContent = errorToMessage(error); setStatus(errorToMessage(error)); return false }
 }
 must<HTMLButtonElement>('quickControlBtn').addEventListener('click', () => { void takeCaptureControl() })
-must<HTMLButtonElement>('endSessionBtn').addEventListener('click', async () => {
-  if (endingSession) return
-  if (requestInFlight || uploadInFlight || connectionInFlight || liveDispatching || liveRecoveryInFlight ||
-      handoverPending || handoverStopping || pendingImport || liveQueue().items.length || liveQueue().paused ||
-      otherTabOwnsLive || must<HTMLButtonElement>('pairRelayBtn').disabled) {
-    setStatus('Cannot end session yet. Wait for current operations, turn off Live update, and reconcile pending imports or tab ownership first. No connection was closed.')
-    return
-  }
-  if (!sessionEnded && !window.confirm('End this session? Points and saved pairing will be kept. Preview and connections will stop; RAP and LightBurn will keep running.')) return
-  endingSession = true
-  renderControls()
-  try {
-    const next = structuredClone(state)
-    for (const group of captureGroups(next)) delete group.liveLocked
-    commitCollection(next)
-    liveEnabled = false
-    sessionEnded = true
-    ++pairingEpoch
-    liveTarget = null
-    livePosition = null
-    workspaceSize = null
-    releaseLiveLock?.()
-    renderPlot()
-    liveTextEl.textContent = 'Preview stopped.'
-    await relay?.endSession()
-    sessionReleaseFailed = false
-    setStatus('Session ended. Your points and pairing are saved; you can close this tab. Use Connection to reconnect.')
-    window.close()
-  } catch (error) {
-    sessionReleaseFailed = sessionEnded
-    setStatus(sessionEnded
-      ? `Session disconnected, but capture control release could not be confirmed: ${errorToMessage(error)}. It expires without heartbeats. Retry End session or close this tab; no artwork was resent.`
-      : `Session was not ended because points could not be saved: ${errorToMessage(error)}`)
-  } finally { endingSession = false; renderControls() }
-})
 must<HTMLButtonElement>('unlinkRelayBtn').addEventListener('click', async () => {
   if (liveOwnsWork() || uploadInFlight || connectionInFlight) { setStatus('Finish current connection/import work before unlinking.'); return }
   if (!window.confirm('Remove this browser’s local pairing? Revoke its grant in RAP to remove server access.')) return
@@ -796,7 +770,9 @@ window.setInterval(() => {
   }).catch(error => setStatus(`Cannot check live ownership: ${errorToMessage(error)}`))
 }, 1000)
 const OPERATION_HINT_DELAY_MS = 1500
+const STATUS_AUTO_CLEAR_MS = 4000
 let operationBusySince: number | null = null
+let statusTextSince = 0
 renderAll()
 resetConnection()
 setupOnboarding()
@@ -966,7 +942,7 @@ must<HTMLButtonElement>('finishBtn').addEventListener('click', async () => {
     if (update) { next.liveQueue ??= emptyLiveQueue(); enqueue(next.liveQueue, update) }
     finishCapture(next)
     commitCollection(next)
-    setStatus('Group finished. Change settings if needed, then Resume to capture a new group.')
+    setStatus('Group finished. Click Capture point to start a new group.')
     void drainLiveQueue()
   } catch (error) { setStatus(`Could not finish: ${errorToMessage(error)}`) }
   finally { requestInFlight = false; renderControls() }
@@ -1075,20 +1051,22 @@ function must<T extends Element>(id: string): T {
 
 function setStatus(message: string): void {
   statusTextEl.textContent = message
+  statusTextSince = performance.now()
 }
 
 function setExportStatus(message: string): void {
-  exportStatusEl.textContent = message
+  setStatus(message)
   must<HTMLParagraphElement>('sessionMessage').textContent = message
 }
 
 async function capturePoint(): Promise<void> {
-  if (sessionEnded || endingSession || requestInFlight || (uploadInFlight && !liveDispatching) || liveCaptureBlocked()) {
+  if (sessionEnded || requestInFlight || (uploadInFlight && !liveDispatching) || liveCaptureBlocked()) {
     return
   }
   if (state.finished) {
-    setStatus('Resume capture before adding another point.')
-    return
+    state.finished = false
+    persistAndRender()
+    setStatus('Capture resumed.')
   }
   requestInFlight = true
   renderControls()
@@ -1137,7 +1115,7 @@ async function saveCapturedPoint(point: Point, coordinateContext: string): Promi
 }
 
 async function sendToLightBurn(): Promise<void> {
-  if (sessionEnded || endingSession || otherTabOwnsLive || uploadInFlight || requestInFlight || liveEnabled || liveQueue().items.length || liveQueue().paused) return
+  if (sessionEnded || otherTabOwnsLive || uploadInFlight || requestInFlight || liveEnabled || liveQueue().items.length || liveQueue().paused) return
   const built = buildSvgForCollection()
   if (!built) {
     setExportStatus('Capture enough points for the selected shape before sending.')
@@ -1357,30 +1335,26 @@ function captureBlockReason(): { label: string; hint: string } | null {  if (han
   if (relay?.rapUpdateRequired) return { label: 'Update RAP', hint: 'This RAP version is too old for the relay. Open RAP and click Update now.' }
   if (!relay?.canCapture()) return {
     label: relay?.isOnline() ? 'Read-only · Take control' : 'Capture unavailable',
-    hint: relay?.error || relay?.controlError || (relay?.isOnline() ? 'Click Take control to capture from this browser.' : 'Waiting for RAP to connect. Use Get started if you need to download or start it.'),
+    hint: relay?.error || relay?.controlError || (relay?.isOnline() ? 'Click Take control to capture from this browser.' : 'Waiting for RAP to connect. Click Help if you need to download or start it.'),
   }
   if (allPoints(state).length && state.coordinateContext !== contextKey()) return {
     label: 'Workspace confirmation needed',
     hint: 'Saved points belong to an unknown or different workspace. If they belong to this machine and workpiece origin, open Connection > Advanced > Confirm workspace for existing points. Otherwise save your session, then clear the old points.',
   }
-  if (state.finished) return { label: 'Capture finished', hint: 'Click Resume to start the next capture group.' }
   if (liveEnabled && liveQueue().items.length >= LIVE_QUEUE_LIMIT) return { label: 'Live queue full', hint: 'Wait for pending imports before capturing another point.' }
   return null
 }
 
 function renderControls(): void {
   const busy = otherTabOwnsLive || handoverStopping || handoverPending || requestInFlight || (uploadInFlight && !liveDispatching)
-  must<HTMLSpanElement>('collectionSummary').textContent =
-    `${state.type} · ${allPoints(state).length} points · ${state.groups.length} finished groups`
-  const relayReady = !sessionEnded && !endingSession && relay?.canCapture() === true
-  must<HTMLButtonElement>('endSessionBtn').disabled = (sessionEnded && !sessionReleaseFailed) || endingSession
-  must<HTMLButtonElement>('connectionBtn').disabled = endingSession
+  const relayReady = !sessionEnded && relay?.canCapture() === true
+  must<HTMLButtonElement>('connectionBtn').disabled = false
   // Hide Take control until the relay has reported state, so it never flashes during startup.
   must<HTMLButtonElement>('quickControlBtn').hidden = sessionEnded || !relay || !relay.hasReportedState || relay.activeBrowser
   must<HTMLButtonElement>('quickControlBtn').disabled = busy || uploadInFlight || !relay?.isOnline()
   const contextMatches = !allPoints(state).length || state.coordinateContext === contextKey()
   const blockReason = captureBlockReason()
-  must<HTMLButtonElement>('captureBtn').disabled = sessionEnded || endingSession || blockReason !== null
+  must<HTMLButtonElement>('captureBtn').disabled = sessionEnded || blockReason !== null
   // Routine captures finish quickly; only announce an in-progress operation once it lingers.
   if (blockReason?.label !== 'Operation in progress') {
     operationBusySince = null
@@ -1389,10 +1363,17 @@ function renderControls(): void {
     window.setTimeout(renderControls, OPERATION_HINT_DELAY_MS + 50)
   }
   const captureBlock = operationBusySince !== null && Date.now() - operationBusySince < OPERATION_HINT_DELAY_MS ? null : blockReason
-  const captureHint = must<HTMLParagraphElement>('captureBlockHint')
-  // The hint keeps its reserved space; only its text and colour change, so showing it never shifts layout.
-  captureHint.textContent = captureBlock?.hint ?? ''
-  captureHint.classList.toggle('visible', !!captureBlock)
+  // One unified status line: block reason takes priority, otherwise show recent feedback.
+  if (captureBlock) {
+    statusTextEl.textContent = captureBlock.hint
+    statusTextSince = 0
+  } else if (statusTextSince && performance.now() - statusTextSince > STATUS_AUTO_CLEAR_MS) {
+    statusTextEl.textContent = ''
+    statusTextSince = 0
+  } else if (!statusTextSince) {
+    // A block hint was showing but just cleared — wipe it.
+    statusTextEl.textContent = ''
+  }
   if (sessionEnded) {
     connectionStateEl.textContent = 'Session ended'
     connectionStateEl.classList.remove('ok')
@@ -1400,8 +1381,8 @@ function renderControls(): void {
     connectionStateEl.textContent = captureBlock?.label ?? 'Ready to capture'
     connectionStateEl.classList.toggle('ok', !captureBlock)
   }
-  must<HTMLButtonElement>('finishBtn').textContent = state.finished ? 'Resume' : 'Finish'
-  must<HTMLButtonElement>('finishBtn').disabled = busy || liveFinishBlocked() || (!state.finished && !hasEnoughPoints(state))
+  must<HTMLButtonElement>('finishBtn').textContent = 'Finish'
+  must<HTMLButtonElement>('finishBtn').disabled = busy || liveFinishBlocked() || state.finished || !hasEnoughPoints(state)
   must<HTMLButtonElement>('undoBtn').disabled = busy || !!state.liveLocked || state.points.length === 0
   must<HTMLButtonElement>('clearBtn').disabled = busy || liveOwnsWork() || allPoints(state).length === 0
   must<HTMLButtonElement>('settingsBtn').disabled = busy || !!savedStateError || !!(state.liveLocked && state.points.length)
@@ -1411,7 +1392,11 @@ function renderControls(): void {
   must<HTMLButtonElement>('downloadSvgBtn').disabled = busy || !hasExportGeometry()
   const queue = liveQueue()
   if (!requestInFlight) must<HTMLInputElement>('liveUpdateToggle').checked = liveEnabled
-  must<HTMLInputElement>('liveUpdateToggle').disabled = sessionEnded || endingSession || handoverPending || handoverStopping || requestInFlight || (!otherTabOwnsLive && !liveEnabled && (uploadInFlight || !!queue.items.length || !!queue.paused))
+  must<HTMLInputElement>('liveUpdateToggle').disabled = sessionEnded || handoverPending || handoverStopping || requestInFlight || (!otherTabOwnsLive && !liveEnabled && (uploadInFlight || !!queue.items.length || !!queue.paused))
+  // The recovery row only exists while live work needs attention; otherwise it is fully hidden.
+  const recoveryRow = must<HTMLDivElement>('liveRecoveryRow')
+  const recoveryVisible = handoverPending || handoverStopping || otherTabOwnsLive || !!queue.paused || !!queue.items.length
+  recoveryRow.hidden = !recoveryVisible
   must<HTMLElement>('liveUpdateStatus').textContent = handoverPending ? 'Waiting for safe Live update transfer…' : handoverStopping ? 'Stopping for safe transfer…' : otherTabOwnsLive ? 'Another tab owns Live update. Use Pair or enable Live update here to take over safely.' : queue.paused ? `Paused: ${queue.paused} · ${queue.items.length} pending` :
     `${liveEnabled ? 'On' : queue.items.length ? 'Off · draining' : 'Off'} · ${queue.items.length}/${LIVE_QUEUE_LIMIT} pending · ${queue.confirmed} confirmed${queue.items.length >= LIVE_QUEUE_LIMIT ? ' · Queue full; wait for imports' : ''}`
   const head = queue.items[0]

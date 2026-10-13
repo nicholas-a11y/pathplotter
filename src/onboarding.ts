@@ -45,7 +45,7 @@ export function setupOnboarding(): void {
       <p class="hint">No administrator access is needed. RAP tells you when an update is available; click <strong>Update now</strong> in RAP to install it.</p>
     </section>
     <section><h3>Use a phone or another browser</h3><p>In RAP choose <strong>Pair phone</strong>, scan the QR code (or open its link), check that the phrase matches, then click Approve in RAP. Only one browser is connected at a time; pairing a new one replaces the old one. Both devices need internet access, but not the same Wi-Fi.</p></section>
-    <section><h3>Already set up?</h3><p>Start RAP and click <strong>Open PathPlotter</strong>, or use Connection &gt; Reconnect in a browser that was paired before. If PathPlotter cannot reach RAP, check that RAP and LightBurn are running and that the computer is online.</p></section>
+    <section><h3>Already set up?</h3><p>Start RAP and click <strong>Open PathPlotter</strong>, or use Connection &gt; Reconnect in a browser that was paired before. RAP runs in the desktop widget area (system tray) — if you don't see its window, look for the tray icon near the clock. If PathPlotter cannot reach RAP, check that RAP and LightBurn are running and that the computer is online.</p></section>
   `
   document.body.append(dialog)
   const get = <T extends HTMLElement>(id: string): T => {
