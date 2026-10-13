@@ -25,3 +25,16 @@ export const layerPalette = colors.map(([label, r, g, b]) => {
 export function isLayerColor(color: string): boolean {
   return layerPalette.some(entry => entry.color === color.toLowerCase())
 }
+
+export function nearestLayerColor(color: string): string {
+  const match = /^#([0-9a-f]{2})([0-9a-f]{2})([0-9a-f]{2})$/i.exec(color)
+  if (!match) return layerPalette[0]!.color
+  const [r, g, b] = [match[1]!, match[2]!, match[3]!].map(hex => parseInt(hex, 16)) as [number, number, number]
+  let best = layerPalette[0]!
+  let bestDistance = Infinity
+  for (const entry of layerPalette) {
+    const distance = (parseInt(entry.color.slice(1, 3), 16) - r) ** 2 + (parseInt(entry.color.slice(3, 5), 16) - g) ** 2 + (parseInt(entry.color.slice(5, 7), 16) - b) ** 2
+    if (distance < bestDistance) { best = entry; bestDistance = distance }
+  }
+  return best.color
+}

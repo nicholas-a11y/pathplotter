@@ -1,6 +1,6 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { layerPalette, isLayerColor } from '../src/layer-palette.ts'
+import { layerPalette, isLayerColor, nearestLayerColor } from '../src/layer-palette.ts'
 
 test('all LightBurn palette entries retain their exact RGB values and order', () => {
   assert.deepEqual(layerPalette.map(entry => entry.color), [
@@ -14,4 +14,11 @@ test('all LightBurn palette entries retain their exact RGB values and order', ()
   ])
   assert.equal(isLayerColor('#FF0000'), true)
   assert.equal(isLayerColor('#2e7dd7'), false)
+})
+
+test('custom colours snap to the nearest LightBurn palette colour', () => {
+  assert.equal(nearestLayerColor('#2e7dd7'), '#4a6fe3')
+  assert.equal(nearestLayerColor('#c0392b'), '#b45a00')
+  assert.equal(nearestLayerColor('#FF0000'), '#ff0000')
+  assert.equal(isLayerColor(nearestLayerColor('#123456')), true)
 })

@@ -1,6 +1,6 @@
 import './style.css'
 import { captureGroups, allPoints, finishCapture, type Collection, type CaptureGroup, type Point, type ShapeType } from './capture-groups'
-import { layerPalette, isLayerColor } from './layer-palette'
+import { layerPalette, isLayerColor, nearestLayerColor } from './layer-palette'
 import { RelayClient, RelayRequestError, loadIdentity, saveIdentity, browserLink, exchangeBrowserLink, parseJob, type BrowserLink } from './relay'
 import { appendCollectionPrimitives, primitiveBounds, hasEnoughPoints, serializeSvg, buildDelta, fmt, type BuiltSvg, type Primitive } from './geometry'
 import { LIVE_QUEUE_LIMIT, emptyLiveQueue, makeUpdate, enqueue, recordOutcome, parseLiveQueue, type LiveUpdate, type ImportTarget, type LiveQueue, type ImportResult } from './live-updates'
@@ -898,7 +898,16 @@ function populateSettings(): void {
   }
   must<HTMLInputElement>('showNumbers').checked = state.showNumbers
   must<HTMLInputElement>('showNames').checked = state.showNames
+  const replaced = new Map<string, string>()
+  for (const key of ['strokeColor', 'labelColor'] as const) {
+    const input = must<HTMLInputElement>(key)
+    if (!isLayerColor(input.value)) { replaced.set(key, input.value); input.value = nearestLayerColor(input.value) }
+  }
   renderPaletteSelection()
+  document.querySelectorAll<HTMLDetailsElement>('.color-picker').forEach(picker => {
+    const original = replaced.get(picker.dataset.colorInput!)
+    if (original) picker.parentElement!.querySelector<HTMLElement>('.color-picker-message')!.textContent = `Custom colour ${original} is not a LightBurn layer colour; the nearest layer is selected.`
+  })
   document.querySelectorAll<HTMLDetailsElement>('.color-picker').forEach(picker => { picker.open = false })
   updateDiameterVisibility()
 }
