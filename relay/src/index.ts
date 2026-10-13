@@ -1565,7 +1565,15 @@ export class RelayDO extends DurableObject<Env> {
       return row.browser_id;
     });
     this.checkViewerCapacity(browserId);
-    if (this.ctx.getWebSockets().filter((s) => this.attachment(s)?.role === "browser").length >= 2) throw new HttpError(429, "too_many_viewers");
+    const viewers = this.ctx.getWebSockets().filter((s) => this.attachment(s)?.role === "browser");
+    // Newest wins for the same browser: a reload leaves its old stream open until the liveness sweep, and must not be refused meanwhile.
+    const replaced = viewers.length >= 2
+      ? viewers.filter((s) => this.attachment(s)?.browserId === browserId).sort((a, b) => this.attachment(a)!.seen - this.attachment(b)!.seen).slice(0, 1)
+      : [];
+    if (viewers.length - replaced.length >= 2) throw new HttpError(429, "too_many_viewers");
+    for (const socket of replaced) {
+      try { socket.close(1008, "browser_replaced"); } catch { /* Already closed. */ }
+    }
     const pair = new WebSocketPair();
     const client = pair[0];
     const server = pair[1];

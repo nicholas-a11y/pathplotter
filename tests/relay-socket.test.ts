@@ -7,13 +7,22 @@ class SocketFixture {
   onopen: (() => void) | null = null
   onmessage: ((event: { data: string }) => void) | null = null
   onerror: (() => void) | null = null
-  onclose: (() => void) | null = null
+  onclose: ((event?: { reason?: string }) => void) | null = null
   sent: string[] = []
   closed = false
+  closeCode: number | undefined
   url: string
   constructor(url: string | URL) { this.url = String(url); SocketFixture.latest = this }
   send(text: string) { this.sent.push(text) }
-  close() { if (this.closed) return; this.closed = true; this.onclose?.() }
+  // Like a real browser, a client may only close with 1000 or 3000-4999.
+  close(code?: number, reason?: string) {
+    if (code !== undefined && code !== 1000 && !(code >= 3000 && code <= 4999)) throw new Error(`InvalidAccessError: close code ${code}`)
+    if (this.closed) return
+    this.closed = true
+    this.closeCode = code
+    this.onclose?.({ reason })
+  }
+  closeFromServer(reason: string) { if (this.closed) return; this.closed = true; this.onclose?.({ reason }) }
   receive(value: unknown) { this.onmessage?.({ data: JSON.stringify(value) }) }
 }
 
@@ -242,6 +251,9 @@ test('malformed relay updates and refused tickets fail closed', async () => {
     await flush()
     assert.match(env.client.error, /unexpected update/)
     assert.equal(env.client.canCapture(), false)
+    // The socket must really close (with a client-legal code) so the client can retry instead of hanging.
+    assert.equal(env.socket.closed, true)
+    assert.equal(env.socket.closeCode, 4000)
   } finally { env.cleanup() }
   const original = globalThis.fetch
   const descriptor = Object.getOwnPropertyDescriptor(globalThis, 'WebSocket')
@@ -259,6 +271,35 @@ test('malformed relay updates and refused tickets fail closed', async () => {
     if (descriptor) Object.defineProperty(globalThis, 'WebSocket', descriptor)
     else Reflect.deleteProperty(globalThis, 'WebSocket')
   }
+})
+
+test('a stream taken over by a newer tab stops retrying until Reconnect, which restarts at once', async () => {
+  const env = await setup()
+  try {
+    const first = env.socket
+    first.closeFromServer('browser_replaced')
+    await new Promise(resolve => setTimeout(resolve, 1400))
+    assert.equal(SocketFixture.latest, first)
+    assert.match(env.client.error, /another tab/)
+    env.client.reconnect()
+    await flush()
+    assert.notEqual(SocketFixture.latest, first)
+    assert.equal(env.client.error, '')
+    SocketFixture.latest.onopen?.()
+    SocketFixture.latest.receive(fixture)
+    await flush()
+    assert.equal(env.client.canCapture(), true)
+  } finally { env.cleanup() }
+})
+
+test('an ordinary disconnect keeps retrying on its own', async () => {
+  const env = await setup()
+  try {
+    const first = env.socket
+    first.closeFromServer('socket_expired')
+    await new Promise(resolve => setTimeout(resolve, 1400))
+    assert.notEqual(SocketFixture.latest, first)
+  } finally { env.cleanup() }
 })
 
 test('the relay can ask for a RAP update', async () => {

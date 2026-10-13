@@ -59,7 +59,7 @@ All bodies are JSON. Allowed browser origins are `https://nicholas-a11y.github.i
 - `control` and `control/release` claim and release capture control. `capture` requests a fresh observation (at most 2 s old).
 - `jobs`, `jobs/:id` and `jobs/:id/resolve` handle SVG imports, limited to 512 KiB each and 1,000 per RAP per 24 hours.
 
-Only one browser identity is authorized per RAP. Approving a new browser replaces the previous one. Moving previews are limited to two updates per second, and to two previewing RAPs service-wide. Temporary snapshots, jobs and pairing requests are deleted by Durable Object alarms within 24 hours.
+Only one browser identity is authorized per RAP. Approving a new browser replaces the previous one. A browser may hold two streams (two tabs); opening a third closes its oldest with reason `browser_replaced`, so a reload never waits for the 45 s liveness sweep. Moving previews are limited to two updates per second, and to two previewing RAPs service-wide. Temporary snapshots, jobs and pairing requests are deleted by Durable Object alarms within 24 hours.
 
 ## Development
 

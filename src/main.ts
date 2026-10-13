@@ -228,7 +228,8 @@ async function acquireLiveLock(): Promise<void> {
 const liveHandover = typeof BroadcastChannel === 'undefined' ? null :
   new LiveHandover(new BroadcastChannel('pathplotter-live-handover'), crypto.randomUUID(),
     () => releaseLiveLock !== null, relinquishLiveOwnership)
-window.addEventListener('pagehide', () => { liveHandover?.close(); releaseLiveLock?.() })
+// Close the relay stream on reload/close so its slot is free at once rather than after the relay's 45 s liveness sweep.
+window.addEventListener('pagehide', () => { liveHandover?.close(); releaseLiveLock?.(); relay?.stop() })
 window.addEventListener('pageshow', event => {
   // A cached document's channel and lock were released; rebuild from the saved journal.
   if (event.persisted) location.reload()
@@ -653,13 +654,20 @@ must<HTMLButtonElement>('pairRelayBtn').addEventListener('click', async () => {
   try {
     if (connectionInFlight) throw new Error('Wait for the current connection request.')
     if (sessionEnded) { sessionEnded = false; relay?.start(); renderControls() }
+    let restarted = false
     if (!relay) {
       const identity = loadIdentity()
       if (!identity) throw new Error('Open PathPlotter from RAP, or scan the Pair phone QR/open its link to pair this browser first.')
       attachRelay(identity)
+      restarted = true
+    } else if (!relay.isOnline()) {
+      relay.reconnect()
+      restarted = true
     }
     button.disabled = true
     must<HTMLDialogElement>('connectionDialog').close()
+    // A fresh connection claims capture control by itself once RAP reports in.
+    if (restarted) { setStatus('Reconnecting to RAP…'); return }
     if (!await takeLiveOwnership()) await takeCaptureControl()
   } catch (error) { setStatus(errorToMessage(error)) }
   finally { button.disabled = false }

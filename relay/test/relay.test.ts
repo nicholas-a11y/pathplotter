@@ -1211,11 +1211,22 @@ describe("browser control acquisition and takeover", () => {
       const first = await browserSocket(relay, browser), second = await browserSocket(relay, browser);
       const ticket = await json<{ ticket: string }>(await call(`${root}/ticket`, { credential: browser, bindings: relay.bindings, body: {} }));
       expect((await call(`${root}/stream?ticket=${ticket.ticket}`, { upgrade: true, bindings: relay.bindings, origin: null })).status).toBe(403);
-      expect((await call(`${root}/stream?ticket=${ticket.ticket}`, { upgrade: true, bindings: relay.bindings })).status).toBe(429);
       first.socket.send(JSON.stringify({ v: 2, type: "heartbeat", watching: false }));
       second.socket.send(JSON.stringify({ v: 2, type: "heartbeat", watching: false }));
       await vi.waitFor(() => expect(second.messages.at(-1)).toMatchObject({ protocol: 2, previewActive: false, activeBrowser: false }));
       first.socket.close(); second.socket.close();
+    });
+
+    it("lets a reloading browser replace its own oldest stream instead of waiting for the liveness sweep", async () => {
+      const relay = await register(), agent = await startAgent(relay), browser = await launchBrowser(relay);
+      void agent;
+      const first = await browserSocket(relay, browser), second = await browserSocket(relay, browser);
+      const closed: { code: number; reason: string }[] = [];
+      first.socket.addEventListener("close", (event) => closed.push({ code: event.code, reason: event.reason }));
+      const third = await browserSocket(relay, browser);
+      await vi.waitFor(() => expect(closed).toEqual([{ code: 1008, reason: "browser_replaced" }]));
+      expect(third.messages.length).toBeGreaterThan(0);
+      second.socket.close(); third.socket.close();
     });
 
     it("delivers fresh captures over WebSockets with measured wait and rejects replay", async () => {

@@ -287,6 +287,14 @@ export class RelayClient {
     void this.connectSocket(epoch)
   }
 
+  // Restart now with a fresh backoff, instead of waiting out a retry timer that can be 30 s away.
+  reconnect(): void {
+    this.stop()
+    this.reconnectDelay = 1000
+    this.error = ''
+    this.start()
+  }
+
   stop(): void {
     this.running = false
     ++this.epoch
@@ -439,7 +447,8 @@ export class RelayClient {
           this.rejectRead(new Error(this.error))
           this.online = false
           this.changed()
-          socket.close(1008, 'invalid_event')
+          // Browsers only allow 1000 or 3000-4999 from a client; 1008 throws and would leave the socket open forever.
+          try { socket.close(4000, 'invalid_event') } catch { /* Already closing. */ }
         })
       }
       socket.onerror = () => {
@@ -447,7 +456,7 @@ export class RelayClient {
         this.error = 'WebSocket connection failed. Check your network connection; PathPlotter will keep retrying.'
         this.changed()
       }
-      socket.onclose = () => {
+      socket.onclose = (event?: { reason?: string }) => {
         clearTimeout(timeout)
         clearInterval(socketHeartbeat)
         if (typeof document !== 'undefined') document.removeEventListener('visibilitychange', sendHeartbeat)
@@ -460,6 +469,12 @@ export class RelayClient {
         this.settled = false
         this.previewActive = false
         this.rejectRead(new Error('Connection interrupted. Capture was not saved.'))
+        if (event?.reason === 'browser_replaced') {
+          // Retrying would just take the connection back from the newer tab and start a tug-of-war.
+          this.error = 'PathPlotter was opened in another tab or window, which took over this connection. Click Connection > Reconnect to take it back.'
+          this.changed()
+          return
+        }
         this.error ||= 'Relay disconnected. Reconnecting; uncertain imports will not be resent.'
         this.changed()
         this.timer = setTimeout(() => { void this.connectSocket(epoch) }, this.reconnectDelay + Math.random() * 250)
