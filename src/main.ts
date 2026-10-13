@@ -5,7 +5,7 @@ import { RelayClient, RelayRequestError, loadIdentity, saveIdentity, browserLink
 import { appendCollectionPrimitives, primitiveBounds, hasEnoughPoints, serializeSvg, buildDelta, fmt, type BuiltSvg, type Primitive } from './geometry'
 import { LIVE_QUEUE_LIMIT, emptyLiveQueue, makeUpdate, enqueue, recordOutcome, parseLiveQueue, type LiveUpdate, type ImportTarget, type LiveQueue, type ImportResult } from './live-updates'
 import { LiveHandover, HANDOVER_TIMEOUT_MS, type LiveHandoverState } from './live-handover'
-import { setupOnboarding, HOSTED_RELAY } from './onboarding'
+import { setupOnboarding } from './onboarding'
 
 const STORAGE_KEY = 'pathplotter.collection.v3'
 
@@ -86,14 +86,12 @@ app.innerHTML = `
       <p id="relayMessage" role="status"></p>
       <details>
         <summary>Advanced</summary>
-        <label>Saved relay API URL<input id="relayUrl" type="url" value="${HOSTED_RELAY}" readonly /></label>
-        <label>Saved relay ID<input id="relayId" readonly /></label>
         <p class="hint">Recovery tools. None of these move points or resend artwork.</p>
         <div class="row">
         <button id="unlinkRelayBtn">Unlink this browser</button>
         <button id="revalidateBtn">Confirm workspace for existing points</button>
-        <button id="checkImportBtn">Check last import</button>
-        <button id="resolveImportBtn">Acknowledge uncertain import</button>
+        <button id="checkImportBtn" hidden>Check last import</button>
+        <button id="resolveImportBtn" hidden>Acknowledge uncertain import</button>
       </div>
       </details>
     </section>
@@ -605,8 +603,6 @@ function requireRelayContext(): string {
 function attachRelay(identity: NonNullable<ReturnType<typeof loadIdentity>>): void {
   relay?.stop()
   relay = new RelayClient(identity, relayChanged)
-  must<HTMLInputElement>('relayUrl').value = identity.baseUrl
-  must<HTMLInputElement>('relayId').value = identity.relayId
   relay.start()
 }
 
@@ -794,8 +790,6 @@ function consumePairingLink(): boolean {
   const link = browserLink(location.hash)
   if (link) {
     history.replaceState(null, '', location.pathname + location.search)
-    must<HTMLInputElement>('relayUrl').value = link.baseUrl
-    must<HTMLInputElement>('relayId').value = link.relayId
     const dialog = must<HTMLDialogElement>('connectionDialog')
     if (!dialog.open) dialog.showModal()
     void connectBrowserLink(link)
@@ -1429,6 +1423,9 @@ function renderControls(): void {
   must<HTMLButtonElement>('sendBtn').disabled = busy || uploadInFlight || liveOwnsWork() || !hasExportGeometry() || !relayReady || !contextMatches ||
     pendingImport !== null
   must<HTMLButtonElement>('downloadSvgBtn').disabled = busy || !hasExportGeometry()
+  // Import recovery only matters while a send has an unresolved outcome.
+  must<HTMLButtonElement>('checkImportBtn').hidden = pendingImport === null
+  must<HTMLButtonElement>('resolveImportBtn').hidden = pendingImport === null
   const queue = liveQueue()
   if (!requestInFlight) must<HTMLInputElement>('liveUpdateToggle').checked = liveEnabled
   must<HTMLInputElement>('liveUpdateToggle').disabled = sessionEnded || handoverPending || handoverStopping || requestInFlight || (!otherTabOwnsLive && !liveEnabled && (uploadInFlight || !!queue.items.length || !!queue.paused))
