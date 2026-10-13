@@ -216,3 +216,4 @@ td input { min-width: 75px; }
   .form-grid { grid-template-columns: 1fr; }
   dialog { padding: 14px; }
 }
+#relayMessage.approval-prompt { font-size: 20px; font-weight: 700; line-height: 1.35; color: #1d3f9a; }

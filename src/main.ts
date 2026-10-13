@@ -629,7 +629,10 @@ async function connectBrowserLink(link: BrowserLink, requestControl = false): Pr
       if (requestControl && !await takeLiveOwnership()) await takeCaptureControl()
       return
     }
-    const identity = await exchangeBrowserLink(link, existing, text => { message.textContent = text; setStatus(text) }, () => epoch === pairingEpoch)
+    const identity = await exchangeBrowserLink(link, existing, (text, urgent) => {
+      message.textContent = text; message.classList.toggle('approval-prompt', !!urgent)
+      setStatus(text)
+    }, () => epoch === pairingEpoch)
     if (!identity || epoch !== pairingEpoch) return
     saveIdentity(identity)
     attachRelay(identity)
@@ -647,7 +650,7 @@ async function connectBrowserLink(link: BrowserLink, requestControl = false): Pr
     }
     must<HTMLDialogElement>('connectionDialog').close()
   } catch (error) { message.textContent = errorToMessage(error); setStatus(errorToMessage(error)) }
-  finally { button.disabled = false }
+  finally { button.disabled = false; message.classList.remove('approval-prompt') }
 }
 must<HTMLButtonElement>('pairRelayBtn').addEventListener('click', async () => {
   const button = must<HTMLButtonElement>('pairRelayBtn')

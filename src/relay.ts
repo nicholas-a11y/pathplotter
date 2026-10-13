@@ -162,7 +162,7 @@ export function browserLink(hash: string): BrowserLink | null {
 }
 
 export async function exchangeBrowserLink(link: BrowserLink, existing: RelayIdentity | null,
-  message: (text: string) => void, active: () => boolean): Promise<RelayIdentity | null> {
+  message: (text: string, urgent?: boolean) => void, active: () => boolean): Promise<RelayIdentity | null> {
   const request = (path: string, body: unknown) => relayRequest(link.baseUrl, link.relayId, path, body)
   const matching = existing?.baseUrl === link.baseUrl && existing.relayId === link.relayId ? existing : null
   if (link.kind === 'launch') {
@@ -188,7 +188,7 @@ export async function exchangeBrowserLink(link: BrowserLink, existing: RelayIden
   if (!record(result) || typeof result.pairingId !== 'string' || typeof result.pendingToken !== 'string' || typeof result.phrase !== 'string') {
     throw new Error('Invalid pairing response.')
   }
-  message(`Compare “${result.phrase}” with RAP, then click Approve on the desktop.`)
+  message(`Compare “${result.phrase}” with RAP, then click “Approve matching phrase” in the desktop RAP widget to finalise the connection.`, true)
   const deadline = performance.now() + 300000
   while (active() && performance.now() < deadline) {
     await new Promise(resolve => setTimeout(resolve, 1000))
