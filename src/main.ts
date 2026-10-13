@@ -57,7 +57,7 @@ app.innerHTML = `
   </section>
   <div class="workspace-status">
     <p id="statusText" role="status">Ready. Open PathPlotter from RAP to connect.</p>
-    <p id="captureBlockHint" role="status" hidden></p>
+    <p id="captureBlockHint" role="status"></p>
     <p id="liveText">No head position available.</p>
   </div>
   <section class="plot-shell" aria-label="Workpiece workspace">
@@ -199,6 +199,8 @@ let sessionEnded = false
 let endingSession = false
 let sessionReleaseFailed = false
 let workspaceSize: { x: number; y: number } | null = null
+// Sticky plot view bounds; renderPlot only ever expands them.
+let plotView: { minX: number; minY: number; maxX: number; maxY: number } | null = null
 let relay: RelayClient | null = null
 let pairingEpoch = 0
 const PENDING_IMPORT_KEY = 'pathplotter.relay.pending-import.v1'
@@ -544,6 +546,7 @@ function resetConnection(): void {
   relay?.stop()
   livePosition = null
   workspaceSize = null
+  plotView = null
   connectionStateEl.textContent = 'Disconnected'
   connectionStateEl.classList.remove('ok')
   relay?.start()
@@ -792,6 +795,8 @@ window.setInterval(() => {
     }
   }).catch(error => setStatus(`Cannot check live ownership: ${errorToMessage(error)}`))
 }, 1000)
+const OPERATION_HINT_DELAY_MS = 1500
+let operationBusySince: number | null = null
 renderAll()
 resetConnection()
 setupOnboarding()
@@ -927,6 +932,7 @@ must<HTMLButtonElement>('clearBtn').addEventListener('click', () => {
   delete state.liveQueue
   delete state.coordinateContext
   state.finished = false
+  plotView = null
   persistAndRender()
   setStatus('Points cleared.')
 })
@@ -1030,6 +1036,7 @@ must<HTMLInputElement>('loadSessionInput').addEventListener('change', async even
     for (const group of captureGroups(imported)) delete group.liveLocked
     if (allPoints(state).length > 0 && !window.confirm('Replace all current groups with this session?')) return
     state = imported
+    plotView = null
     persistAndRender()
     setExportStatus('Session imported.')
   } catch (error) {
@@ -1343,11 +1350,7 @@ function renderAll(): void {
   renderPlot()
 }
 
-const OPERATION_HINT_DELAY_MS = 1500
-let operationBusySince: number | null = null
-
-function captureBlockReason(): { label: string; hint: string } | null {
-  if (handoverPending || handoverStopping) return { label: 'Transferring live control', hint: 'Wait for the current operation and safe tab handover to finish.' }
+function captureBlockReason(): { label: string; hint: string } | null {  if (handoverPending || handoverStopping) return { label: 'Transferring live control', hint: 'Wait for the current operation and safe tab handover to finish.' }
   if (otherTabOwnsLive) return { label: 'Another tab owns Live update', hint: 'Click Take control or enable Live update here to request a safe transfer.' }
   if (requestInFlight || (uploadInFlight && !liveDispatching) || liveRecoveryInFlight) return { label: 'Operation in progress', hint: 'Wait for the current capture, import or recovery operation to finish.' }
   if (liveQueue().paused) return { label: 'Live update paused', hint: liveQueue().paused }
@@ -1372,7 +1375,8 @@ function renderControls(): void {
   const relayReady = !sessionEnded && !endingSession && relay?.canCapture() === true
   must<HTMLButtonElement>('endSessionBtn').disabled = (sessionEnded && !sessionReleaseFailed) || endingSession
   must<HTMLButtonElement>('connectionBtn').disabled = endingSession
-  must<HTMLButtonElement>('quickControlBtn').hidden = sessionEnded || !relay || relay.activeBrowser
+  // Hide Take control until the relay has reported state, so it never flashes during startup.
+  must<HTMLButtonElement>('quickControlBtn').hidden = sessionEnded || !relay || !relay.hasReportedState || relay.activeBrowser
   must<HTMLButtonElement>('quickControlBtn').disabled = busy || uploadInFlight || !relay?.isOnline()
   const contextMatches = !allPoints(state).length || state.coordinateContext === contextKey()
   const blockReason = captureBlockReason()
@@ -1386,8 +1390,9 @@ function renderControls(): void {
   }
   const captureBlock = operationBusySince !== null && Date.now() - operationBusySince < OPERATION_HINT_DELAY_MS ? null : blockReason
   const captureHint = must<HTMLParagraphElement>('captureBlockHint')
-  captureHint.hidden = !captureBlock
+  // The hint keeps its reserved space; only its text and colour change, so showing it never shifts layout.
   captureHint.textContent = captureBlock?.hint ?? ''
+  captureHint.classList.toggle('visible', !!captureBlock)
   if (sessionEnded) {
     connectionStateEl.textContent = 'Session ended'
     connectionStateEl.classList.remove('ok')
@@ -1539,6 +1544,17 @@ function renderPlot(): void {
     maxX = Math.max(maxX, bounds.maxX)
     maxY = Math.max(maxY, bounds.maxY)
   }
+  // The view only ever expands during a session. Dropping a stale preview or a
+  // changed workspace size must not zoom the plot back in on the user.
+  const view = plotView ?? (plotView = { minX, minY, maxX, maxY })
+  if (minX < view.minX) view.minX = minX
+  if (minY < view.minY) view.minY = minY
+  if (maxX > view.maxX) view.maxX = maxX
+  if (maxY > view.maxY) view.maxY = maxY
+  minX = view.minX
+  minY = view.minY
+  maxX = view.maxX
+  maxY = view.maxY
   const spanX = Math.max(20, maxX - minX || 100)
   const spanY = Math.max(20, maxY - minY || 100)
   const padding = Math.max(2, Math.max(spanX, spanY) * 0.04)

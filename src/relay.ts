@@ -214,6 +214,8 @@ export class RelayClient {
   controlOccupied = false
   controlError = ''
   error = ''
+  // True once the relay has sent its first state message for this connection.
+  hasReportedState = false
   private serverTime = 0
   private roundTripMs = 0
   private receivedMonotonic = 0
@@ -296,6 +298,7 @@ export class RelayClient {
     this.rejectRead(new Error('Connection stopped. Capture was not saved.'))
     this.snapshot = null
     this.activeBrowser = false
+    this.hasReportedState = false
     this.online = false
     this.settled = false
     this.previewActive = false
@@ -338,6 +341,7 @@ export class RelayClient {
     this.roundTripMs = transitMs
     this.receivedMonotonic = performance.now()
     this.healthMonotonic = performance.now()
+    this.hasReportedState = true
     this.online = value.agentOnline
     this.settled = value.settled === true
     this.rapUpdateRequired = value.rapUpdateRequired === true
@@ -457,6 +461,7 @@ export class RelayClient {
         this.online = false
         this.snapshot = null
         this.activeBrowser = false
+        this.hasReportedState = false
         this.settled = false
         this.previewActive = false
         this.rejectRead(new Error('Connection interrupted. Capture was not saved.'))

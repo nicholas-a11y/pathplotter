@@ -43,6 +43,10 @@ h2 { font-size: 1.2rem; }
 .workspace-status { display: flex; justify-content: space-between; flex-wrap: wrap; gap: 4px 12px; font-size: 12px; padding: 0 4px; }
 #liveText { flex-basis: 100%; font-variant-numeric: tabular-nums; color: #596676; }
 .hint { color: #667384; font-size: 12px; }
+/* Each status line owns a full row with reserved height, so text changes never shift the plot. */
+#statusText, #captureBlockHint, #liveText { flex-basis: 100%; min-height: 2.8em; }
+#captureBlockHint { visibility: hidden; }
+#captureBlockHint.visible { visibility: visible; color: #a42c2c; }
 
 button, input, select { font: inherit; }
 button {
