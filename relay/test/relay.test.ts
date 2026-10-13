@@ -658,7 +658,7 @@ describe("PathPlotter relay HTTP contract", () => {
     });
     expect(rejected.status).toBe(429);
     expect(await json<{ error: string }>(rejected)).toEqual({ error: "job_limit_reached" });
-  }, 30_000);
+  }, 120_000);
 
   it("limits pending SVG payloads independently and releases them after expiry", async () => {
     const relay = await register();

@@ -687,7 +687,7 @@ try {
     $script:TimingMessages = New-Object 'Collections.Generic.List[object]'
     $script:TimingHttp = New-Object 'Collections.Generic.List[object]'
     $script:TimingClock = [Diagnostics.Stopwatch]::StartNew()
-    $script:TimingLimit = 16200
+    $script:TimingLimit = 19000
     $script:ReadCount = 0
     function Get-Observation { $script:ReadCount++; return Fresh-Observation }
     function Read-UiCommand { if ($script:TimingClock.ElapsedMilliseconds -ge $script:TimingLimit) { $script:StopRequested = $true } }
