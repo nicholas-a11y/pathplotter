@@ -6,6 +6,7 @@ import { appendCollectionPrimitives, primitiveBounds, hasEnoughPoints, serialize
 import { LIVE_QUEUE_LIMIT, emptyLiveQueue, makeUpdate, enqueue, recordOutcome, parseLiveQueue, type LiveUpdate, type ImportTarget, type LiveQueue, type ImportResult } from './live-updates'
 import { LiveHandover, HANDOVER_TIMEOUT_MS, type LiveHandoverState } from './live-handover'
 import { setupOnboarding } from './onboarding'
+import { chooseDecision, type Decision, type DecisionActionId, type DecisionInput } from './decisions'
 
 const STORAGE_KEY = 'pathplotter.collection.v3'
 
@@ -36,7 +37,6 @@ app.innerHTML = `
       <span class="dro-axis">Y <span id="droY">–</span></span>
     </div>
     <div class="status-chip" id="connectionState">Disconnected</div>
-    <button id="connectionBtn" class="secondary">Connection</button>
     <button id="getStartedBtn" class="secondary">Help</button>
   </header>
 
@@ -73,30 +73,12 @@ app.innerHTML = `
     <button id="sessionBtn" class="secondary" hidden>Backup</button>
   </footer>
 
-  <dialog id="connectionDialog" aria-labelledby="connectionTitle">
-    <header class="dialog-header">
-      <h2 id="connectionTitle">Connection</h2>
-      <button data-close="connectionDialog" aria-label="Close connection">Close</button>
-    </header>
-    <section id="relayConnection">
-      <p class="hint">Connect by clicking Open PathPlotter in RAP, or scan RAP's Pair phone QR code. A browser that was paired before can reconnect here.</p>
-      <div class="row">
-        <button id="pairRelayBtn" class="primary">Reconnect</button>
-      </div>
-      <p id="relayMessage" role="status"></p>
-      <details>
-        <summary>Advanced</summary>
-        <p class="hint">Recovery tools. None of these move points or resend artwork.</p>
-        <div class="row">
-        <button id="unlinkRelayBtn">Unlink this browser</button>
-        <button id="revalidateBtn">Confirm workspace for existing points</button>
-        <button id="checkImportBtn" hidden>Check last import</button>
-        <button id="resolveImportBtn" hidden>Acknowledge uncertain import</button>
-      </div>
-      </details>
-    </section>
+  <dialog id="decisionDialog" aria-labelledby="decisionTitle">
+    <header class="dialog-header"><h2 id="decisionTitle"></h2></header>
+    <p id="decisionMessage" role="status"></p>
+    <p id="decisionNote" class="hint" role="status"></p>
+    <div id="decisionActions" class="row"></div>
   </dialog>
-
   <dialog id="settingsDialog" aria-labelledby="settingsTitle">
     <form id="settingsForm">
       <header class="dialog-header">
@@ -194,6 +176,15 @@ let livePosition: { x: number; y: number } | null = null
 let requestInFlight = false
 let uploadInFlight = false
 let connectionInFlight = false
+// Connection decisions are asked in one modal, only when something needs the user.
+let pairingUi: { text: string; urgent: boolean; error: boolean } | null = null
+let decisionKey = ''
+let decisionSince = 0
+let dismissedDecisionKey = ''
+let decisionClosingByCode = false
+let decisionNote = ''
+let decisionNoteKey = ''
+let lastStatusMessage = ''
 let sessionEnded = false
 let workspaceSize: { x: number; y: number } | null = null
 // Sticky plot view bounds; renderPlot only ever expands them.
@@ -255,7 +246,7 @@ async function relinquishLiveOwnership(): Promise<LiveHandoverState | null> {
     otherTabOwnsLive = true
     releaseLiveLock?.()
     await liveLockReleased
-    setStatus('Live update transferred to another tab. This tab is read-only; use Pair to take ownership back.')
+    setStatus('Live update transferred to another tab. This tab is read-only; enable Live update here to take ownership back.')
     return { enabled, target }
   } catch (error) {
     liveEnabled = false
@@ -533,7 +524,7 @@ window.addEventListener('storage', async event => {
     otherTabOwnsLive = liveTransferred || (locks?.held?.some(lock => lock.name === 'pathplotter-live-update') ?? false)
     state = loadState()
     if (state.liveQueue?.items.length) state.liveQueue.paused = 'Saved state changed in another tab. Check the import before resuming.'
-    if (otherTabOwnsLive) setStatus('Another tab owns Live update. Use Pair or enable Live update here to request a safe transfer.')
+    if (otherTabOwnsLive) setStatus('Another tab owns Live update. Enable Live update here to request a safe transfer.')
     renderAll()
   } catch (error) { setStatus(errorToMessage(error)) }
 })
@@ -568,7 +559,6 @@ function relayChanged(): void {
   connectionStateEl.textContent = fresh ? 'Ready to capture' : relay?.isOnline() ? (lightBurnNotReady() ? 'LightBurn not ready' : 'Read-only · Take control') : 'Capture unavailable'
   connectionStateEl.classList.toggle('ok', fresh)
   updateDro(snapshot?.position ?? null, fresh)
-  if (relay?.controlError) must<HTMLElement>('relayMessage').textContent = relay.controlError
   renderControls()
   renderPlot()
 }
@@ -595,7 +585,7 @@ function requireRelayContext(): string {
   const key = contextKey()
   if (!key) throw new Error('Workspace context is unavailable.')
   if (allPoints(state).length && state.coordinateContext !== key) {
-    throw new Error('Existing points belong to an unknown or different workspace. Clear them, or explicitly confirm the workspace in Connection.')
+    throw new Error('Existing points belong to an unknown or different workspace. Clear them, or confirm the workspace when PathPlotter asks.')
   }
   return key
 }
@@ -607,32 +597,37 @@ function attachRelay(identity: NonNullable<ReturnType<typeof loadIdentity>>): vo
 }
 
 async function connectBrowserLink(link: BrowserLink, requestControl = false): Promise<void> {
-  const button = must<HTMLButtonElement>('pairRelayBtn')
-  const message = must<HTMLParagraphElement>('relayMessage')
   if (connectionInFlight) { setStatus('Wait for the current connection request.'); return }
-  button.disabled = true
   const epoch = ++pairingEpoch
+  const show = (text: string, urgent = false, error = false): void => {
+    if (epoch !== pairingEpoch) return
+    pairingUi = { text, urgent, error }
+    setStatus(text)
+    renderControls()
+  }
+  const finish = (): void => {
+    if (epoch !== pairingEpoch) return
+    pairingUi = null
+    renderControls()
+  }
+  show('Connecting this browser to RAP…')
   try {
     const existing = relay?.identity ?? loadIdentity()
     const matching = existing?.baseUrl === link.baseUrl && existing.relayId === link.relayId
     if (!matching && (liveOwnsWork() || uploadInFlight || pendingImport)) throw new Error('Reconcile pending work before connecting a different RAP.')
-    if (!matching && existing && !window.confirm('Connect this browser to a different RAP? Existing captured points will not be transformed.')) return
+    if (!matching && existing && !window.confirm('Connect this browser to a different RAP? Existing captured points will not be transformed.')) { finish(); return }
     if (matching && (liveOwnsWork() || uploadInFlight || pendingImport)) {
       if (existing && !relay) attachRelay(existing)
-      message.textContent = 'Saved RAP connection retained. Reconcile pending live work before starting new captures.'
-      setStatus(message.textContent)
-      must<HTMLDialogElement>('connectionDialog').close()
-      if (requestControl && !await takeLiveOwnership()) await takeCaptureControl()
+      finish()
+      setStatus('Saved RAP connection retained. Reconcile pending live work before starting new captures.')
+      if (requestControl) await takeControl()
       return
     }
-    const identity = await exchangeBrowserLink(link, existing, (text, urgent) => {
-      message.textContent = text; message.classList.toggle('approval-prompt', !!urgent)
-      setStatus(text)
-    }, () => epoch === pairingEpoch)
+    const identity = await exchangeBrowserLink(link, existing, (text, urgent) => show(text, !!urgent), () => epoch === pairingEpoch)
     if (!identity || epoch !== pairingEpoch) return
     saveIdentity(identity)
     attachRelay(identity)
-    message.textContent = 'Connected to RAP. See the capture status for any remaining steps.'
+    finish()
     setStatus('Connected to RAP.')
     if (requestControl) {
       const client = relay
@@ -641,76 +636,71 @@ async function connectBrowserLink(link: BrowserLink, requestControl = false): Pr
         await new Promise(resolve => window.setTimeout(resolve, 100))
       }
       if (epoch !== pairingEpoch || client !== relay) return
-      if (!client?.isOnline()) throw new Error('Paired, but RAP is offline. Check LightBurn and RAP, then click Reconnect.')
-      if (!client.activeBrowser && !await takeCaptureControl()) return
+      if (!client?.isOnline()) throw new Error('Paired, but RAP is offline. Check that RAP is running; PathPlotter keeps retrying.')
+      if (!client.activeBrowser) await takeControl()
     }
-    must<HTMLDialogElement>('connectionDialog').close()
-  } catch (error) { message.textContent = errorToMessage(error); setStatus(errorToMessage(error)) }
-  finally { button.disabled = false; message.classList.remove('approval-prompt') }
+  } catch (error) { show(errorToMessage(error), false, true) }
 }
-must<HTMLButtonElement>('pairRelayBtn').addEventListener('click', async () => {
-  const button = must<HTMLButtonElement>('pairRelayBtn')
+
+// Restart the saved relay connection; it normally retries by itself.
+function reconnectRelay(): void {
   try {
-    if (connectionInFlight) throw new Error('Wait for the current connection request.')
-    if (sessionEnded) { sessionEnded = false; relay?.start(); renderControls() }
-    let restarted = false
     if (!relay) {
       const identity = loadIdentity()
-      if (!identity) throw new Error('Open PathPlotter from RAP, or scan the Pair phone QR/open its link to pair this browser first.')
+      if (!identity) throw new Error('Open PathPlotter from RAP, or scan its Pair phone QR code, to pair this browser first.')
       attachRelay(identity)
-      restarted = true
-    } else if (!relay.isOnline()) {
-      relay.reconnect()
-      restarted = true
-    }
-    button.disabled = true
-    must<HTMLDialogElement>('connectionDialog').close()
-    // A fresh connection claims capture control by itself once RAP reports in.
-    if (restarted) { setStatus('Reconnecting to RAP…'); return }
-    if (!await takeLiveOwnership()) await takeCaptureControl()
+    } else relay.reconnect()
+    setStatus('Reconnecting to RAP…')
   } catch (error) { setStatus(errorToMessage(error)) }
-  finally { button.disabled = false }
-})
-async function takeCaptureControl(): Promise<boolean> {
+}
+
+async function takeCaptureControl(confirmed = false): Promise<boolean> {
   try {
-    if (sessionEnded) throw new Error('Session ended. Use Connection > Reconnect.')
+    if (sessionEnded) throw new Error('Session ended. Reload PathPlotter.')
     if (!relay) throw new Error('Pair with RAP first.')
     if (relay.activeBrowser && relay.canCapture()) { setStatus('Already paired and ready to capture.'); return true }
-    if (!relay.isOnline()) throw new Error('RAP is offline. Check that RAP is running, then click Reconnect.')
+    if (!relay.isOnline()) throw new Error('RAP is offline. Check that RAP is running; PathPlotter keeps retrying.')
     if (!relay.snapshot?.context) throw new Error(LIGHTBURN_NOT_READY_HINT + ' This browser takes capture control automatically once LightBurn is ready.')
     if (uploadInFlight || liveDispatching || liveRecoveryInFlight) throw new Error('Wait for the import result before requesting control.')
     const takeover = relay.controlOccupied
-    if (takeover && !window.confirm('Take capture control from the other browser? Its capture stops; pending or unresolved imports must be reconciled first.')) return false
+    if (takeover && !confirmed && !window.confirm('Take capture control from the other browser? Its capture stops; pending or unresolved imports must be reconciled first.')) return false
     await relay.claimControl(takeover)
-    must<HTMLParagraphElement>('relayMessage').textContent = 'This browser has capture control.'
     setStatus('Capture control acquired.')
     return true
-  } catch (error) { must<HTMLParagraphElement>('relayMessage').textContent = errorToMessage(error); setStatus(errorToMessage(error)); return false }
+  } catch (error) { setStatus(errorToMessage(error)); return false }
 }
-must<HTMLButtonElement>('quickControlBtn').addEventListener('click', () => { void takeCaptureControl() })
-must<HTMLButtonElement>('unlinkRelayBtn').addEventListener('click', async () => {
+
+// Also asks another PathPlotter tab for its Live update ownership when it holds it.
+async function takeControl(confirmed = false): Promise<void> {
+  try { if (!await takeLiveOwnership()) await takeCaptureControl(confirmed) }
+  catch (error) { setStatus(errorToMessage(error)) }
+}
+must<HTMLButtonElement>('quickControlBtn').addEventListener('click', () => { void takeControl() })
+
+function unlinkBrowser(): void {
   if (liveOwnsWork() || uploadInFlight || connectionInFlight) { setStatus('Finish current connection/import work before unlinking.'); return }
   if (!window.confirm('Remove this browser’s local pairing? Revoke its grant in RAP to remove server access.')) return
   ++pairingEpoch
+  pairingUi = null
   try {
     saveIdentity(null)
     relay?.stop()
     relay = null
     resetConnection()
-    must<HTMLParagraphElement>('relayMessage').textContent = 'Unlinked locally. Open a new RAP link or scan its Pair phone QR to pair again.'
+    setStatus('Unlinked locally. Open PathPlotter from RAP, or scan its Pair phone QR code, to pair again.')
   } catch (error) { setStatus(errorToMessage(error)) }
-})
-must<HTMLButtonElement>('revalidateBtn').addEventListener('click', () => {
-  if (liveOwnsWork() || uploadInFlight || requestInFlight) return
+}
+
+function confirmWorkspace(): void {
+  if (liveOwnsWork() || uploadInFlight || requestInFlight) { setStatus('Finish the current operation first.'); return }
   const key = contextKey()
   if (!key || !relay?.canCapture()) { setStatus('A fresh RAP workspace and capture control are required.'); return }
-  if (window.confirm('Confirm all existing point coordinates belong to the currently connected machine and workpiece origin? This does not move or transform any points.')) {
-    state.coordinateContext = key
-    persistAndRender()
-    setStatus('Existing points explicitly associated with this workspace.')
-  }
-})
-must<HTMLButtonElement>('checkImportBtn').addEventListener('click', async () => {
+  state.coordinateContext = key
+  persistAndRender()
+  setStatus('Existing points explicitly associated with this workspace.')
+}
+
+async function checkPendingImport(): Promise<void> {
   if (uploadInFlight) return
   if (liveQueue().items.length) { must<HTMLButtonElement>('liveCheckBtn').click(); return }
   try {
@@ -720,8 +710,9 @@ must<HTMLButtonElement>('checkImportBtn').addEventListener('click', async () => 
     setExportStatus(`RAP import ${job.id}: ${job.status}${job.error ? ` — ${job.error}` : ''}.`)
     if (['confirmed', 'failed', 'expired'].includes(job.status)) clearPendingImport()
   } catch (error) { setExportStatus(errorToMessage(error)) }
-})
-must<HTMLButtonElement>('resolveImportBtn').addEventListener('click', async () => {
+}
+
+async function acknowledgePendingImport(): Promise<void> {
   if (uploadInFlight || liveRecoveryInFlight || !pendingImport) return
   if (liveQueue().items.length) { must<HTMLButtonElement>('liveReconcileBtn').click(); return }
   if (window.confirm(`Check RAP and LightBurn for job ${pendingImport.id} first. Confirm you have reconciled its outcome and understand another Send may duplicate artwork.`)) {
@@ -734,8 +725,7 @@ must<HTMLButtonElement>('resolveImportBtn').addEventListener('click', async () =
     catch (error) { setExportStatus(errorToMessage(error)) }
     finally { liveRecoveryInFlight = false; renderControls() }
   }
-})
-
+}
 async function acknowledgeRelayImport(id: string, relayId: string, baseUrl?: string): Promise<void> {
   const client = relay
   if (!client || client.identity.relayId !== relayId || (baseUrl && client.identity.baseUrl !== baseUrl)) {
@@ -785,13 +775,11 @@ let statusTextSince = 0
 let blockSince: number | null = null
 renderAll()
 resetConnection()
-setupOnboarding()
+setupOnboarding({ onUnlink: unlinkBrowser })
 function consumePairingLink(): boolean {
   const link = browserLink(location.hash)
   if (link) {
     history.replaceState(null, '', location.pathname + location.search)
-    const dialog = must<HTMLDialogElement>('connectionDialog')
-    if (!dialog.open) dialog.showModal()
     void connectBrowserLink(link)
     return true
   }
@@ -813,7 +801,6 @@ try {
 new ResizeObserver(() => renderPlot()).observe(plotEl)
 
 for (const [button, dialog] of [
-  ['connectionBtn', 'connectionDialog'],
   ['settingsBtn', 'settingsDialog'],
   ['pointsBtn', 'pointsDialog'],
   ['sessionBtn', 'sessionDialog'],
@@ -1068,6 +1055,7 @@ function must<T extends Element>(id: string): T {
 
 function setStatus(message: string): void {
   statusTextEl.textContent = message
+  lastStatusMessage = message
   statusTextSince = performance.now()
 }
 
@@ -1363,16 +1351,117 @@ function captureBlockReason(): { label: string; hint: string } | null {  if (han
   }
   if (allPoints(state).length && state.coordinateContext !== contextKey()) return {
     label: 'Workspace confirmation needed',
-    hint: 'Saved points belong to an unknown or different workspace. If they belong to this machine and workpiece origin, open Connection > Advanced > Confirm workspace for existing points. Otherwise save your session, then clear the old points.',
+    hint: 'Saved points belong to an unknown or different workspace. If they belong to this machine and workpiece origin, click the status above to confirm them for this workspace, or back them up and clear them.',
   }
   if (liveEnabled && liveQueue().items.length >= LIVE_QUEUE_LIMIT) return { label: 'Live queue full', hint: 'Wait for pending imports before capturing another point.' }
   return null
 }
 
-function renderControls(): void {
-  const busy = otherTabOwnsLive || handoverStopping || handoverPending || requestInFlight || (uploadInFlight && !liveDispatching)
+function decisionInput(): DecisionInput {
+  const idle = !uploadInFlight && !liveDispatching && !liveRecoveryInFlight && !requestInFlight
+  const online = relay?.isOnline() === true
+  const control = relay && online && relay.hasReportedState && !relay.activeBrowser && (relay.controlOccupied || relay.controlError)
+    ? { message: relay.controlError || 'Another browser has capture control.', takeover: relay.controlOccupied } : null
+  return {
+    pairing: pairingUi,
+    unresolvedImportId: pendingImport && idle ? pendingImport.id : null,
+    workspaceMismatch: relay?.canCapture() === true && allPoints(state).length > 0 && state.coordinateContext !== contextKey(),
+    rapUpdateRequired: relay?.rapUpdateRequired === true,
+    control,
+    offline: relay && !online
+      ? { message: relay.error || 'RAP is not connected. Check that RAP is running on the LightBurn computer. PathPlotter keeps retrying automatically.' } : null,
+  }
+}
+
+function paintDecision(decision: Decision): void {
+  must<HTMLElement>('decisionTitle').textContent = decision.title
+  const message = must<HTMLElement>('decisionMessage')
+  message.textContent = decision.message
+  message.classList.toggle('approval-prompt', decision.urgent)
+  const note = must<HTMLElement>('decisionNote')
+  note.textContent = decisionNoteKey === decision.key ? decisionNote : ''
+  const actions = must<HTMLElement>('decisionActions')
+  const signature = decision.actions.map(action => `${action.id}:${action.label}`).join('|')
+  if (actions.dataset.signature === signature) return
+  actions.dataset.signature = signature
+  actions.replaceChildren(...decision.actions.map(action => {
+    const button = document.createElement('button')
+    button.type = 'button'
+    button.dataset.decisionAction = action.id
+    button.className = action.style
+    button.textContent = action.label
+    return button
+  }))
+}
+
+// Opens by itself once a decision has persisted long enough; a dismissed one stays closed until it changes.
+function updateDecision(forceOpen = false): void {
+  const dialog = must<HTMLDialogElement>('decisionDialog')
+  const decision = chooseDecision(decisionInput())
+  connectionStateEl.classList.toggle('actionable', decision !== null)
+  connectionStateEl.tabIndex = decision ? 0 : -1
+  connectionStateEl.title = decision ? 'Click to review what needs attention' : ''
+  if (!decision) {
+    decisionKey = ''
+    dismissedDecisionKey = ''
+    if (dialog.open) { decisionClosingByCode = true; dialog.close() }
+    return
+  }
+  if (decision.key !== decisionKey) { decisionKey = decision.key; decisionSince = performance.now() }
+  if (dialog.open) { paintDecision(decision); return }
+  if (forceOpen) dismissedDecisionKey = ''
+  else if (decision.key === dismissedDecisionKey || performance.now() - decisionSince < decision.delayMs) return
+  // Never interrupt another dialog, except a pairing the user just started.
+  if (decision.kind !== 'pairing' && document.querySelector('dialog[open]')) return
+  paintDecision(decision)
+  dialog.showModal()
+}
+
+async function runDecisionAction(id: DecisionActionId): Promise<void> {
+  const dialog = must<HTMLDialogElement>('decisionDialog')
+  switch (id) {
+    case 'close':
+      if (pairingUi?.error) pairingUi = null
+      dialog.close()
+      return
+    case 'cancel-pairing':
+      ++pairingEpoch
+      pairingUi = null
+      setStatus('Pairing cancelled.')
+      updateDecision()
+      return
+    case 'check-import': await checkPendingImport(); break
+    case 'acknowledge-import': await acknowledgePendingImport(); break
+    case 'confirm-workspace': confirmWorkspace(); break
+    case 'download-backup': must<HTMLButtonElement>('saveSessionBtn').click(); break
+    case 'clear-points': must<HTMLButtonElement>('clearBtn').click(); break
+    case 'take-control': await takeControl(true); break
+    case 'reconnect': reconnectRelay(); break
+  }
+  decisionNote = lastStatusMessage
+  decisionNoteKey = decisionKey
+  updateDecision()
+}
+
+must<HTMLElement>('decisionActions').addEventListener('click', event => {
+  const target = event.target
+  if (target instanceof HTMLButtonElement && target.dataset.decisionAction) void runDecisionAction(target.dataset.decisionAction as DecisionActionId)
+})
+must<HTMLDialogElement>('decisionDialog').addEventListener('cancel', event => {
+  // A pairing in progress is ended with Cancel, never by accident.
+  if (chooseDecision(decisionInput())?.mandatory) event.preventDefault()
+})
+must<HTMLDialogElement>('decisionDialog').addEventListener('close', () => {
+  if (!decisionClosingByCode) dismissedDecisionKey = decisionKey
+  decisionClosingByCode = false
+})
+connectionStateEl.addEventListener('click', () => { if (decisionKey) updateDecision(true) })
+connectionStateEl.addEventListener('keydown', event => {
+  if ((event.key === 'Enter' || event.key === ' ') && decisionKey) { event.preventDefault(); updateDecision(true) }
+})
+
+function renderControls(): void {  const busy = otherTabOwnsLive || handoverStopping || handoverPending || requestInFlight || (uploadInFlight && !liveDispatching)
   const relayReady = !sessionEnded && relay?.canCapture() === true
-  must<HTMLButtonElement>('connectionBtn').disabled = false
   // Hide Take control until the relay has reported state, so it never flashes during startup.
   must<HTMLButtonElement>('quickControlBtn').hidden = sessionEnded || !relay || !relay.hasReportedState || relay.activeBrowser
   must<HTMLButtonElement>('quickControlBtn').disabled = busy || uploadInFlight || !relay?.isOnline()
@@ -1423,9 +1512,6 @@ function renderControls(): void {
   must<HTMLButtonElement>('sendBtn').disabled = busy || uploadInFlight || liveOwnsWork() || !hasExportGeometry() || !relayReady || !contextMatches ||
     pendingImport !== null
   must<HTMLButtonElement>('downloadSvgBtn').disabled = busy || !hasExportGeometry()
-  // Import recovery only matters while a send has an unresolved outcome.
-  must<HTMLButtonElement>('checkImportBtn').hidden = pendingImport === null
-  must<HTMLButtonElement>('resolveImportBtn').hidden = pendingImport === null
   const queue = liveQueue()
   if (!requestInFlight) must<HTMLInputElement>('liveUpdateToggle').checked = liveEnabled
   must<HTMLInputElement>('liveUpdateToggle').disabled = sessionEnded || handoverPending || handoverStopping || requestInFlight || (!otherTabOwnsLive && !liveEnabled && (uploadInFlight || !!queue.items.length || !!queue.paused))
@@ -1433,7 +1519,7 @@ function renderControls(): void {
   const recoveryRow = must<HTMLDivElement>('liveRecoveryRow')
   const recoveryVisible = handoverPending || handoverStopping || otherTabOwnsLive || !!queue.paused || !!queue.items.length
   recoveryRow.hidden = !recoveryVisible
-  must<HTMLElement>('liveUpdateStatus').textContent = handoverPending ? 'Waiting for safe Live update transfer…' : handoverStopping ? 'Stopping for safe transfer…' : otherTabOwnsLive ? 'Another tab owns Live update. Use Pair or enable Live update here to take over safely.' : queue.paused ? `Paused: ${queue.paused} · ${queue.items.length} pending` :
+  must<HTMLElement>('liveUpdateStatus').textContent = handoverPending ? 'Waiting for safe Live update transfer…' : handoverStopping ? 'Stopping for safe transfer…' : otherTabOwnsLive ? 'Another tab owns Live update. Enable Live update here to take over safely.' : queue.paused ? `Paused: ${queue.paused} · ${queue.items.length} pending` :
     `${liveEnabled ? 'On' : queue.items.length ? 'Off · draining' : 'Off'} · ${queue.items.length}/${LIVE_QUEUE_LIMIT} pending · ${queue.confirmed} confirmed${queue.items.length >= LIVE_QUEUE_LIMIT ? ' · Queue full; wait for imports' : ''}`
   const head = queue.items[0]
   must<HTMLButtonElement>('liveCheckBtn').hidden = !queue.paused || !head || head.phase === 'queued'
@@ -1442,6 +1528,7 @@ function renderControls(): void {
   must<HTMLButtonElement>('liveAbandonBtn').hidden = !queue.paused && !queue.items.length
   for (const id of ['liveCheckBtn', 'liveReconcileBtn', 'liveResumeBtn', 'liveAbandonBtn']) must<HTMLButtonElement>(id).disabled = otherTabOwnsLive || handoverPending || handoverStopping || liveRecoveryInFlight || liveDispatching || requestInFlight
   must<HTMLInputElement>('loadSessionInput').disabled = busy || liveOwnsWork()
+  updateDecision()
 }
 
 function renderEditor(): void {

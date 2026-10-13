@@ -23,7 +23,7 @@ async function latestRelease(): Promise<unknown> {
   return response.json()
 }
 
-export function setupOnboarding(): void {
+export function setupOnboarding(options: { onUnlink?: () => void } = {}): void {
   const dialog = document.createElement('dialog')
   dialog.id = 'startDialog'
   dialog.setAttribute('aria-labelledby', 'startTitle')
@@ -44,7 +44,8 @@ export function setupOnboarding(): void {
       <p class="hint">No administrator access is needed. RAP tells you when an update is available; click <strong>Update now</strong> in RAP to install it.</p>
     </section>
     <section><h3>Use a phone or another browser</h3><p>In RAP choose <strong>Pair phone</strong>, scan the QR code (or open its link), check that the phrase matches, then click <strong>Approve matching phrase</strong> in RAP. Only one browser is connected at a time; pairing a new one replaces the old one. Both devices need internet access, but not the same Wi-Fi.</p></section>
-    <section><h3>Already set up?</h3><p>Start RAP and click <strong>Open PathPlotter</strong>, or use Connection &gt; Reconnect in a browser that was paired before. RAP runs in the desktop widget area (system tray) — if you don't see its window, look for the tray icon near the clock. If PathPlotter cannot reach RAP, check that RAP is running and the computer is online. If it says LightBurn is not ready, read the reason in the RAP window: LightBurn must be running with its REST API on, RAP must have permission, and a machine must be connected.</p></section>
+    <section><h3>Already set up?</h3><p>Start RAP and click <strong>Open PathPlotter</strong>, or just open PathPlotter again in a browser that was paired before; it reconnects by itself and asks you if anything needs a decision. RAP runs in the desktop widget area (system tray) — if you don't see its window, look for the tray icon near the clock. If PathPlotter cannot reach RAP, check that RAP is running and the computer is online. If it says LightBurn is not ready, read the reason in the RAP window: LightBurn must be running with its REST API on, RAP must have permission, and a machine must be connected.</p></section>
+    ${options.onUnlink ? `<section><h3>This browser</h3><p>Forget this browser's pairing with RAP, for example on a shared computer. Also revoke it in RAP's <strong>Paired browser</strong> list (under Advanced connection settings) to remove its access on the relay.</p><button id="unlinkBrowser">Unlink this browser</button></section>` : ''}
   `
   document.body.append(dialog)
   const get = <T extends HTMLElement>(id: string): T => {
@@ -54,6 +55,7 @@ export function setupOnboarding(): void {
   }
   document.querySelector<HTMLButtonElement>('#getStartedBtn')?.addEventListener('click', () => { if (!dialog.open) dialog.showModal() })
   get('closeStart').addEventListener('click', () => dialog.close())
+  dialog.querySelector<HTMLButtonElement>('#unlinkBrowser')?.addEventListener('click', () => { dialog.close(); options.onUnlink?.() })
   get<HTMLButtonElement>('findRap').addEventListener('click', async event => {
     const button = event.currentTarget as HTMLButtonElement
     button.disabled = true

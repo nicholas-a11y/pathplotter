@@ -1,4 +1,4 @@
-﻿# PathPlotter
+# PathPlotter
 
 **Capture positions from LightBurn, plot them in your browser, and turn them into circles, open paths or closed outlines.**
 
@@ -42,7 +42,7 @@ Keep LightBurn's **Allow API Access From Network** setting **off**.
 5. RAP connects to the relay and opens PathPlotter in your browser, which pairs automatically. LightBurn does not need to be ready yet.
 6. Before capturing, connect your machine in LightBurn, click **Request local LightBurn permission** in RAP, bring LightBurn to the front and approve within 30 seconds. This is needed once. Until LightBurn is ready, PathPlotter shows **LightBurn not ready** and capture stays disabled.
 
-Later, start RAP and click **Open PathPlotter**. A browser that was paired before can also use **Connection > Reconnect**.
+Later, start RAP and click **Open PathPlotter**. A browser that was paired before reconnects by itself when you open PathPlotter. If the connection is lost, PathPlotter shows a window offering **Reconnect now**.
 
 RAP keeps itself up to date: when a new version is published it shows **Update now**. See the [RAP guide](rap/README.md) for updates, the tray menu and troubleshooting.
 
@@ -103,28 +103,28 @@ Your groups and current capture are saved in this browser only. They are not sha
 
 ### Why a button is disabled
 
-The status line explains the actual reason. Common cases:
+The status line explains the actual reason. When something needs a decision, PathPlotter opens a window for it automatically; click the status chip at the top to open it again if you closed it. Common cases:
 
 | Situation | What to do |
 | --- | --- |
 | Waiting for fresh coordinates | Check RAP, LightBurn and the machine connection. |
-| Another tab or browser has capture control | Click **Take control** and confirm. |
-| Workspace confirmation needed | If the saved points belong to this machine and origin, use **Connection > Advanced > Confirm workspace for existing points**. Otherwise export a backup and clear the old points. Confirming does not move or re-measure points. |
+| Another tab or browser has capture control | Choose **Take control** in the window that opens (or the **Take control** button). |
+| Workspace confirmation needed | In the window that opens, choose **They belong to this workspace** if the saved points belong to this machine and origin. Otherwise choose **Download backup**, then **Clear points**. Confirming does not move or re-measure points. |
 | Finish disabled but points exist | Finish needs enough points in the **current** group. |
 
 ### Interrupted imports
 
-If a full Send is interrupted, open **Connection > Advanced**:
+If a full Send is interrupted, PathPlotter opens a **Check the last import** window with:
 
-- **Check last import** asks RAP for the outcome. It never resends.
-- **Acknowledge uncertain import** is for when the outcome is unknown. Inspect LightBurn first; this clears the warning without retrying or deleting anything.
+- **Check import** asks RAP for the outcome. It never resends.
+- **Acknowledge outcome** is for when the outcome is unknown. Inspect LightBurn first; this clears the warning without retrying or deleting anything.
 
 PathPlotter never resends an import whose outcome is unknown, so a missing piece may need adding manually but nothing is silently duplicated.
 
 ## Privacy
 
 - LightBurn's API secret never leaves the computer. RAP's credentials and import journal are protected for the current Windows user.
-- **Connection > Advanced > Unlink this browser** forgets the pairing in this browser. RAP's **Paired browser** list (under Advanced connection settings) revokes it on the relay.
+- **Help > Unlink this browser** forgets the pairing in this browser. RAP's **Paired browser** list (under Advanced connection settings) revokes it on the relay.
 - The relay keeps only the latest coordinates, not movement history. SVGs pass through the relay for import, and temporary coordinates, jobs and pairing requests are deleted within 24 hours.
 
 ## Development

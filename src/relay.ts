@@ -471,7 +471,7 @@ export class RelayClient {
         this.rejectRead(new Error('Connection interrupted. Capture was not saved.'))
         if (event?.reason === 'browser_replaced') {
           // Retrying would just take the connection back from the newer tab and start a tug-of-war.
-          this.error = 'PathPlotter was opened in another tab or window, which took over this connection. Click Connection > Reconnect to take it back.'
+          this.error = 'PathPlotter was opened in another tab or window, which took over this connection. Choose Reconnect now to take it back.'
           this.changed()
           return
         }
