@@ -11,7 +11,7 @@ test('no modal is shown when nothing needs a decision', () => {
 })
 
 test('a pairing in progress is mandatory, opens at once and can only be cancelled', () => {
-  const decision = chooseDecision({ ...idle, pairing: { text: 'Compare “AMBER RIVER” with RAP', urgent: true, error: false } })
+  const decision = chooseDecision({ ...idle, pairing: { text: 'To finish pairing, open the PathPlotter RAP and click “Approve matching phrase” if you see “AMBER RIVER”.', urgent: true, error: false } })
   assert.equal(decision?.kind, 'pairing')
   assert.equal(decision?.urgent, true)
   assert.equal(decision?.mandatory, true)
