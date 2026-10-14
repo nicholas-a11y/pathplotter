@@ -92,7 +92,7 @@ test('phone links reuse valid saved authorization and otherwise wait for exact d
     const paired = await exchangeBrowserLink(link, existing, text => messages.push(text), () => true)
     assert.equal(paired?.credential, 'phone-authorized')
     assert.deepEqual(paths.slice(1), ['/ticket', '/pairing/request', '/pairing/status'])
-    assert.ok(messages.some(message => message.includes('compare-this-phrase')))
+    assert.ok(messages.includes('compare-this-phrase\n\nTo finish pairing, open the PathPlotter RAP in the Windows system tray\nand click “Approve matching phrase”.'))
   } finally { globalThis.fetch = original }
 })
 

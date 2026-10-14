@@ -188,7 +188,7 @@ export async function exchangeBrowserLink(link: BrowserLink, existing: RelayIden
   if (!record(result) || typeof result.pairingId !== 'string' || typeof result.pendingToken !== 'string' || typeof result.phrase !== 'string') {
     throw new Error('Invalid pairing response.')
   }
-  message(`To finish pairing, open the PathPlotter RAP (Windows system tray) and click “Approve matching phrase” if you see “${result.phrase}”.`, true)
+  message(`${result.phrase}\n\nTo finish pairing, open the PathPlotter RAP in the Windows system tray\nand click “Approve matching phrase”.`, true)
   const deadline = performance.now() + 300000
   while (active() && performance.now() < deadline) {
     await new Promise(resolve => setTimeout(resolve, 1000))

@@ -148,7 +148,7 @@ function Show-Approvals($Pairings) {
         $card = New-Object Windows.Forms.FlowLayoutPanel
         $card.Size = New-Object Drawing.Size(565, 104); $card.FlowDirection = 'LeftToRight'
         $phrase = New-Object Windows.Forms.Label
-        $phrase.Text = 'Approve only if the browser shows exactly:' + [Environment]::NewLine + $Pairings[$id]
+        $phrase.Text = $Pairings[$id]
         $phrase.Font = New-Object Drawing.Font($phrase.Font.FontFamily, 12, [Drawing.FontStyle]::Bold)
         $phrase.Size = New-Object Drawing.Size(545, 58); $card.Controls.Add($phrase)
         $approve = New-UiButton 'Approve matching phrase' @{ action = 'decide'; id = $id; phrase = $Pairings[$id]; approve = $true }
@@ -524,6 +524,7 @@ function Step-GuiSmoke {
         }
         3 {
             if ($s.smokePhones -eq 1 -and $s.pairings.ContainsKey('fixture-pair') -and -not $s.busy) {
+                if ($s.approvals.Controls.Count -eq 0 -or $s.approvals.Controls[0].Controls[0].Text -cne 'AMBER RIVER') { throw 'Pairing approval did not show only the matching phrase.' }
                 [void](Submit-Ui @{ action = 'decide'; id = 'fixture-pair'; phrase = 'WRONG PHRASE'; approve = $true })
                 $s.smokeStage = 4
             }
