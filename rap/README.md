@@ -20,9 +20,9 @@ Registration needs only the Invitation ID. RAP uses the hosted relay and this co
 
 - Start RAP with **Start RAP.cmd**. Starting it again just shows the running window.
 - **Open PathPlotter** opens the app on this computer.
-- The window shows which browser is paired, with a **Disconnect** button to remove its access.
+- While a browser is paired, the window shows **Disconnect paired browser** (under the status line) instead of **Open PathPlotter** and **Pair phone**. Disconnect it to pair a different browser, or to remove its access.
 - **Pair phone** shows a QR code in the window (with **Copy link** for sending it another way). Scan it, check the phrase on the phone matches the one in RAP, then click **Approve matching phrase**.
-- Only one browser is connected at a time. Pairing a new one replaces the old one after you confirm.
+- Only one browser is connected at a time. A paired browser reconnects by itself when you open PathPlotter again.
 - Closing the window keeps RAP in the system tray. Right-click the tray icon and choose **Quit** to stop it.
 
 ## Updates

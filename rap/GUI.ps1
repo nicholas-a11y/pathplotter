@@ -223,11 +223,14 @@ function Handle-UiEvent($Event) {
         'phone' { Show-Phone $Event.value; $d.smokePhones++; if ($d.smoke -and $d.phoneUrl -and $null -ne $d.phonePicture.Image) { $d.smokePhoneShown = $true } }
         'pairings' { Show-Approvals $Event.value }
         'browser' {
+            # One browser at a time: while it is paired only Disconnect is offered.
             $d.browser = $Event.value
-            $d.browserRow.Visible = $true
-            if ($null -eq $d.browser) { $d.browserLabel.Text = 'No browser paired yet.'; $d.revoke.Visible = $false }
-            else { $d.browserLabel.Text = 'Paired browser: ' + $d.browser.label; $d.revoke.Visible = $true }
-            if ($d.smoke -and $null -eq $d.browser -and $d.browserLabel.Text -ceq 'No browser paired yet.') { $d.smokeBrowserShown = $true }
+            $paired = $null -ne $d.browser
+            $d.revoke.Visible = $paired
+            $d.actions.Visible = -not $paired
+            foreach ($name in @('menu-open', 'menu-phone')) { $d[$name].Available = -not $paired }
+            if ($paired) { Clear-Phone }
+            if ($d.smoke -and -not $paired) { $d.smokeBrowserShown = $true }
         }
         'confirm-switch' { $d.switchRequest = $Event.value }
         'action-complete' {
@@ -300,6 +303,17 @@ function Start-RapDesktop {
         $d.status = New-Object Windows.Forms.Label
         $d.status.Text = 'Starting RAP...'; $d.status.AutoSize = $true; $d.status.MaximumSize = New-Object Drawing.Size(585, 0)
         $d.status.Margin = New-Object Windows.Forms.Padding(3, 3, 3, 8); $layout.Controls.Add($d.status)
+        # Shown only while a browser is paired; then Open PathPlotter and Pair phone are hidden.
+        $d.revoke = New-Object Windows.Forms.Button
+        $d.revoke.Text = 'Disconnect paired browser'; $d.revoke.AutoSize = $true; $d.revoke.Visible = $false; $d.revoke.Enabled = $false
+        $d.revoke.Margin = New-Object Windows.Forms.Padding(3, 0, 3, 8)
+        $d.revoke.Add_Click({
+            $s = $script:Desktop
+            if ($null -ne $s.browser -and [Windows.Forms.MessageBox]::Show('Disconnect the paired browser? Its access to RAP stops. It can be paired again later.', 'Disconnect paired browser', 'YesNo', 'Warning') -eq 'Yes') {
+                [void](Submit-Ui @{ action = 'revoke'; id = $s.browser.id })
+            }
+        })
+        $layout.Controls.Add($d.revoke)
         $d.notice = New-Object Windows.Forms.Label
         $d.notice.AutoSize = $true; $d.notice.MaximumSize = New-Object Drawing.Size(585, 0); $d.notice.Visible = $false
         $d.notice.Margin = New-Object Windows.Forms.Padding(3, 0, 3, 8)
@@ -326,25 +340,10 @@ function Start-RapDesktop {
         $d.importing = $false
         $actions = New-Object Windows.Forms.FlowLayoutPanel
         $actions.AutoSize = $true; $actions.AutoSizeMode = 'GrowAndShrink'; $layout.Controls.Add($actions)
+        $d.actions = $actions
         $d.open = New-UiButton 'Open PathPlotter' @{ action = 'open' }
         $d.pair = New-UiButton 'Pair phone' @{ action = 'phone' }
         foreach ($button in @($d.open, $d.pair)) { $button.Enabled = $false; $actions.Controls.Add($button) }
-        $d.browserRow = New-Object Windows.Forms.FlowLayoutPanel
-        $d.browserRow.AutoSize = $true; $d.browserRow.AutoSizeMode = 'GrowAndShrink'; $d.browserRow.Visible = $false
-        $d.browserLabel = New-Object Windows.Forms.Label
-        $d.browserLabel.AutoSize = $true; $d.browserLabel.MaximumSize = New-Object Drawing.Size(430, 0)
-        $d.browserLabel.Margin = New-Object Windows.Forms.Padding(3, 8, 3, 3); $d.browserLabel.Text = 'No browser paired yet.'
-        $d.browserRow.Controls.Add($d.browserLabel)
-        $d.revoke = New-Object Windows.Forms.Button
-        $d.revoke.Text = 'Disconnect'; $d.revoke.AutoSize = $true; $d.revoke.Visible = $false; $d.revoke.Enabled = $false
-        $d.revoke.Add_Click({
-            $s = $script:Desktop
-            if ($null -ne $s.browser -and [Windows.Forms.MessageBox]::Show('Disconnect this browser? Its access to RAP stops. It can be paired again later.', 'Disconnect browser', 'YesNo', 'Warning') -eq 'Yes') {
-                [void](Submit-Ui @{ action = 'revoke'; id = $s.browser.id })
-            }
-        })
-        $d.browserRow.Controls.Add($d.revoke)
-        $layout.Controls.Add($d.browserRow)
         $d.phone = New-Object Windows.Forms.FlowLayoutPanel
         $d.phone.AutoSize = $true; $d.phone.AutoSizeMode = 'GrowAndShrink'; $d.phone.FlowDirection = 'TopDown'; $d.phone.WrapContents = $false; $d.phone.Visible = $false
         $phoneHelp = New-Object Windows.Forms.Label
@@ -398,7 +397,7 @@ function Start-RapDesktop {
         })
         $versionRow.Controls.Add($d.update)
         $safety = New-Object Windows.Forms.Label
-        $safety.Text = 'RAP only sends SVG imports; it never jogs, fires or starts the laser. Closing this window keeps RAP in the system tray.'
+        $safety.Text = 'Closing this window keeps RAP in the system tray.'
         $safety.AutoSize = $true; $safety.MaximumSize = New-Object Drawing.Size(585, 0); $layout.Controls.Add($safety)
         $d.tray = New-Object Windows.Forms.NotifyIcon
         $d.tray.Icon = [Drawing.SystemIcons]::Application; $d.tray.Text = 'PathPlotter RAP - Starting'; $d.tray.Visible = $true
@@ -546,6 +545,10 @@ function Step-GuiSmoke {
         }
         6 {
             if (-not $s.phoneUrl -and -not $s.busy -and $s.update.Visible) {
+                Handle-UiEvent @{ kind = 'browser'; value = @{ id = 'fixture-browser'; label = 'Fixture browser' } }
+                if (-not $s.revoke.Visible -or $s.actions.Visible -or $s['menu-open'].Available -or $s['menu-phone'].Available) { throw 'A paired browser did not replace Open PathPlotter and Pair phone with Disconnect.' }
+                Handle-UiEvent @{ kind = 'browser'; value = $null }
+                if ($s.revoke.Visible -or -not $s.actions.Visible -or -not $s['menu-open'].Available -or -not $s['menu-phone'].Available) { throw 'Disconnecting did not bring back Open PathPlotter and Pair phone.' }
                 if ($s.update.Text -cne 'Update now to v9.9.9' -or $s.versionLabel.Text -notmatch '^RAP v\d+\.\d+\.\d+ - update available$') { throw 'Update offer is not shown.' }
                 [void](Submit-Ui @{ action = 'update' }); $s.smokeStage = 7
             }

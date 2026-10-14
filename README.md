@@ -52,7 +52,7 @@ RAP keeps itself up to date: when a new version is published it shows **Update n
 2. Scan the QR code or open its private link on the phone.
 3. Check that the phrase on the phone matches RAP, then click **Approve matching phrase**.
 
-Only one browser is connected to a RAP at a time; pairing a phone replaces the computer's browser (and the other way round) after you confirm. Finish or acknowledge any pending imports in the old browser before switching. Do not share pairing links or photos of the QR code.
+Only one browser is connected to a RAP at a time. While one is paired, RAP shows **Disconnect paired browser** instead of **Open PathPlotter** and **Pair phone**; click it to pair a different browser. Finish or acknowledge any pending imports in the old browser first. Do not share pairing links or photos of the QR code.
 
 ## Capture your first shape
 
@@ -124,7 +124,7 @@ PathPlotter never resends an import whose outcome is unknown, so a missing piece
 ## Privacy
 
 - LightBurn's API secret never leaves the computer. RAP's credentials and import journal are protected for the current Windows user.
-- **Help > Unlink this browser** forgets the pairing in this browser. RAP's **Disconnect** button revokes it on the relay.
+- **Help > Unlink this browser** forgets the pairing in this browser. RAP's **Disconnect paired browser** button revokes it on the relay.
 - The relay keeps only the latest coordinates, not movement history. SVGs pass through the relay for import, and temporary coordinates, jobs and pairing requests are deleted within 24 hours.
 
 ## Development
