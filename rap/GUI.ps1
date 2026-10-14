@@ -95,6 +95,22 @@ function Show-RapWindow {
     [void]$form.Activate()
 }
 
+# The hosted relay is built in. A relay.txt next to these files (one https origin) overrides it for self-hosting.
+function Get-RelayOrigin {
+    $override = Join-Path $PSScriptRoot 'relay.txt'
+    if ([IO.File]::Exists($override)) {
+        $text = [IO.File]::ReadAllText($override).Trim()
+        if ($text) { return $text }
+    }
+    return 'https://pathplotter-relay-v3.nicholas-leqeta.workers.dev'
+}
+
+function Get-ComputerLabel {
+    $name = [string]$env:COMPUTERNAME
+    if ([string]::IsNullOrWhiteSpace($name)) { $name = 'This computer' }
+    return $name.Substring(0, [Math]::Min(64, $name.Length))
+}
+
 function Clear-Phone {
     $d = $script:Desktop
     if ($null -eq $d.phone) { return }
@@ -102,54 +118,39 @@ function Clear-Phone {
     try {
         if ([Windows.Forms.Clipboard]::ContainsText() -and [Windows.Forms.Clipboard]::GetText() -ceq $d.phoneUrl) { [Windows.Forms.Clipboard]::Clear() }
     } catch { }
-    $d.phoneUrl = ''; $d.phoneLink.Clear(); $d.phoneCopy.Enabled = $false
-    $d.phoneExpiry.Text = 'Invitation expired or closed. Create a new invitation to pair.'
+    $d.phoneUrl = ''; $d.phoneCopy.Enabled = $false
+    $d.phone.Visible = $false
 }
 
 function Show-Phone($Value) {
     $d = $script:Desktop
-    if ($null -ne $d.phone) { Clear-Phone; $d.phone.Dispose() }
-    $d.phone = New-Object Windows.Forms.Form
-    $d.phone.Text = 'Pair phone - private invitation'; $d.phone.ClientSize = New-Object Drawing.Size(500, 580)
-    $panel = New-Object Windows.Forms.FlowLayoutPanel
-    $panel.Dock = 'Fill'; $panel.FlowDirection = 'TopDown'; $panel.WrapContents = $false; $panel.AutoScroll = $true
-    $d.phone.Controls.Add($panel)
-    $label = New-Object Windows.Forms.Label
-    $label.Text = 'Scan with your phone. Compare its phrase here before approving. Do not share this QR/link or screenshots.'
-    $label.Size = New-Object Drawing.Size(470, 55); $panel.Controls.Add($label)
+    Clear-Phone
     $d.phoneUrl = $Value.url
     $d.phoneImage = New-InvitationBitmap $Value.url
-    $d.phonePicture = New-Object Windows.Forms.PictureBox
-    $d.phonePicture.Size = New-Object Drawing.Size(470, 370); $d.phonePicture.SizeMode = 'Zoom'; $d.phonePicture.Image = $d.phoneImage
-    $panel.Controls.Add($d.phonePicture)
-    $d.phoneLink = New-Object Windows.Forms.TextBox
-    $d.phoneLink.ReadOnly = $true; $d.phoneLink.Width = 470; $d.phoneLink.Text = $Value.url; $panel.Controls.Add($d.phoneLink)
-    $d.phoneCopy = New-Object Windows.Forms.Button
-    $d.phoneCopy.Text = 'Copy private phone link'; $d.phoneCopy.AutoSize = $true
-    $d.phoneCopy.Add_Click({ if ($script:Desktop.phoneUrl) { [Windows.Forms.Clipboard]::SetText($script:Desktop.phoneUrl) } })
-    $panel.Controls.Add($d.phoneCopy)
-    $d.phoneExpiry = New-Object Windows.Forms.Label
-    $d.phoneExpiry.Size = New-Object Drawing.Size(470, 35); $panel.Controls.Add($d.phoneExpiry)
+    $d.phonePicture.Image = $d.phoneImage
+    $d.phoneCopy.Enabled = $true
+    $d.phoneExpiry.Text = ''
     $d.phoneDeadline = $d.clock.ElapsedMilliseconds + $Value.remainingMs
-    $d.phone.Add_FormClosed({ Clear-Phone })
-    $d.phone.Show($d.form)
+    $d.phone.Visible = $true
 }
 
 function Show-Approvals($Pairings) {
     $d = $script:Desktop
+    if ($Pairings.Count -gt 0) { Clear-Phone }
     $signature = ($Pairings.Keys | Sort-Object | ForEach-Object { $_ + ':' + $Pairings[$_] }) -join '|'
     $d.pairings = $Pairings
     $d.approvals.Visible = $Pairings.Count -gt 0
-    $d.approvals.Height = [Math]::Min(250, $Pairings.Count * 96)
+    $d.approvals.Height = [Math]::Min(250, $Pairings.Count * 110)
     if ($signature -ceq $d.pairingSignature) { return }
     $d.pairingSignature = $signature
     while ($d.approvals.Controls.Count -gt 0) { $d.approvals.Controls[0].Dispose() }
     foreach ($id in ($Pairings.Keys | Sort-Object)) {
         $card = New-Object Windows.Forms.FlowLayoutPanel
-        $card.Size = New-Object Drawing.Size(565, 90); $card.FlowDirection = 'LeftToRight'
+        $card.Size = New-Object Drawing.Size(565, 104); $card.FlowDirection = 'LeftToRight'
         $phrase = New-Object Windows.Forms.Label
-        $phrase.Text = 'Compare the exact phrase on the requesting browser:' + [Environment]::NewLine + $Pairings[$id]
-        $phrase.Size = New-Object Drawing.Size(545, 45); $card.Controls.Add($phrase)
+        $phrase.Text = 'Approve only if the browser shows exactly:' + [Environment]::NewLine + $Pairings[$id]
+        $phrase.Font = New-Object Drawing.Font($phrase.Font.FontFamily, 12, [Drawing.FontStyle]::Bold)
+        $phrase.Size = New-Object Drawing.Size(545, 58); $card.Controls.Add($phrase)
         $approve = New-UiButton 'Approve matching phrase' @{ action = 'decide'; id = $id; phrase = $Pairings[$id]; approve = $true }
         $reject = New-UiButton 'Reject' @{ action = 'decide'; id = $id; phrase = $Pairings[$id]; approve = $false }
         $card.Controls.Add($approve); $card.Controls.Add($reject); $d.approvals.Controls.Add($card)
@@ -160,37 +161,11 @@ function Show-Approvals($Pairings) {
     }
 }
 
-function Show-Browsers($Rows) {
-    $d = $script:Desktop
-    if ($null -ne $d.browsers) { $d.browsers.Dispose() }
-    $d.browsers = New-Object Windows.Forms.Form
-    $d.browsers.Text = 'Paired browser'; $d.browsers.ClientSize = New-Object Drawing.Size(440, 300)
-    $panel = New-Object Windows.Forms.FlowLayoutPanel
-    $panel.Dock = 'Fill'; $panel.AutoScroll = $true; $panel.FlowDirection = 'TopDown'; $panel.WrapContents = $false
-    $d.browsers.Controls.Add($panel)
-    foreach ($row in $Rows) {
-        $button = New-Object Windows.Forms.Button
-        $button.AutoSize = $true; $button.Text = 'Revoke: ' + $row.label; $button.Tag = $row.id
-        $button.Add_Click({
-            param($sender, $eventArgs)
-            if ([Windows.Forms.MessageBox]::Show('Revoke this browser? Its relay access will stop.', 'Revoke browser', 'YesNo', 'Warning') -eq 'Yes') {
-                if (Submit-Ui @{ action = 'revoke'; id = $sender.Tag }) { $sender.Enabled = $false }
-            }
-        })
-        $panel.Controls.Add($button)
-    }
-    if (@($Rows).Count -eq 0) {
-        $label = New-Object Windows.Forms.Label
-        $label.Text = 'No approved browsers.'; $label.AutoSize = $true; $panel.Controls.Add($label)
-    }
-    $d.browsers.Show($d.form)
-}
-
 function Handle-UiEvent($Event) {
     $d = $script:Desktop
     switch -CaseSensitive ($Event.kind) {
         'setup' {
-            $d.busy = $false; $d.setup.Visible = $true; $d.registrationAdvanced.Visible = $true; $d.register.Enabled = $true
+            $d.busy = $false; $d.setup.Visible = $true; $d.register.Enabled = $true
             $d.status.Text = 'Not registered. Enter the Invitation ID you were given.'
             Show-RapWindow
         }
@@ -205,7 +180,7 @@ function Handle-UiEvent($Event) {
             if ($Event.value) { $d.consentNeeded = $false; $d.consentHelp.Visible = $false; $d.consent.Visible = $false }
             else { $d.consent.Enabled = $true }
         }
-        'configured' { $d.configured = $true; $d.busy = $false; $d.setup.Visible = $false; $d.registrationAdvanced.Visible = $false; $d.status.Text = 'Connecting to the relay...' }
+        'configured' { $d.configured = $true; $d.busy = $false; $d.setup.Visible = $false; $d.status.Text = 'Connecting to the relay...' }
         'recovery' {
             $d.busy = $false; $d.recovery.Visible = $true
             $d.status.Text = 'Saved registration is invalid or unreadable. Replace only local credentials with explicit consent below. The import journal is preserved; ask the operator to revoke the old agent credential and revoke the old LightBurn entry.'
@@ -224,7 +199,7 @@ function Handle-UiEvent($Event) {
             if (-not $d.healthy) { Show-Approvals @{} }
         }
         'version' {
-            $d.versionLabel.Text = 'RAP v' + $Event.value.current
+            $d.versionLabel.Text = 'RAP v' + $Event.value.current + $(if ($Event.value.upToDate) { ' - up to date' } else { '' })
             $d.update.Visible = [bool]$Event.value.available
             if ($Event.value.available) {
                 $d.update.Text = 'Update now to v' + $Event.value.latest
@@ -245,9 +220,15 @@ function Handle-UiEvent($Event) {
             }
             $Event.value = $null
         }
-        'phone' { Show-Phone $Event.value; $d.smokePhones++ }
+        'phone' { Show-Phone $Event.value; $d.smokePhones++; if ($d.smoke -and $d.phoneUrl -and $null -ne $d.phonePicture.Image) { $d.smokePhoneShown = $true } }
         'pairings' { Show-Approvals $Event.value }
-        'browsers' { Show-Browsers $Event.value }
+        'browser' {
+            $d.browser = $Event.value
+            $d.browserRow.Visible = $true
+            if ($null -eq $d.browser) { $d.browserLabel.Text = 'No browser paired yet.'; $d.revoke.Visible = $false }
+            else { $d.browserLabel.Text = 'Paired browser: ' + $d.browser.label; $d.revoke.Visible = $true }
+            if ($d.smoke -and $null -eq $d.browser -and $d.browserLabel.Text -ceq 'No browser paired yet.') { $d.smokeBrowserShown = $true }
+        }
         'confirm-switch' { $d.switchRequest = $Event.value }
         'action-complete' {
             $d.busy = $false; $d.pairingSignature = $null
@@ -297,7 +278,7 @@ function Start-RapDesktop {
     $d = @{
         bridge = (New-Object PathPlotterRap.UiBridge); clock = [Diagnostics.Stopwatch]::StartNew()
         activation = $activation; configured = $false; healthy = $false; lightBurn = $false; consentNeeded = $false; consentPending = $false; busy = $false; closing = $false; stopped = $false; failed = $false
-        phone = $null; phoneImage = $null; phoneUrl = ''; phoneDeadline = 0L; browsers = $null; switchRequest = $null
+        phone = $null; phoneImage = $null; phoneUrl = ''; phoneDeadline = 0L; browser = $null; switchRequest = $null; smokePhoneShown = $false; smokeBrowserShown = $false
         pairings = @{}; pairingSignature = ''; smoke = [bool]$SmokeTest; smokeOpens = 0; smokePhones = 0; smokeStage = 0; smokeConsentTicks = 0
         fixtureEvents = (New-Object 'Collections.Generic.List[string]')
     }
@@ -324,13 +305,84 @@ function Start-RapDesktop {
         $d.notice.Margin = New-Object Windows.Forms.Padding(3, 0, 3, 8)
         $d.notice.ForeColor = [Drawing.Color]::DarkRed; $layout.Controls.Add($d.notice)
         $d.notice.Add_TextChanged({ param($sender, $eventArgs) $sender.Visible = $sender.Text.Length -gt 0 })
+        # Top to bottom: registration (first run only), actions, who is paired, the phone QR, approvals, LightBurn permission, version.
+        $d.setup = New-Object Windows.Forms.FlowLayoutPanel
+        $d.setup.AutoSize = $true; $d.setup.AutoSizeMode = 'GrowAndShrink'; $d.setup.FlowDirection = 'TopDown'; $d.setup.WrapContents = $false; $d.setup.Visible = $false
+        $layout.Controls.Add($d.setup)
+        $label = New-Object Windows.Forms.Label
+        $label.Text = 'Invitation ID'; $label.AutoSize = $true; $d.setup.Controls.Add($label)
+        $d.invitation = New-Object Windows.Forms.TextBox
+        $d.invitation.Width = 540; $d.invitation.UseSystemPasswordChar = $true; $d.setup.Controls.Add($d.invitation)
+        $d.register = New-Object Windows.Forms.Button
+        $d.register.Text = 'Register this computer'; $d.register.AutoSize = $true
+        $d.register.Add_Click({
+            $s = $script:Desktop
+            if ([string]::IsNullOrWhiteSpace($s.invitation.Text)) { $s.notice.Text = 'Enter your Invitation ID.'; return }
+            if (Submit-Ui @{ action = 'register'; api = (Get-RelayOrigin); name = (Get-ComputerLabel); invitation = $s.invitation.Text.Trim() }) {
+                $s.invitation.Clear(); $s.register.Enabled = $false; $s.status.Text = 'Registering...'
+            }
+        })
+        $d.setup.Controls.Add($d.register)
+        $d.importing = $false
         $actions = New-Object Windows.Forms.FlowLayoutPanel
         $actions.AutoSize = $true; $actions.AutoSizeMode = 'GrowAndShrink'; $layout.Controls.Add($actions)
         $d.open = New-UiButton 'Open PathPlotter' @{ action = 'open' }
         $d.pair = New-UiButton 'Pair phone' @{ action = 'phone' }
-        $d.list = New-UiButton 'Paired browser' @{ action = 'browsers' }
         foreach ($button in @($d.open, $d.pair)) { $button.Enabled = $false; $actions.Controls.Add($button) }
-        $d.list.Enabled = $false
+        $d.browserRow = New-Object Windows.Forms.FlowLayoutPanel
+        $d.browserRow.AutoSize = $true; $d.browserRow.AutoSizeMode = 'GrowAndShrink'; $d.browserRow.Visible = $false
+        $d.browserLabel = New-Object Windows.Forms.Label
+        $d.browserLabel.AutoSize = $true; $d.browserLabel.MaximumSize = New-Object Drawing.Size(430, 0)
+        $d.browserLabel.Margin = New-Object Windows.Forms.Padding(3, 8, 3, 3); $d.browserLabel.Text = 'No browser paired yet.'
+        $d.browserRow.Controls.Add($d.browserLabel)
+        $d.revoke = New-Object Windows.Forms.Button
+        $d.revoke.Text = 'Disconnect'; $d.revoke.AutoSize = $true; $d.revoke.Visible = $false; $d.revoke.Enabled = $false
+        $d.revoke.Add_Click({
+            $s = $script:Desktop
+            if ($null -ne $s.browser -and [Windows.Forms.MessageBox]::Show('Disconnect this browser? Its access to RAP stops. It can be paired again later.', 'Disconnect browser', 'YesNo', 'Warning') -eq 'Yes') {
+                [void](Submit-Ui @{ action = 'revoke'; id = $s.browser.id })
+            }
+        })
+        $d.browserRow.Controls.Add($d.revoke)
+        $layout.Controls.Add($d.browserRow)
+        $d.phone = New-Object Windows.Forms.FlowLayoutPanel
+        $d.phone.AutoSize = $true; $d.phone.AutoSizeMode = 'GrowAndShrink'; $d.phone.FlowDirection = 'TopDown'; $d.phone.WrapContents = $false; $d.phone.Visible = $false
+        $phoneHelp = New-Object Windows.Forms.Label
+        $phoneHelp.Text = 'Scan this with the phone, then approve the phrase it shows. Keep this code private.'
+        $phoneHelp.AutoSize = $true; $phoneHelp.MaximumSize = New-Object Drawing.Size(560, 0); $d.phone.Controls.Add($phoneHelp)
+        $d.phonePicture = New-Object Windows.Forms.PictureBox
+        $d.phonePicture.Size = New-Object Drawing.Size(300, 300); $d.phonePicture.SizeMode = 'Zoom'; $d.phone.Controls.Add($d.phonePicture)
+        $phoneRow = New-Object Windows.Forms.FlowLayoutPanel
+        $phoneRow.AutoSize = $true; $phoneRow.AutoSizeMode = 'GrowAndShrink'
+        $d.phoneCopy = New-Object Windows.Forms.Button
+        $d.phoneCopy.Text = 'Copy link'; $d.phoneCopy.AutoSize = $true; $d.phoneCopy.Enabled = $false
+        $d.phoneCopy.Add_Click({ if ($script:Desktop.phoneUrl) { [Windows.Forms.Clipboard]::SetText($script:Desktop.phoneUrl) } })
+        $phoneRow.Controls.Add($d.phoneCopy)
+        $phoneClose = New-Object Windows.Forms.Button
+        $phoneClose.Text = 'Close'; $phoneClose.AutoSize = $true; $phoneClose.Add_Click({ Clear-Phone })
+        $phoneRow.Controls.Add($phoneClose)
+        $d.phoneExpiry = New-Object Windows.Forms.Label
+        $d.phoneExpiry.AutoSize = $true; $d.phoneExpiry.Margin = New-Object Windows.Forms.Padding(8, 8, 3, 3); $phoneRow.Controls.Add($d.phoneExpiry)
+        $d.phone.Controls.Add($phoneRow)
+        $layout.Controls.Add($d.phone)
+        $d.approvals = New-Object Windows.Forms.FlowLayoutPanel
+        $d.approvals.Size = New-Object Drawing.Size(585, 0); $d.approvals.Visible = $false
+        $d.approvals.FlowDirection = 'TopDown'; $d.approvals.WrapContents = $false; $d.approvals.AutoScroll = $true
+        $layout.Controls.Add($d.approvals)
+        $d.consentHelp = New-Object Windows.Forms.Label
+        $d.consentHelp.AutoSize = $true; $d.consentHelp.MaximumSize = New-Object Drawing.Size(585, 0); $d.consentHelp.Visible = $false
+        $d.consentHelp.Text = 'To capture points, let RAP read LightBurn: turn on REST API in LightBurn (Settings > Extensions), click below, then approve LightBurn''s dialog within 30 seconds.'
+        $layout.Controls.Add($d.consentHelp)
+        $d.consent = New-UiButton 'Request local LightBurn permission' @{ action = 'consent' }
+        $d.consent.Visible = $false; $layout.Controls.Add($d.consent)
+        $d.recovery = New-Object Windows.Forms.Button
+        $d.recovery.Text = 'Replace invalid local registration...'; $d.recovery.AutoSize = $true; $d.recovery.Visible = $false
+        $d.recovery.Add_Click({
+            if ([Windows.Forms.MessageBox]::Show('Forget the unreadable/invalid local credentials and register again? Remote permissions must be revoked separately. The import journal will not be removed.', 'Replace invalid registration', 'YesNo', 'Warning') -eq 'Yes') {
+                if (Submit-Ui @{ action = 'reset-registration' }) { $script:Desktop.recovery.Visible = $false }
+            }
+        })
+        $layout.Controls.Add($d.recovery)
         $versionRow = New-Object Windows.Forms.FlowLayoutPanel
         $versionRow.AutoSize = $true; $versionRow.AutoSizeMode = 'GrowAndShrink'; $layout.Controls.Add($versionRow)
         $d.versionLabel = New-Object Windows.Forms.Label
@@ -345,74 +397,19 @@ function Start-RapDesktop {
             }
         })
         $versionRow.Controls.Add($d.update)
-        $d.setup = New-Object Windows.Forms.FlowLayoutPanel
-        $d.setup.AutoSize = $true; $d.setup.AutoSizeMode = 'GrowAndShrink'; $d.setup.FlowDirection = 'TopDown'; $d.setup.WrapContents = $false; $d.setup.Visible = $false
-        $layout.Controls.Add($d.setup)
-        $d.registrationAdvanced = New-Object Windows.Forms.FlowLayoutPanel
-        $d.registrationAdvanced.AutoSize = $true; $d.registrationAdvanced.AutoSizeMode = 'GrowAndShrink'
-        $d.registrationAdvanced.FlowDirection = 'TopDown'; $d.registrationAdvanced.WrapContents = $false
-        foreach ($field in @(@('Relay origin', 'api'), @('Computer name', 'name'), @('Invitation ID', 'invitation'))) {
-            $parent = $(if ($field[1] -ceq 'invitation') { $d.setup } else { $d.registrationAdvanced })
-            $label = New-Object Windows.Forms.Label
-            $label.Text = $field[0]; $label.AutoSize = $true; $parent.Controls.Add($label)
-            $box = New-Object Windows.Forms.TextBox
-            $box.Width = 540; $d[$field[1]] = $box; $parent.Controls.Add($box)
-        }
-        $d.name.Text = $env:COMPUTERNAME; $d.invitation.UseSystemPasswordChar = $true
-        $d.api.Text = 'https://pathplotter-relay-v3.nicholas-leqeta.workers.dev'
-        $d.register = New-Object Windows.Forms.Button
-        $d.register.Text = 'Register this computer'; $d.register.AutoSize = $true
-        $d.register.Add_Click({
-            $s = $script:Desktop
-            if ([string]::IsNullOrWhiteSpace($s.invitation.Text)) { $s.notice.Text = 'Enter your Invitation ID.'; return }
-            if (Submit-Ui @{ action = 'register'; api = $s.api.Text.Trim(); name = $s.name.Text.Trim(); invitation = $s.invitation.Text.Trim() }) {
-                $s.invitation.Clear(); $s.register.Enabled = $false; $s.status.Text = 'Registering...'
-            }
-        })
-        $d.setup.Controls.Add($d.register)
-        $d.importing = $false
-        $advanced = New-Object Windows.Forms.CheckBox
-        $advanced.Text = 'Advanced connection settings'; $advanced.AutoSize = $true
-        $d.advancedPanel = New-Object Windows.Forms.FlowLayoutPanel
-        $d.advancedPanel.AutoSize = $true; $d.advancedPanel.MaximumSize = New-Object Drawing.Size(580, 0)
-        $d.advancedPanel.FlowDirection = 'TopDown'; $d.advancedPanel.WrapContents = $false
-        $d.advancedPanel.Visible = $false
-        $advanced.Add_CheckedChanged({ param($sender, $eventArgs) $script:Desktop.advancedPanel.Visible = $sender.Checked })
-        $layout.Controls.Add($advanced)
-        $d.advancedPanel.Controls.Add($d.registrationAdvanced)
-        $d.advancedPanel.Controls.Add($d.list)
-        $layout.Controls.Add($d.advancedPanel)
-        $d.consentHelp = New-Object Windows.Forms.Label
-        $d.consentHelp.AutoSize = $true; $d.consentHelp.MaximumSize = New-Object Drawing.Size(585, 0); $d.consentHelp.Visible = $false
-        $d.consentHelp.Text = 'To capture points, give RAP permission to read LightBurn. Open LightBurn, enable REST API in Settings > Extensions (keep network API access disabled), click below, bring LightBurn forward, then approve its own dialog within 30 seconds. You can pair a browser first.'
-        $layout.Controls.Add($d.consentHelp)
-        $d.consent = New-UiButton 'Request local LightBurn permission (state, project, upload)' @{ action = 'consent' }
-        $d.consent.Visible = $false; $layout.Controls.Add($d.consent)
-        $d.recovery = New-Object Windows.Forms.Button
-        $d.recovery.Text = 'Replace invalid local registration...'; $d.recovery.AutoSize = $true; $d.recovery.Visible = $false
-        $d.recovery.Add_Click({
-            if ([Windows.Forms.MessageBox]::Show('Forget the unreadable/invalid local credentials and register again? Remote permissions must be revoked separately. The import journal will not be removed.', 'Replace invalid registration', 'YesNo', 'Warning') -eq 'Yes') {
-                if (Submit-Ui @{ action = 'reset-registration' }) { $script:Desktop.recovery.Visible = $false }
-            }
-        })
-        $layout.Controls.Add($d.recovery)
-        $d.approvals = New-Object Windows.Forms.FlowLayoutPanel
-        $d.approvals.Size = New-Object Drawing.Size(585, 0); $d.approvals.Visible = $false
-        $d.approvals.FlowDirection = 'TopDown'; $d.approvals.WrapContents = $false; $d.approvals.AutoScroll = $true
-        $layout.Controls.Add($d.approvals)
         $safety = New-Object Windows.Forms.Label
-        $safety.Text = 'Send imports SVG only. RAP never jogs, fires or starts the laser. Closing this window keeps RAP in the tray. Choose Quit to stop.'
+        $safety.Text = 'RAP only sends SVG imports; it never jogs, fires or starts the laser. Closing this window keeps RAP in the system tray.'
         $safety.AutoSize = $true; $safety.MaximumSize = New-Object Drawing.Size(585, 0); $layout.Controls.Add($safety)
         $d.tray = New-Object Windows.Forms.NotifyIcon
         $d.tray.Icon = [Drawing.SystemIcons]::Application; $d.tray.Text = 'PathPlotter RAP - Starting'; $d.tray.Visible = $true
         $menu = New-Object Windows.Forms.ContextMenuStrip
         $d.tray.ContextMenuStrip = $menu
-        foreach ($item in @(@('Open PathPlotter', 'open'), @('Pair phone', 'phone'), @('Paired browser', 'browsers'))) {
+        foreach ($item in @(@('Open PathPlotter', 'open'), @('Pair phone', 'phone'))) {
             $entry = $menu.Items.Add($item[0]); $entry.Tag = @{ action = $item[1] }
             $entry.Add_Click({ param($sender, $eventArgs) [void](Submit-Ui $sender.Tag) })
             $d['menu-' + $item[1]] = $entry; $entry.Enabled = $false
         }
-        $entry = $menu.Items.Add('Status'); $entry.Add_Click({ Show-RapWindow })
+        $entry = $menu.Items.Add('Show window'); $entry.Add_Click({ Show-RapWindow })
         $entry = $menu.Items.Add('Check for updates'); $entry.Tag = @{ action = 'check-update' }
         $entry.Add_Click({ param($sender, $eventArgs) [void](Submit-Ui $sender.Tag) })
         $d['menu-check-update'] = $entry; $entry.Enabled = $false
@@ -460,7 +457,7 @@ function Start-RapDesktop {
                 foreach ($control in @($s.open, $s.pair, $s['menu-open'], $s['menu-phone'])) {
                     $control.Enabled = $s.healthy -and -not $s.busy -and -not $s.closing -and -not $s.stopped
                 }
-                foreach ($control in @($s.list, $s.update, $s['menu-browsers'], $s['menu-check-update'], $s['menu-forget-lightburn'], $s['menu-forget-relay'])) {
+                foreach ($control in @($s.revoke, $s.update, $s['menu-check-update'], $s['menu-forget-lightburn'], $s['menu-forget-relay'])) {
                     $control.Enabled = $s.configured -and -not $s.busy -and -not $s.closing -and -not $s.stopped
                 }
                 if ($null -ne $s.phone -and $s.phoneUrl) {
@@ -494,8 +491,6 @@ function Start-RapDesktop {
         if ($null -ne $runspace) { $runspace.Dispose() }
         if ($d.ContainsKey('timer')) { $d.timer.Stop(); $d.timer.Dispose() }
         Clear-Phone
-        if ($null -ne $d.phone) { $d.phone.Dispose() }
-        if ($null -ne $d.browsers) { $d.browsers.Dispose() }
         if ($d.ContainsKey('tray')) { $d.tray.Visible = $false; $d.tray.Dispose() }
         if ($d.ContainsKey('form')) { $d.form.Dispose() }
         $activation.Dispose()
@@ -508,7 +503,7 @@ function Step-GuiSmoke {
     switch ($s.smokeStage) {
         0 {
             if ($s.setup.Visible) {
-                if ($s.advancedPanel.Visible -or $s.api.Visible -or $s.name.Visible -or $s.setup.Controls.Count -ne 3) { throw 'Advanced setup is not hidden by default.' }
+                if ($s.setup.Controls.Count -ne 3 -or $s.ContainsKey('advancedPanel') -or $s.ContainsKey('api') -or $s.ContainsKey('name')) { throw 'Registration has extra controls beyond the Invitation ID.' }
                 $s.register.PerformClick()
                 if ($s.busy -or -not $s.bridge.Commands.IsEmpty -or $s.notice.Text -cne 'Enter your Invitation ID.' -or -not $s.invitation.UseSystemPasswordChar) { throw 'Blank invitation was not refused explicitly.' }
                 [void](Submit-Ui @{ action = 'register'; api = 'https://fixture.invalid'; name = 'Fixture PC'; invitation = 'fixture-invitation-id' }); $s.smokeStage = 1
@@ -559,12 +554,12 @@ function Step-GuiSmoke {
 
 function Assert-GuiSmoke {
     $s = $script:Desktop
-    if ($s.failed -or $s.smokeStage -ne 7 -or $s.smokeOpens -ne 1 -or $s.smokePhones -ne 1 -or
+    if ($s.failed -or $s.smokeStage -ne 7 -or $s.smokeOpens -ne 1 -or $s.smokePhones -ne 1 -or -not $s.smokePhoneShown -or -not $s.smokeBrowserShown -or
         $s.fixtureEvents.Contains('approve') -or -not $s.fixtureEvents.Contains('reject') -or -not $s.fixtureEvents.Contains('disconnected') -or
         -not $s.fixtureEvents.Contains('registered') -or -not $s.fixtureEvents.Contains('consent-denied') -or -not $s.fixtureEvents.Contains('consent-granted') -or
         -not $s.fixtureEvents.Contains('installed') -or -not $s.fixtureEvents.Contains('relaunch') -or $s.smokeConsentTicks -lt 10) {
         throw ('GUI fixture smoke checks failed: stage=' + $s.smokeStage + ', failed=' + $s.failed +
-            ', opens=' + $s.smokeOpens + ', phones=' + $s.smokePhones + ', fixture=' + ($s.fixtureEvents -join ','))
+            ', opens=' + $s.smokeOpens + ', phones=' + $s.smokePhones + ', phoneShown=' + $s.smokePhoneShown + ', browserShown=' + $s.smokeBrowserShown + ', fixture=' + ($s.fixtureEvents -join ','))
     }
     Write-Host 'PASS GUI: STA form/tray, invitation registration, consent, responsive UI, desktop/phone pairing, update offer, install and restart, duplicate activation and graceful shutdown.'
 }

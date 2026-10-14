@@ -14,19 +14,20 @@ RAP uses the built-in Windows PowerShell 5.1 and .NET Framework. It needs no ins
 6. RAP connects to the relay and opens PathPlotter in your default browser, so the browser is paired straight away. LightBurn does not need to be running yet.
 7. Click **Request local LightBurn permission**, bring LightBurn to the front and approve its dialog within 30 seconds. This is only needed once, and only before you capture points. Until LightBurn is ready, RAP and PathPlotter say "LightBurn not ready" and capture stays disabled.
 
-**Advanced connection settings** (a checkbox in the RAP window) shows the relay address and computer name while registering, and afterwards the **Paired browser** list for revoking a browser. Most people never need it.
+Registration needs only the Invitation ID. RAP uses the hosted relay and this computer's Windows name automatically.
 
 ## Everyday use
 
 - Start RAP with **Start RAP.cmd**. Starting it again just shows the running window.
 - **Open PathPlotter** opens the app on this computer.
-- **Pair phone** shows a QR code and private link. Scan it, check the phrase on the phone matches the one in RAP, then click **Approve matching phrase**.
+- The window shows which browser is paired, with a **Disconnect** button to remove its access.
+- **Pair phone** shows a QR code in the window (with **Copy link** for sending it another way). Scan it, check the phrase on the phone matches the one in RAP, then click **Approve matching phrase**.
 - Only one browser is connected at a time. Pairing a new one replaces the old one after you confirm.
 - Closing the window keeps RAP in the system tray. Right-click the tray icon and choose **Quit** to stop it.
 
 ## Updates
 
-RAP checks for a new version every time it starts. You can also choose **Check for updates** from the tray menu.
+RAP checks for a new version every time it starts. You can also choose **Check for updates** from the tray menu; the version line then says "up to date" when there is nothing newer.
 
 When a new version is available, the version line in RAP shows **Update now to vX.Y.Z**. Click it and confirm. RAP downloads the release from GitHub, checks its SHA-256 checksum, replaces its own files and restarts. Your registration and LightBurn permission are kept.
 
@@ -68,6 +69,7 @@ The tray menu also has **Forget LightBurn permission** and **Forget local regist
 | `Transport.cs`, `Desktop.cs` | Compiled helpers for sockets, the SSE stream and single-instance activation |
 | `version.txt` | RAP version, compared against GitHub releases and the relay's `MIN_RAP_VERSION` |
 | `Operator-Invitations.ps1` | Operator tool for batch invitations (not shipped in the ZIP) |
+| elay.txt (optional) | A single https relay origin placed next to the RAP files to register against a self-hosted relay instead of the hosted one. Not shipped in the ZIP, and kept across updates |
 
 ### Tests
 

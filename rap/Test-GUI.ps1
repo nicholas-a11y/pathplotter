@@ -60,6 +60,7 @@ try {
             }
             '/agent/pairing/new' { return @{ invitation = 'fixture-phone'; expiresAt = (Get-ServerNow) + 60000 } }
             '/agent/pairing/decide' { return @{} }
+            '/agent/browsers/revoke' { return @{} }
             default { throw 'Unexpected network call forbidden in GUI protocol checks.' }
         }
     }
@@ -129,7 +130,22 @@ try {
     Invoke-UiCommand @{ action = 'decide-replace'; id = 'replacement-phone'; phrase = 'EXACT SWITCH'; approve = $true; replaceBrowserIds = $script:ApprovedBrowserIds }
     if ($script:WireCalls[$script:WireCalls.Count - 1].body.replaceBrowserIds[0] -cne $script:ApprovedBrowserIds[0]) { throw 'Phone switch omitted replacement IDs.' }
     Write-Host 'PASS one-browser GUI protocol: restart preserves existing pairing, explicit desktop/phone replacement confirmation and exact identity fencing.'
-    # Browser pairing needs only the relay session; LightBurn readiness is independent.
+    # One paired browser is shown in the window with Disconnect; revoking is quiet.
+    $script:ApprovedBrowserIds = @()
+    $drop = $null; while ($bridge.Events.TryDequeue([ref]$drop)) { }
+    Send-BrowserState
+    $none = $null; $drop = $null; while ($bridge.Events.TryDequeue([ref]$drop)) { if ($drop.kind -ceq 'browser') { $none = $drop } }
+    if ($null -eq $none -or $null -ne $none.value) { throw 'No paired browser was not reported as empty.' }
+    $script:ApprovedBrowserIds = @('browser-one')
+    Send-BrowserState
+    $one = $null; while ($bridge.Events.TryDequeue([ref]$drop)) { if ($drop.kind -ceq 'browser') { $one = $drop } }
+    if ($null -eq $one -or $one.value.id -cne 'browser-one' -or $one.value.label -cne 'Approved browser 1') { throw 'Paired browser was not reported with its id and label.' }
+    Invoke-UiCommand @{ action = 'revoke'; id = 'browser-one' }
+    if ($script:WireCalls[$script:WireCalls.Count - 1].path -cne '/agent/browsers/revoke' -or $script:WireCalls[$script:WireCalls.Count - 1].body.browserId -cne 'browser-one') { throw 'Disconnect did not revoke the shown browser.' }
+    $noisy = $false; while ($bridge.Events.TryDequeue([ref]$drop)) { if ($drop.kind -ceq 'notice') { $noisy = $true } }
+    if ($noisy) { throw 'Disconnecting a browser raised a notice.' }
+    $script:ApprovedBrowserIds = @()
+    Write-Host 'PASS paired browser is reported for the window and Disconnect revokes it without a notice.'    # Browser pairing needs only the relay session; LightBurn readiness is independent.
     $script:AutoOpened = $false; $script:ApprovedBrowserIds = @(); $script:WireCalls.Clear(); $script:CloudReady = $false
     Publish-RapHealth 'LightBurn not listening' $false $false
     if ($script:WireCalls.Count -ne 0 -or $script:CloudReady) { throw 'Pairing was available without a relay session.' }

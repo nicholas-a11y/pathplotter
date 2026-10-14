@@ -12,6 +12,8 @@ $script:HostedApp = 'https://nicholas-a11y.github.io/pathplotter/'
 $script:LatestRelease = $null
 $script:NextUpdateCheck = 0L
 $script:AnnouncedUpdateRequired = $false
+$script:NextBrowserCheck = 0L
+$script:UpToDate = $false
 
 function Send-Ui([string]$Kind, $Value = $null) {
     $Bridge.Events.Enqueue(@{ kind = $Kind; value = $Value })
@@ -154,7 +156,30 @@ function Get-DesktopLaunchUrl($ReplacementIds = $null) {
         '&relayId=' + [Uri]::EscapeDataString($script:Config.relayId) + '&launch=' + [Uri]::EscapeDataString($token)
 }
 
+function Get-PairedBrowsers {
+    $result = Invoke-Cloud '/agent/browsers' -Body $null -Method 'GET'
+    $browsers = Get-Field $result 'browsers'
+    if ($browsers -isnot [array]) { throw 'Invalid browser list.' }
+    $rows = @()
+    foreach ($browser in $browsers) {
+        $id = Get-Field $browser 'id'
+        if ($id -isnot [string] -or $id -notmatch '^[A-Za-z0-9_-]{1,128}$') { throw 'Invalid browser.' }
+        $label = Get-Field $browser 'label'
+        if ($label -isnot [string] -or [string]::IsNullOrWhiteSpace($label)) { $label = Get-Field $browser 'name' }
+        if ($label -isnot [string] -or [string]::IsNullOrWhiteSpace($label)) { $label = 'Approved browser ' + ($rows.Count + 1) }
+        $rows += @{ id = $id; label = $label.Substring(0, [Math]::Min(80, $label.Length)) }
+    }
+    return ,$rows
+}
+
+# Only one browser is paired at a time; the window shows it with a Disconnect button.
+function Send-BrowserState {
+    $rows = Get-PairedBrowsers
+    Send-Ui 'browser' $(if ($rows.Count -gt 0) { $rows[0] } else { $null })
+}
+
 function Publish-RapHealth([string]$Message, [bool]$Connected, [bool]$CloudReady = $Connected) {
+    if ($CloudReady -and -not $script:CloudReady) { $script:NextBrowserCheck = 0L }
     $script:CloudReady = $CloudReady
     Send-Ui 'health' @{ message = $Message; connected = $Connected; cloud = $CloudReady; importing = ($null -ne $script:ActiveImport) }
     if ($CloudReady -and -not $script:AutoOpened -and -not $Bridge.StopRequested) {
@@ -162,7 +187,6 @@ function Publish-RapHealth([string]$Message, [bool]$Connected, [bool]$CloudReady
         $script:AutoOpened = $true
         try {
             if ((Get-ApprovedBrowserIds).Count -eq 0) { Send-Ui 'desktop' (Get-DesktopLaunchUrl) }
-            else { Send-Ui 'notice' 'A browser is already paired. Use it, or Open PathPlotter to explicitly replace it.' }
         }
         catch { Send-Ui 'notice' 'Could not open PathPlotter automatically. Click Open PathPlotter to try again.' }
     }
@@ -171,7 +195,7 @@ function Publish-RapHealth([string]$Message, [bool]$Connected, [bool]$CloudReady
 function Publish-RapPairings($Pairings) { Send-Ui 'pairings' $Pairings }
 
 function Send-RapVersion {
-    $value = @{ current = $script:RapVersion; available = $false; required = [bool]$script:UpdateRequired }
+    $value = @{ current = $script:RapVersion; available = $false; required = [bool]$script:UpdateRequired; upToDate = [bool]$script:UpToDate }
     if ($null -ne $script:LatestRelease) { $value.available = $true; $value.latest = $script:LatestRelease.version }
     Send-Ui 'version' $value
 }
@@ -181,7 +205,7 @@ function Update-RapReleaseInfo([switch]$Explicit) {
     try {
         $release = Get-RapLatestRelease
         $script:LatestRelease = $(if (Test-RapNewer $release.version $script:RapVersion) { $release } else { $null })
-        if ($Explicit -and $null -eq $script:LatestRelease) { Send-Ui 'notice' ('RAP v' + $script:RapVersion + ' is up to date.') }
+        $script:UpToDate = [bool]$Explicit -and $null -eq $script:LatestRelease
     } catch {
         if ($Explicit -or $script:UpdateRequired) { Send-Ui 'notice' 'Could not check GitHub for RAP updates. Check your internet connection and try again.' }
     }
@@ -229,25 +253,9 @@ function Invoke-UiCommand($Command) {
             $script:PendingPairings.Remove($Command.id)
             Send-Ui 'pairings' ([hashtable]$script:PendingPairings.Clone())
         }
-        'browsers' {
-            $result = Invoke-Cloud '/agent/browsers' -Body $null -Method 'GET'
-            $browsers = Get-Field $result 'browsers'
-            if ($browsers -isnot [array]) { throw 'Invalid browser list.' }
-            $rows = @()
-            foreach ($browser in $browsers) {
-                $id = Get-Field $browser 'id'
-                if ($id -isnot [string] -or $id -notmatch '^[A-Za-z0-9_-]{1,128}$') { throw 'Invalid browser.' }
-                $label = Get-Field $browser 'label'
-                if ($label -isnot [string] -or [string]::IsNullOrWhiteSpace($label)) { $label = Get-Field $browser 'name' }
-                if ($label -isnot [string] -or [string]::IsNullOrWhiteSpace($label)) { $label = 'Approved browser ' + ($rows.Count + 1) }
-                $rows += @{ id = $id; label = $label.Substring(0, [Math]::Min(80, $label.Length)) }
-            }
-            Send-Ui 'browsers' $rows
-        }
         'revoke' {
             if ($Command.id -isnot [string] -or $Command.id -notmatch '^[A-Za-z0-9_-]{1,128}$') { throw 'Invalid browser.' }
             $null = Invoke-Cloud '/agent/browsers/revoke' @{ browserId = $Command.id }
-            Send-Ui 'notice' 'Browser access revoked. Refresh Paired browser.'
         }
         'forget-lightburn' {
             $script:Config.lightBurnSecret = ''
@@ -283,6 +291,10 @@ function Read-UiCommand {
         Update-RapReleaseInfo
     }
     Update-LightBurnConsent
+    if ($script:CloudReady -and $script:Clock.ElapsedMilliseconds -ge $script:NextBrowserCheck) {
+        $script:NextBrowserCheck = $script:Clock.ElapsedMilliseconds + 20000
+        try { Send-BrowserState } catch { }
+    }
     # One action per cycle; protocol/import processing cannot be starved by clicks.
     $command = $null
     if ($Bridge.Commands.TryDequeue([ref]$command)) {
@@ -296,7 +308,12 @@ function Read-UiCommand {
                 Send-Ui 'notice' 'Action failed or request expired. Check connection/permissions and refresh before an explicit retry; no automatic approval or revocation retry.'
             }
         }
-        finally { Send-Ui 'action-complete' }
+        finally {
+            # Show the result of pairing changes at once; a browser takes a moment to finish opening.
+            if ($command.action -cin @('decide', 'decide-replace', 'revoke')) { $script:NextBrowserCheck = 0L }
+            elseif ($command.action -cin @('open', 'open-replace')) { $script:NextBrowserCheck = $script:Clock.ElapsedMilliseconds + 4000 }
+            Send-Ui 'action-complete'
+        }
     }
 }
 

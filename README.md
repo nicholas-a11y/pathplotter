@@ -124,7 +124,7 @@ PathPlotter never resends an import whose outcome is unknown, so a missing piece
 ## Privacy
 
 - LightBurn's API secret never leaves the computer. RAP's credentials and import journal are protected for the current Windows user.
-- **Help > Unlink this browser** forgets the pairing in this browser. RAP's **Paired browser** list (under Advanced connection settings) revokes it on the relay.
+- **Help > Unlink this browser** forgets the pairing in this browser. RAP's **Disconnect** button revokes it on the relay.
 - The relay keeps only the latest coordinates, not movement history. SVGs pass through the relay for import, and temporary coordinates, jobs and pairing requests are deleted within 24 hours.
 
 ## Development
@@ -138,7 +138,7 @@ npm test
 npm run build
 ```
 
-The dev server connects to the hosted relay like the live site. To pair it, click **Pair phone** in RAP, then **Copy private phone link**. In the copied link, replace `https://nicholas-a11y.github.io/pathplotter/` with `http://127.0.0.1:5173/pathplotter/`, keeping everything from `#` onwards. Open the edited link and approve the matching phrase in RAP.
+The dev server connects to the hosted relay like the live site. To pair it, click **Pair phone** in RAP, then **Copy link**. In the copied link, replace `https://nicholas-a11y.github.io/pathplotter/` with `http://127.0.0.1:5173/pathplotter/`, keeping everything from `#` onwards. Open the edited link and approve the matching phrase in RAP.
 
 | Component | Deployment |
 | --- | --- |
