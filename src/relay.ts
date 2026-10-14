@@ -214,6 +214,8 @@ export class RelayClient {
   controlOccupied = false
   controlError = ''
   error = ''
+  // The relay rejected this browser's saved credential (it was disconnected in RAP); retrying cannot help.
+  unauthorized = false
   // True once the relay has sent its first state message for this connection.
   hasReportedState = false
   private serverTime = 0
@@ -368,6 +370,7 @@ export class RelayClient {
   }
 
   private async connectSocket(epoch: number): Promise<void> {
+    this.unauthorized = false
     const handshakeStarted = performance.now()
     let transportBound = 0
     try {
@@ -484,8 +487,9 @@ export class RelayClient {
       if (!this.running || epoch !== this.epoch) return
       this.online = false
       this.error = error instanceof Error ? error.message : String(error)
+      this.unauthorized = error instanceof RelayRequestError && [401, 403].includes(error.status)
       this.changed()
-      if (!(error instanceof RelayRequestError && [401, 403].includes(error.status))) {
+      if (!this.unauthorized) {
         this.timer = setTimeout(() => { void this.connectSocket(epoch) }, this.reconnectDelay)
         this.reconnectDelay = Math.min(30000, this.reconnectDelay * 2)
       }

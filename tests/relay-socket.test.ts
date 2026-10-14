@@ -265,6 +265,11 @@ test('malformed relay updates and refused tickets fail closed', async () => {
     await flush()
     assert.match(client.error, /revoked/)
     assert.equal(client.canCapture(), false)
+    // A rejected credential is reported separately, because reconnecting can never fix it.
+    assert.equal(client.unauthorized, true)
+    client.reconnect()
+    await flush()
+    assert.equal(client.unauthorized, true)
   } finally {
     client.stop()
     globalThis.fetch = original

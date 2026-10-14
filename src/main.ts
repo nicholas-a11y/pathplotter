@@ -677,9 +677,9 @@ async function takeControl(confirmed = false): Promise<void> {
 }
 must<HTMLButtonElement>('quickControlBtn').addEventListener('click', () => { void takeControl() })
 
-function unlinkBrowser(): void {
+function unlinkBrowser(confirmed = false): void {
   if (liveOwnsWork() || uploadInFlight || connectionInFlight) { setStatus('Finish current connection/import work before unlinking.'); return }
-  if (!window.confirm('Remove this browser’s local pairing? Revoke its grant in RAP to remove server access.')) return
+  if (!confirmed && !window.confirm('Remove this browser’s local pairing? Revoke its grant in RAP to remove server access.')) return
   ++pairingEpoch
   pairingUi = null
   try {
@@ -775,7 +775,7 @@ let statusTextSince = 0
 let blockSince: number | null = null
 renderAll()
 resetConnection()
-setupOnboarding({ onUnlink: unlinkBrowser })
+setupOnboarding({ onUnlink: () => unlinkBrowser() })
 function consumePairingLink(): boolean {
   const link = browserLink(location.hash)
   if (link) {
@@ -1364,11 +1364,12 @@ function decisionInput(): DecisionInput {
     ? { message: relay.controlError || 'Another browser has capture control.', takeover: relay.controlOccupied } : null
   return {
     pairing: pairingUi,
+    unpaired: relay?.unauthorized === true,
     unresolvedImportId: pendingImport && idle ? pendingImport.id : null,
     workspaceMismatch: relay?.canCapture() === true && allPoints(state).length > 0 && state.coordinateContext !== contextKey(),
     rapUpdateRequired: relay?.rapUpdateRequired === true,
     control,
-    offline: relay && !online
+    offline: relay && !online && !relay.unauthorized
       ? { message: relay.error || 'RAP is not connected. Check that RAP is running on the LightBurn computer. PathPlotter keeps retrying automatically.' } : null,
   }
 }
@@ -1437,6 +1438,7 @@ async function runDecisionAction(id: DecisionActionId): Promise<void> {
     case 'clear-points': must<HTMLButtonElement>('clearBtn').click(); break
     case 'take-control': await takeControl(true); break
     case 'reconnect': reconnectRelay(); break
+    case 'forget-pairing': unlinkBrowser(true); break
   }
   decisionNote = lastStatusMessage
   decisionNoteKey = decisionKey

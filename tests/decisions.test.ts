@@ -3,7 +3,7 @@ import assert from 'node:assert/strict'
 import { chooseDecision, type DecisionInput } from '../src/decisions.ts'
 
 const idle: DecisionInput = {
-  pairing: null, unresolvedImportId: null, workspaceMismatch: false, rapUpdateRequired: false, control: null, offline: null,
+  pairing: null, unpaired: false, unresolvedImportId: null, workspaceMismatch: false, rapUpdateRequired: false, control: null, offline: null,
 }
 
 test('no modal is shown when nothing needs a decision', () => {
@@ -45,18 +45,18 @@ test('a workspace mismatch lets the user confirm, back up or clear', () => {
   assert.deepEqual(decision?.actions.map(action => action.id), ['confirm-workspace', 'download-backup', 'clear-points', 'close'])
 })
 
-test('decisions are prioritised: pairing, import, workspace, update, control, offline', () => {
+test('decisions are prioritised: pairing, unpaired, import, workspace, update, control, offline', () => {
   const all: DecisionInput = {
-    pairing: { text: 'x', urgent: false, error: false }, unresolvedImportId: 'job', workspaceMismatch: true,
+    pairing: { text: 'x', urgent: false, error: false }, unpaired: true, unresolvedImportId: 'job', workspaceMismatch: true,
     rapUpdateRequired: true, control: { message: 'c', takeover: true }, offline: { message: 'o' },
   }
   const order: string[] = []
   let input = { ...all }
-  for (const field of ['pairing', 'unresolvedImportId', 'workspaceMismatch', 'rapUpdateRequired', 'control', 'offline'] as const) {
+  for (const field of ['pairing', 'unpaired', 'unresolvedImportId', 'workspaceMismatch', 'rapUpdateRequired', 'control', 'offline'] as const) {
     order.push(chooseDecision(input)!.kind)
     input = { ...input, [field]: idle[field] }
   }
-  assert.deepEqual(order, ['pairing', 'import', 'workspace', 'update', 'control', 'offline'])
+  assert.deepEqual(order, ['pairing', 'unpaired', 'import', 'workspace', 'update', 'control', 'offline'])
   assert.equal(chooseDecision(input), null)
 })
 
@@ -66,6 +66,13 @@ test('taking control from another browser warns that it stops their capture', ()
   assert.match(takeover?.message ?? '', /stops capture in the other browser/)
   assert.doesNotMatch(free?.message ?? '', /stops capture/)
   assert.deepEqual(takeover?.actions.map(action => action.id), ['take-control', 'close'])
+})
+
+test('a browser disconnected in RAP is told to pair again and is not offered a pointless Reconnect', () => {
+  const decision = chooseDecision({ ...idle, unpaired: true })
+  assert.equal(decision?.kind, 'unpaired')
+  assert.deepEqual(decision?.actions.map(action => action.id), ['forget-pairing', 'close'])
+  assert.match(decision?.message ?? '', /Open PathPlotter in RAP/)
 })
 
 test('connection loss waits before opening and offers Reconnect', () => {

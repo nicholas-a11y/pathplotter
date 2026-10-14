@@ -1,8 +1,8 @@
-export type DecisionKind = 'pairing' | 'import' | 'workspace' | 'update' | 'control' | 'offline'
+export type DecisionKind = 'pairing' | 'unpaired' | 'import' | 'workspace' | 'update' | 'control' | 'offline'
 
 export type DecisionActionId =
   | 'cancel-pairing' | 'close' | 'check-import' | 'acknowledge-import' | 'confirm-workspace'
-  | 'download-backup' | 'clear-points' | 'take-control' | 'reconnect'
+  | 'download-backup' | 'clear-points' | 'take-control' | 'reconnect' | 'forget-pairing'
 
 export interface DecisionAction {
   id: DecisionActionId
@@ -27,6 +27,8 @@ export interface Decision {
 
 export interface DecisionInput {
   pairing: { text: string; urgent: boolean; error: boolean } | null
+  // RAP no longer accepts this browser's saved pairing.
+  unpaired: boolean
   unresolvedImportId: string | null
   workspaceMismatch: boolean
   rapUpdateRequired: boolean
@@ -44,6 +46,13 @@ export function chooseDecision(input: DecisionInput): Decision | null {
       kind: 'pairing', key: 'pairing', title: error ? 'Could not connect to RAP' : 'Connecting to RAP',
       message: text, urgent: urgent && !error, delayMs: 0, mandatory: !error,
       actions: error ? [close] : [{ id: 'cancel-pairing', label: 'Cancel', style: 'secondary' }],
+    }
+  }
+  if (input.unpaired) {
+    return {
+      kind: 'unpaired', key: 'unpaired', title: 'This browser is no longer paired with RAP', urgent: false, delayMs: 1500, mandatory: false,
+      message: 'RAP no longer accepts this browser: it was disconnected in RAP, or RAP was reset. Reconnecting cannot fix that. To pair again, click Open PathPlotter in RAP (or use Pair phone).',
+      actions: [{ id: 'forget-pairing', label: 'Forget this pairing', style: 'primary' }, close],
     }
   }
   if (input.unresolvedImportId !== null) {
