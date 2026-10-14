@@ -411,7 +411,8 @@ function Start-RapDesktop {
         }
         $entry = $menu.Items.Add('Show window'); $entry.Add_Click({ Show-RapWindow })
         $entry = $menu.Items.Add('Check for updates'); $entry.Tag = @{ action = 'check-update' }
-        $entry.Add_Click({ param($sender, $eventArgs) [void](Submit-Ui $sender.Tag) })
+        # Show the window so the result (update offer or up to date) is seen.
+        $entry.Add_Click({ param($sender, $eventArgs) Show-RapWindow; [void](Submit-Ui $sender.Tag) })
         $d['menu-check-update'] = $entry; $entry.Enabled = $false
         foreach ($item in @(@('Forget LightBurn permission...', 'forget-lightburn'), @('Forget local registration...', 'forget-relay'))) {
             $entry = $menu.Items.Add($item[0]); $entry.Tag = @{ action = $item[1] }
