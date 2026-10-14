@@ -253,6 +253,7 @@ namespace PathPlotterRap
                             if (data.Length > 8192) throw new InvalidDataException();
                         }
                     }
+
                 }
             }
             catch { /* Caller treats closed/unready streams as failure, never confirmation. */ }
@@ -271,6 +272,148 @@ namespace PathPlotterRap
             request.Abort();
             if (response != null) response.Close();
             // Do not leave a background reader accessing a disposed wait handle.
+            if (thread.Join(3500)) ready.Dispose();
+            request.ServicePoint.CloseConnectionGroup(request.ConnectionGroupName);
+        }
+    }
+
+    public sealed class StateEvent
+    {
+        public string Name { get; private set; }
+        public string Data { get; private set; }
+        public long ReceivedAtUtcTicks { get; private set; }
+
+        public StateEvent(string name, string data)
+        {
+            Name = name;
+            Data = data;
+            ReceivedAtUtcTicks = DateTime.UtcNow.Ticks;
+        }
+    }
+
+    public sealed class StateEventStream : IDisposable
+    {
+        private readonly HttpWebRequest request;
+        private readonly Thread thread;
+        private readonly ManualResetEvent ready = new ManualResetEvent(false);
+        private readonly ConcurrentQueue<StateEvent> events = new ConcurrentQueue<StateEvent>();
+        private volatile bool connected;
+        private volatile bool closed;
+        private volatile bool disposed;
+        private volatile string failure = "";
+        private HttpWebResponse response;
+
+        public StateEventStream(string url, string token)
+        {
+            request = (HttpWebRequest)WebRequest.Create(url);
+            request.Proxy = null;
+            request.AllowAutoRedirect = false;
+            request.Timeout = 3000;
+            request.ReadWriteTimeout = 40000;
+            request.Accept = "text/event-stream";
+            request.Headers[HttpRequestHeader.Authorization] = "Bearer " + token;
+            request.ConnectionGroupName = Guid.NewGuid().ToString("N");
+            thread = new Thread(Read);
+            thread.IsBackground = true;
+            thread.Start();
+        }
+
+        public bool WaitReady(int timeoutMs)
+        {
+            return ready.WaitOne(timeoutMs) && connected && !closed;
+        }
+
+        public bool IsOpen { get { return connected && !closed; } }
+        public string Failure { get { return failure; } }
+
+        public StateEvent Take()
+        {
+            StateEvent value;
+            return events.TryDequeue(out value) ? value : null;
+        }
+
+        private static string ReadBoundedLine(StreamReader reader)
+        {
+            var line = new StringBuilder();
+            for (;;)
+            {
+                int c = reader.Read();
+                if (c == -1) return line.Length == 0 ? null : line.ToString();
+                if (c == '\n') return line.ToString().TrimEnd('\r');
+                if (line.Length >= 8192) throw new InvalidDataException("SSE line exceeded its limit.");
+                line.Append((char)c);
+            }
+        }
+
+        private void Read()
+        {
+            try
+            {
+                response = (HttpWebResponse)request.GetResponse();
+                if ((int)response.StatusCode != 200 ||
+                    !response.ContentType.StartsWith("text/event-stream", StringComparison.OrdinalIgnoreCase))
+                {
+                    failure = "LightBurn did not provide a state event stream.";
+                    return;
+                }
+                using (var reader = new StreamReader(response.GetResponseStream(), new UTF8Encoding(false, true)))
+                {
+                    string name = "message";
+                    var data = new StringBuilder();
+                    while (!disposed)
+                    {
+                        string line = ReadBoundedLine(reader);
+                        if (line == null) break;
+                        if (line == ":connected")
+                        {
+                            connected = true;
+                            ready.Set();
+                        }
+                        if (line.Length == 0)
+                        {
+                            if ((name == "position" || name == "connection") && data.Length > 0)
+                            {
+                                if (events.Count >= 64) throw new InvalidDataException("SSE event queue exceeded its limit.");
+                                events.Enqueue(new StateEvent(name, data.ToString()));
+                            }
+                            name = "message";
+                            data.Length = 0;
+                        }
+                        else if (line.StartsWith("event:", StringComparison.Ordinal))
+                        {
+                            name = line.Substring(6).TrimStart(' ');
+                        }
+                        else if (line.StartsWith("data:", StringComparison.Ordinal))
+                        {
+                            if (data.Length > 0) data.Append('\n');
+                            data.Append(line.Substring(5).TrimStart(' '));
+                            if (data.Length > 8192) throw new InvalidDataException("SSE event exceeded its limit.");
+                        }
+                    }
+                }
+                if (!disposed) failure = "LightBurn state event stream closed.";
+            }
+            catch (WebException)
+            {
+                failure = "LightBurn state event stream is unavailable.";
+            }
+            catch (Exception ex)
+            {
+                failure = ex is InvalidDataException ? ex.Message : "LightBurn state event stream failed.";
+            }
+            finally
+            {
+                closed = true;
+                ready.Set();
+                if (response != null) response.Close();
+            }
+        }
+
+        public void Dispose()
+        {
+            disposed = true;
+            request.Abort();
+            if (response != null) response.Close();
             if (thread.Join(3500)) ready.Dispose();
             request.ServicePoint.CloseConnectionGroup(request.ConnectionGroupName);
         }

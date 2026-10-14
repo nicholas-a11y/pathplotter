@@ -1333,7 +1333,7 @@ function renderAll(): void {
   renderPlot()
 }
 
-const LIGHTBURN_NOT_READY_HINT = 'RAP is connected, but cannot read LightBurn yet. Check the reason shown in the RAP window: LightBurn must be running with its REST API on, RAP must have permission, and a machine must be connected in LightBurn (Devices/Laser window).'
+const LIGHTBURN_NOT_READY_HINT = 'RAP is connected, but cannot read LightBurn yet. Check the reason shown in the RAP window: LightBurn must be running, RAP must have permission, and a machine must be connected in LightBurn (Devices/Laser window).'
 // RAP can pair a browser before it can read LightBurn; capture waits for a workspace context.
 function lightBurnNotReady(): boolean {
   return relay?.isOnline() === true && relay.hasReportedState && !relay.snapshot?.context
@@ -1719,7 +1719,7 @@ function renderPlot(): void {
   ).join('')).join('')
   const settled = relay?.settled === true
   const head = livePosition
-    ? `<g class="head-marker${settled ? ' settled' : ''}" transform="translate(${screenX(livePosition.x)} ${screenY(livePosition.y)})"><title>${settled ? 'Reported position unchanged for three readings' : 'Reported position not yet settled'}</title><circle r="5" /><path d="M -9 0 H 9 M 0 -9 V 9" /></g>` : ''
+    ? `<g class="head-marker${settled ? ' settled' : ''}" transform="translate(${screenX(livePosition.x)} ${screenY(livePosition.y)})"><title>${settled ? 'Reported position unchanged for two seconds' : 'Reported position not yet settled'}</title><circle r="5" /><path d="M -9 0 H 9 M 0 -9 V 9" /></g>` : ''
   const workspace = workspaceSize
     ? `<rect class="bed-outline" x="${screenX(0)}" y="${screenY(workspaceSize.y)}" width="${workspaceSize.x * scale}" height="${workspaceSize.y * scale}" />` : ''
   const markup = `

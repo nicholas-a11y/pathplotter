@@ -10,7 +10,7 @@ PathPlotter does **not** move the machine, fire the laser or start a job. Sendin
 
 ## What you need
 
-- A Windows computer running LightBurn with its REST API enabled and a connected machine. PathPlotter reads positions through LightBurn's API, so it does not depend on the controller type. Placement should still be checked on your own setup.
+- A Windows computer running LightBurn with a connected machine. PathPlotter reads positions through LightBurn's local API, so it does not depend on the controller type. Placement should still be checked on your own setup.
 - The portable **RAP** connector running on that computer.
 - An **Invitation ID** from the PathPlotter operator to register your computer.
 - An internet connection on the computer and on any phone you use. The phone does not need to be on the same Wi-Fi.
@@ -36,11 +36,10 @@ Keep LightBurn's **Allow API Access From Network** setting **off**.
 ## Connect for the first time
 
 1. In the web app click **Help > Find Windows download**, or go to the [latest release](https://github.com/nicholas-a11y/pathplotter/releases/latest). Download **PathPlotter-RAP-Windows.zip** and extract the whole ZIP somewhere writable.
-2. In LightBurn enable **REST API** in **Settings > Extensions**.
-3. Double-click **Start RAP.cmd**.
-4. Paste your **Invitation ID** and click **Register this computer**.
-5. RAP connects to the relay and opens PathPlotter in your browser, which pairs automatically. LightBurn does not need to be ready yet.
-6. Before capturing, connect your machine in LightBurn, click **Request local LightBurn permission** in RAP, bring LightBurn to the front and approve within 30 seconds. This is needed once. Until LightBurn is ready, PathPlotter shows **LightBurn not ready** and capture stays disabled.
+2. Double-click **Start RAP.cmd**.
+3. Paste your **Invitation ID** and click **Register this computer**.
+4. RAP connects to the relay and opens PathPlotter in your browser, which pairs automatically. LightBurn does not need to be ready yet.
+5. Before capturing, connect your machine in LightBurn, click **Request local LightBurn permission** in RAP, then bring LightBurn to the foreground so its permission prompt appears. Approve it within 30 seconds. This is needed once. Until LightBurn is ready, PathPlotter shows **LightBurn not ready** and capture stays disabled.
 
 Later, start RAP and click **Open PathPlotter**. A browser that was paired before reconnects by itself when you open PathPlotter. If the connection is lost, PathPlotter shows a window offering **Reconnect now**.
 
@@ -87,7 +86,7 @@ Coordinates are in **millimetres**, with **+X right and +Y up**. The plot has ru
 
 The crosshair turns black once LightBurn reports the same X/Y three times in a row, and red while coordinates change. Black means the *reported coordinates* are stable, not proof the head has physically stopped.
 
-**Capture point asks RAP for a fresh reading** rather than reusing the preview. The reading must be no more than 2 seconds old; otherwise no point is saved. Moving previews are limited to 2 updates per second.
+**Capture point asks RAP for a fresh reading** rather than reusing the preview. The reading must be no more than 2 seconds old; otherwise no point is saved. LightBurn's position events update moving previews at about 2 Hz; preview forwarding stops after two seconds without a position change.
 
 ## Send to LightBurn
 

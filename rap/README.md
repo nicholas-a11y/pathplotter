@@ -8,11 +8,12 @@ RAP uses the built-in Windows PowerShell 5.1 and .NET Framework. It needs no ins
 
 1. Download **PathPlotter-RAP-Windows.zip** from the [latest release](https://github.com/nicholas-a11y/pathplotter/releases/latest), or use **Get started > Find Windows download** in PathPlotter.
 2. Extract the whole ZIP to a folder you can write to, such as Documents. Do not run it from inside the ZIP.
-3. In LightBurn, enable **REST API** under **Settings > Extensions**. Leave **Allow API Access From Network** off.
-4. Double-click **Start RAP.cmd**.
-5. Paste the **Invitation ID** you were given and click **Register this computer**. Each Invitation ID registers one computer and expires after seven days.
-6. RAP connects to the relay and opens PathPlotter in your default browser, so the browser is paired straight away. LightBurn does not need to be running yet.
-7. Click **Request local LightBurn permission**, bring LightBurn to the front and approve its dialog within 30 seconds. This is only needed once, and only before you capture points. Until LightBurn is ready, RAP and PathPlotter say "LightBurn not ready" and capture stays disabled.
+3. Double-click **Start RAP.cmd**.
+4. Paste the **Invitation ID** you were given and click **Register this computer**. Each Invitation ID registers one computer and expires after seven days.
+5. RAP connects to the relay and opens PathPlotter in your default browser, so the browser is paired straight away. LightBurn does not need to be running yet.
+6. Before capturing, connect your machine in LightBurn, click **Request local LightBurn permission**, then bring LightBurn to the foreground so its permission prompt appears. Approve it within 30 seconds. This is only needed once. Until LightBurn is ready, RAP and PathPlotter say "LightBurn not ready" and capture stays disabled.
+
+Keep **Allow API Access From Network** off in LightBurn. RAP uses the local API and does not require that network-access setting.
 
 Registration needs only the Invitation ID. RAP uses the hosted relay and this computer's Windows name automatically.
 
@@ -40,7 +41,7 @@ If an update cannot be installed automatically, for example because the folder i
 | Problem | What to do |
 | --- | --- |
 | Registration failed | Check the Invitation ID was pasted in full. Each ID works once; ask for a new one if it was already used or has expired. |
-| "LightBurn not ready" | The browser can still be paired. Check that LightBurn is running, its REST API is on and a machine is connected, and that you have granted RAP permission (the **Request local LightBurn permission** button). |
+| "LightBurn not ready" | The browser can still be paired. Check that LightBurn is running, a machine is connected, and that you have granted RAP permission (the **Request local LightBurn permission** button). |
 | "Relay disconnected" | Check the internet connection. Some company networks block WebSockets. |
 | Nothing happens on start | Run **Start RAP diagnostics.cmd** to see startup errors in a console window. |
 | Windows blocks the scripts | Follow your organization's approved procedure. Do not disable security protections. |

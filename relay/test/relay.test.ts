@@ -1204,6 +1204,22 @@ describe("browser control acquisition and takeover", () => {
       expect(await cp.preview("c", true)).toBe(true);
     });
 
+    it("leases and forwards moving previews only while watched, then publishes the settled position", async () => {
+      const relay = await register(), agent = await startAgent(relay), browser = await launchBrowser(relay);
+      const viewer = await browserSocket(relay, browser);
+      expect(viewer.messages.at(-1)).toMatchObject({ previewActive: false });
+      const still = await update(agent, 1, { settled: true, moving: false });
+      expect((await json<{ previewActive: boolean }>(still)).previewActive).toBe(false);
+      const moving = await update(agent, 2, { settled: false, moving: true });
+      expect((await json<{ previewActive: boolean }>(moving)).previewActive).toBe(true);
+      await vi.waitFor(() => expect(viewer.messages.at(-1)).toMatchObject({ previewActive: true, settled: false }));
+      const stopped = await update(agent, 3, { settled: true, moving: false });
+      expect((await json<{ previewActive: boolean }>(stopped)).previewActive).toBe(false);
+      await vi.waitFor(() => expect(viewer.messages.at(-1)).toMatchObject({ previewActive: false, settled: true }));
+      expect((await update(agent, 4, { moving: "yes" })).status).toBe(400);
+      viewer.socket.close();
+    });
+
     it("caps browser sockets, scopes roles, and releases hidden preview without taking control", async () => {
       const relay = await register(), agent = await startAgent(relay), browser = await launchBrowser(relay);
       const root = `/v1/relays/${relay.relayId}`;
@@ -1211,6 +1227,8 @@ describe("browser control acquisition and takeover", () => {
       const first = await browserSocket(relay, browser), second = await browserSocket(relay, browser);
       const ticket = await json<{ ticket: string }>(await call(`${root}/ticket`, { credential: browser, bindings: relay.bindings, body: {} }));
       expect((await call(`${root}/stream?ticket=${ticket.ticket}`, { upgrade: true, bindings: relay.bindings, origin: null })).status).toBe(403);
+      const moving = await update(agent, 1, { settled: false, moving: true });
+      expect((await json<{ previewActive: boolean }>(moving)).previewActive).toBe(true);
       first.socket.send(JSON.stringify({ v: 2, type: "heartbeat", watching: false }));
       second.socket.send(JSON.stringify({ v: 2, type: "heartbeat", watching: false }));
       await vi.waitFor(() => expect(second.messages.at(-1)).toMatchObject({ protocol: 2, previewActive: false, activeBrowser: false }));

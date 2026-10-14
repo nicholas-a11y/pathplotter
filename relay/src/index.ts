@@ -517,9 +517,12 @@ export class RelayDO extends DurableObject<Env> {
   private transient: Snapshot | null = null;
   private sequence = 0;
   private settled = false;
+  private moving = false;
   private identical = 0;
   private previewUntil = 0;
   private lastPreviewRenew = 0;
+  private lastPreviewWanted: boolean | null = null;
+  private previewDenied = false;
   private lastJobReap = 0;
   private agentUpdateAt = 0;
   private observedAt = 0;
@@ -766,6 +769,7 @@ export class RelayDO extends DurableObject<Env> {
     this.sequence = 0;
     this.agentUpdateAt = 0;
     this.settled = false;
+    this.moving = false;
     for (const socket of this.ctx.getWebSockets()) {
       const a = this.attachment(socket);
       if (a?.role === "agent") socket.close(1008, "stale_generation");
@@ -775,7 +779,7 @@ export class RelayDO extends DurableObject<Env> {
     return jsonResponse({ generation, serverTime });
   }
 
-  private async agentUpdate(request: Request, identity: AgentIdentity, deliverWork = true): Promise<Response> {
+  private async agentUpdate(request: Request, identity: AgentIdentity, deliverWork = true, publishSnapshot = deliverWork): Promise<Response> {
     const body = requiredObject(await readJson(request));
     jsonBody(body, [
       "generation",
@@ -788,7 +792,10 @@ export class RelayDO extends DurableObject<Env> {
       "clockUncertaintyMs",
       "error",
       "settled",
+      "moving",
     ]);
+    if (body.settled !== undefined && typeof body.settled !== "boolean") throw new HttpError(400, "invalid_request");
+    if (body.moving !== undefined && typeof body.moving !== "boolean") throw new HttpError(400, "invalid_request");
     const generation = body.generation;
     const sequence = body.sequence;
     const parsedGeneration = parseGeneration(generation);
@@ -828,6 +835,7 @@ export class RelayDO extends DurableObject<Env> {
       position = null;
       context = null;
     }
+    const moving = connected && (typeof body.moving === "boolean" ? body.moving : body.settled === false);
     const receivedAt = serverTime;
     const conservativeAge = validAge && validClock
       ? Math.max(age, Math.max(0, receivedAt - (observedAtServer as number) + (uncertainty as number)))
@@ -855,6 +863,7 @@ export class RelayDO extends DurableObject<Env> {
     this.ctx.storage.transactionSync(() => {
       const currentMeta = this.meta();
       if (!currentMeta || currentMeta.generation !== parsedGeneration) throw new HttpError(409, "stale_generation");
+      if (deliverWork) this.moving = moving;
       const same = this.transient?.connected === snapshot.connected && JSON.stringify(this.transient.position) === JSON.stringify(snapshot.position) && this.transient.context?.revision === snapshot.context?.revision;
       this.identical = same ? this.identical + (typeof observedAtServer === "number" && observedAtServer > this.observedAt ? 1 : 0) : 1;
       if (typeof observedAtServer === "number") this.observedAt = observedAtServer;
@@ -901,7 +910,7 @@ export class RelayDO extends DurableObject<Env> {
       const a = this.attachment(socket);
       if (a?.role === "agent" && a.generation === parsedGeneration) { a.sequence = snapshot.sequence; socket.serializeAttachment(a); }
     }
-    if (deliverWork) this.broadcast();
+    if (publishSnapshot) this.broadcast();
     if (invalidClockForLiveSample) throw new HttpError(400, "invalid_clock_calibration");
     return jsonResponse({ serverTime: receivedAt, pairings, job: claimed, previewActive: this.previewUntil > receivedAt, captures: [...this.captures.entries()].filter(([, c]) => c.status === "pending" && c.generation === parsedGeneration && receivedAt - c.created < 10_000).map(([id]) => id) });
   }
@@ -1579,10 +1588,10 @@ export class RelayDO extends DurableObject<Env> {
     const server = pair[1];
     this.ctx.acceptWebSocket(server);
     server.serializeAttachment({ role: "browser", browserId, seen: now, watching: true } satisfies SocketIdentity);
-    await this.renewPreview(true);
+    await this.renewPreview(this.hasWatchers() && this.moving);
     const envelope = this.snapshotEnvelope(browserId, now, true);
     server.send(JSON.stringify(envelope));
-    if (this.previewUntil <= now) server.send(JSON.stringify({ v: 2, type: "error", error: "preview_busy" }));
+    if (this.moving && this.previewUntil <= now) server.send(JSON.stringify({ v: 2, type: "error", error: "preview_busy" }));
     return new Response(null, { status: 101, webSocket: client });
   }
 
@@ -1598,7 +1607,9 @@ export class RelayDO extends DurableObject<Env> {
 
   private async renewPreview(wanted: boolean): Promise<void> {
     const now = Date.now();
-    if (wanted && now - this.lastPreviewRenew < 15_000 && this.previewUntil > now) return;
+    if (this.lastPreviewWanted === wanted &&
+        (!wanted || now - this.lastPreviewRenew < 15_000)) return;
+    this.lastPreviewWanted = wanted;
     this.lastPreviewRenew = now;
     const epoch = ++this.previewEpoch;
     const meta = this.meta();
@@ -1606,6 +1617,7 @@ export class RelayDO extends DurableObject<Env> {
     const accepted = await this.env.CONTROL_PLANE.getByName("registration-control").preview(meta.relay_id, wanted);
     if (epoch !== this.previewEpoch) return;
     this.previewUntil = accepted ? now + LIVENESS_MS : 0;
+    if (!wanted || accepted) this.previewDenied = false;
     this.notifyWork();
   }
 
@@ -1661,16 +1673,36 @@ export class RelayDO extends DurableObject<Env> {
       if (a.role === "browser" && body.type === "heartbeat") {
         if (body.watching !== undefined && typeof body.watching !== "boolean") throw new HttpError(400, "invalid_message");
         if (typeof body.watching === "boolean") { a.watching = body.watching; socket.serializeAttachment(a); }
-        await this.renewPreview(this.hasWatchers());
+        await this.renewPreview(this.hasWatchers() && this.moving);
         socket.send(JSON.stringify(this.snapshotEnvelope(a.browserId!, now, true)));
-        if (a.watching !== false && this.previewUntil <= now) socket.send(JSON.stringify({ v: 2, type: "error", error: "preview_busy" }));
+        if (a.watching !== false && this.moving && this.previewUntil <= now) socket.send(JSON.stringify({ v: 2, type: "error", error: "preview_busy" }));
         if (!this.transient || now - this.transient.receivedAt > 15_000) this.notifyWork();
       } else if (a.role === "agent" && body.type === "update" && id) {
         if (this.agentUpdateAt && now - this.agentUpdateAt < 500) throw new HttpError(429, "message_rate_limited");
         this.agentUpdateAt = now;
-        const response = await this.agentUpdate(this.messageRequest(body.body), { generation: a.generation! });
+        const wasMoving = this.moving;
+        const response = await this.agentUpdate(this.messageRequest(body.body), { generation: a.generation! }, true, false);
+        if (wasMoving !== this.moving) {
+          await this.renewPreview(this.hasWatchers() && this.moving);
+          if (!this.moving) this.previewDenied = false;
+        }
+        const movingWithWatchers = this.moving && this.hasWatchers();
+        const previewGranted = this.previewUntil > Date.now();
+        if (movingWithWatchers && !previewGranted && !this.previewDenied) {
+          for (const watcher of this.ctx.getWebSockets()) {
+            const watcherIdentity = this.attachment(watcher);
+            if (watcherIdentity?.role === "browser" && watcherIdentity.watching !== false) {
+              this.send(watcher, { v: 2, type: "error", error: "preview_busy" });
+            }
+          }
+          this.previewDenied = true;
+        }
+        if (previewGranted) this.previewDenied = false;
+        if (!this.moving || previewGranted) this.broadcast();
         a.sequence = this.sequence; socket.serializeAttachment(a);
-        socket.send(JSON.stringify({ v: 2, type: "update-result", id, body: await response.json() }));
+        const result = await response.json() as Record<string, unknown>;
+        result.previewActive = previewGranted;
+        socket.send(JSON.stringify({ v: 2, type: "update-result", id, body: result }));
       } else if (a.role === "agent" && body.type === "capture-result" && id) {
         await this.captureResult(this.messageRequest(body.body), id, { generation: a.generation! });
         a.sequence = this.sequence; socket.serializeAttachment(a);

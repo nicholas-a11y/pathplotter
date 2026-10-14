@@ -36,15 +36,14 @@ export function setupOnboarding(options: { onUnlink?: () => void } = {}): void {
       <div class="row"><button id="findRap">Find Windows download</button><a id="downloadRap" hidden>Download RAP ZIP</a><a href="${RELEASES}" target="_blank" rel="noopener noreferrer">View releases</a></div>
       <ol>
         <li>Extract the ZIP to a folder you can write to, such as Documents. Do not run it from inside the ZIP.</li>
-        <li>In LightBurn, enable <strong>REST API</strong> under Settings &gt; Extensions. Leave network API access off.</li>
         <li>Double-click <strong>Start RAP.cmd</strong>, paste the <strong>Invitation ID</strong> you were given and click Register. RAP then opens PathPlotter in your browser and pairs it; LightBurn does not need to be ready yet.</li>
-        <li>Before capturing, open LightBurn and connect your machine. In RAP click <strong>Request local LightBurn permission</strong> and approve the prompt in LightBurn within 30 seconds (needed once).</li>
+        <li>Before capturing, open LightBurn and connect your machine. In RAP click <strong>Request local LightBurn permission</strong>, then bring LightBurn to the foreground so its permission prompt appears. Approve it within 30 seconds (needed once).</li>
         <li>In PathPlotter choose Capture settings, jog the head and press Space to capture points.</li>
       </ol>
       <p class="hint">No administrator access is needed. RAP tells you when an update is available; click <strong>Update now</strong> in RAP to install it.</p>
     </section>
     <section><h3>Use a phone or another browser</h3><p>In RAP choose <strong>Pair phone</strong>, scan the QR code (or open its link), check that the phrase matches, then click <strong>Approve matching phrase</strong> in RAP. Only one browser is connected at a time; click <strong>Disconnect paired browser</strong> in RAP first to pair a different one. Both devices need internet access, but not the same Wi-Fi.</p></section>
-    <section><h3>Already set up?</h3><p>Start RAP and click <strong>Open PathPlotter</strong>, or just open PathPlotter again in a browser that was paired before; it reconnects by itself and asks you if anything needs a decision. RAP runs in the desktop widget area (system tray) — if you don't see its window, look for the tray icon near the clock. If PathPlotter cannot reach RAP, check that RAP is running and the computer is online. If it says LightBurn is not ready, read the reason in the RAP window: LightBurn must be running with its REST API on, RAP must have permission, and a machine must be connected.</p></section>
+    <section><h3>Already set up?</h3><p>Start RAP and click <strong>Open PathPlotter</strong>, or just open PathPlotter again in a browser that was paired before; it reconnects by itself and asks you if anything needs a decision. RAP runs in the desktop widget area (system tray) — if you don't see its window, look for the tray icon near the clock. If PathPlotter cannot reach RAP, check that RAP is running and the computer is online. If it says LightBurn is not ready, read the reason in the RAP window: LightBurn must be running, RAP must have permission, and a machine must be connected.</p></section>
     ${options.onUnlink ? `<section><h3>This browser</h3><p>Forget this browser's pairing with RAP, for example on a shared computer. Also click <strong>Disconnect paired browser</strong> in the RAP window to remove its access on the relay.</p><button id="unlinkBrowser">Unlink this browser</button></section>` : ''}
   `
   document.body.append(dialog)

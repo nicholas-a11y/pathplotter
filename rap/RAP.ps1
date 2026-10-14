@@ -32,6 +32,7 @@ $script:ActiveImport = $null
 $script:LightBurnRoot = 'http://127.0.0.1:19520'
 $script:UiBridge = $null
 $script:Socket = $null
+$script:StateStream = $null
 $script:PreviewActive = $false
 $script:LastObservationHealth = ''
 $script:DefaultRelay = 'https://pathplotter-relay-v3.nicholas-leqeta.workers.dev'
@@ -64,7 +65,7 @@ function Publish-ObservationHealth($Observation, $Body) {
 function Invoke-AgentWork($Result, [switch]$FreshRequest) {
     if (-not (Test-Field $Result 'job') -or (Get-Field $Result 'pairings') -isnot [array] -or
         (Get-Field $Result 'previewActive') -isnot [bool]) { throw 'Invalid cloud work envelope.' }
-    if ($FreshRequest -or $script:PreviewActive -ne $Result.previewActive) { $script:ForcePublish = $true }
+    if ($FreshRequest -or (-not $script:PreviewActive -and $Result.previewActive)) { $script:ForcePublish = $true }
     $script:PreviewActive = $Result.previewActive
     Show-PendingPairings $Result.pairings
     if ($null -ne $Result.job) { Invoke-Import $Result.job (Get-Observation) }
@@ -109,6 +110,43 @@ function Receive-AgentMessages {
 
 function Get-ObservationSignature($Observation) {
     return (@{ connected = $Observation.connected; position = $Observation.position; context = $Observation.context; error = $Observation.error } | ConvertTo-Json -Depth 20 -Compress)
+}
+
+function Get-PositionSignature($Observation) {
+    if (-not $Observation.connected -or $null -eq $Observation.position) { return '' }
+    return (@{ x = $Observation.position.x; y = $Observation.position.y } | ConvertTo-Json -Compress)
+}
+
+function Register-PreviewObservation($Observation) {
+    if (-not $Observation.connected -or $null -eq $Observation.position) {
+        $script:PositionConnected = $false
+        $script:PositionInitialized = $false
+        $script:PositionMotionActive = $false
+        return
+    }
+    $positionSignature = Get-PositionSignature $Observation
+    if (-not $script:PositionConnected -or -not $script:PositionInitialized) {
+        $script:LastPositionSignature = $positionSignature
+        $script:LastPositionChangeTick = $Observation.tick
+        $script:PositionInitialized = $true
+        $script:PositionMotionActive = $false
+    } elseif ($positionSignature -cne $script:LastPositionSignature) {
+        $script:LastPositionSignature = $positionSignature
+        $script:LastPositionChangeTick = $Observation.tick
+        $script:PositionMotionActive = $true
+    }
+    $script:PositionConnected = $true
+}
+
+function Get-PreviewMotion($Observation, [long]$NowTick = -1) {
+    if ($NowTick -lt 0) { $NowTick = $script:Clock.ElapsedMilliseconds }
+    $age = $Observation.observationAgeMs + ($NowTick - $Observation.tick)
+    $live = $Observation.connected -and $age -le 2000
+    $quietFor = $NowTick - $script:LastPositionChangeTick
+    $moving = $live -and $script:PositionMotionActive -and $quietFor -lt 2000
+    $settled = $live -and $script:PositionInitialized -and $quietFor -ge 2000
+    if (-not $moving) { $script:PositionMotionActive = $false }
+    return @{ live = [bool]$live; moving = [bool]$moving; settled = [bool]$settled }
 }
 
 # UI hooks; GUIWorker.ps1 replaces these.
@@ -381,44 +419,92 @@ function New-ObservationUpdate($Observation, [long]$NowTick = -1) {
     return $body
 }
 
+function Get-ProjectContext {
+    $project = Invoke-Local '/api/project'
+    $workspace = Get-Field $project 'workspace'
+    if ($null -eq $workspace) { throw 'LightBurn workspace context is unavailable.' }
+    foreach ($field in @('machine_size', 'workpiece_offset')) {
+        $point = Get-Field $workspace $field
+        if (-not (Test-Number (Get-Field $point 'x')) -or -not (Test-Number (Get-Field $point 'y'))) { throw 'LightBurn workspace dimensions or workpiece offset unavailable.' }
+    }
+    if ($workspace.machine_size.x -le 0 -or $workspace.machine_size.y -le 0 -or
+        (Get-Field $workspace 'machine_view') -isnot [bool]) { throw 'Invalid LightBurn workspace context.' }
+    $size = Get-Field $workspace 'workpiece_size'
+    $sizeOut = $null
+    if ($null -ne $size) {
+        if (-not (Test-Number (Get-Field $size 'x')) -or -not (Test-Number (Get-Field $size 'y')) -or $size.x -le 0 -or $size.y -le 0) { throw 'Invalid LightBurn workpiece dimensions.' }
+        $sizeOut = @{ x = $size.x; y = $size.y }
+    }
+    # Only stable documented coordinate/device fields, never layers or imported geometry.
+    $stable = [ordered]@{
+        workspace = [ordered]@{
+            machine_size = Get-Field $workspace 'machine_size'
+            workpiece_size = $sizeOut
+            workpiece_offset = Get-Field $workspace 'workpiece_offset'
+            machine_view = Get-Field $workspace 'machine_view'
+        }
+        filename = Get-Field $project 'filename'
+        device = Get-Field $project 'device'
+    }
+    $revision = Get-Hash $script:Utf8.GetBytes(($stable | ConvertTo-Json -Depth 20 -Compress))
+    return @{ revision = $revision; size = $sizeOut }
+}
+
+function New-StateObservation($Position, $Context, [bool]$Connected, [long]$Tick = -1, [double]$AgeMs = 0) {
+    if ($Tick -lt 0) { $Tick = $script:Clock.ElapsedMilliseconds }
+    if (-not $Connected) {
+        return @{ connected = $false; position = $null; context = $null; observationAgeMs = 0; tick = $Tick; error = 'LightBurn API available, but no machine connected.' }
+    }
+    $point = Get-Field $Position 'workpiece'
+    if (-not (Test-Number (Get-Field $point 'x')) -or -not (Test-Number (Get-Field $point 'y'))) {
+        throw 'LightBurn event stream did not provide finite workpiece coordinates.'
+    }
+    if ($null -eq $Context -or (Get-Field $Context 'revision') -isnot [string]) {
+        throw 'LightBurn project context is unavailable.'
+    }
+    return @{
+        connected = $true; position = @{ x = $point.x; y = $point.y }
+        context = $Context; observationAgeMs = $AgeMs; tick = $Tick; error = $null
+    }
+}
+
+function New-StateEventStream {
+    return New-Object PathPlotterRap.StateEventStream(($script:LightBurnRoot + '/api/events'), (Get-LightBurnToken $script:Config.lightBurnSecret))
+}
+
+function Start-StateEventStream {
+    $stream = New-StateEventStream
+    if ($null -eq $stream) { return $null }
+    try {
+        if (-not $stream.WaitReady(1500)) { throw 'LightBurn state event stream did not become ready.' }
+        $state = Invoke-Local '/api/events/poll'
+        $connection = Get-Field (Get-Field $state 'connection') 'connected'
+        if ($connection -isnot [bool]) { throw 'LightBurn event snapshot has no connection state.' }
+        $context = Get-ProjectContext
+        $observation = New-StateObservation (Get-Field $state 'position') $context $connection
+        return @{
+            stream = $stream; context = $context; connected = $connection
+            position = Get-Field $state 'position'; positionTick = $observation.tick
+            observation = $observation
+        }
+    } catch {
+        $stream.Dispose()
+        throw
+    }
+}
+
 function Get-Observation {
     $timer = [Diagnostics.Stopwatch]::StartNew()
     try {
         $status = Invoke-Local '/api/status'
         if ((Get-Field $status 'connected') -isnot [bool] -or $status.connected -ne $true) { throw 'No connected LightBurn machine.' }
-        $project = Invoke-Local '/api/project'
-        $workspace = Get-Field $project 'workspace'
-        if ($null -eq $workspace) { throw 'LightBurn workspace context is unavailable.' }
-        foreach ($field in @('machine_size', 'workpiece_offset')) {
-            $point = Get-Field $workspace $field
-            if (-not (Test-Number (Get-Field $point 'x')) -or -not (Test-Number (Get-Field $point 'y'))) { throw 'LightBurn workspace dimensions or workpiece offset unavailable.' }
-        }
-        if ($workspace.machine_size.x -le 0 -or $workspace.machine_size.y -le 0 -or
-            (Get-Field $workspace 'machine_view') -isnot [bool]) { throw 'Invalid LightBurn workspace context.' }
-        $size = Get-Field $workspace 'workpiece_size'
-        $sizeOut = $null
-        if ($null -ne $size) {
-            if (-not (Test-Number (Get-Field $size 'x')) -or -not (Test-Number (Get-Field $size 'y')) -or $size.x -le 0 -or $size.y -le 0) { throw 'Invalid LightBurn workpiece dimensions.' }
-            $sizeOut = @{ x = $size.x; y = $size.y }
-        }
-        # Only stable documented coordinate/device fields, never layers or imported geometry.
-        $stable = [ordered]@{
-            workspace = [ordered]@{
-                machine_size = Get-Field $workspace 'machine_size'
-                workpiece_size = $sizeOut
-                workpiece_offset = Get-Field $workspace 'workpiece_offset'
-                machine_view = Get-Field $workspace 'machine_view'
-            }
-            filename = Get-Field $project 'filename'
-            device = Get-Field $project 'device'
-        }
-        $revision = Get-Hash $script:Utf8.GetBytes(($stable | ConvertTo-Json -Depth 20 -Compress))
+        $context = Get-ProjectContext
         $position = Invoke-Local '/api/position'
         $point = Get-Field $position 'workpiece'
         if (-not (Test-Number (Get-Field $point 'x')) -or -not (Test-Number (Get-Field $point 'y'))) { throw 'Finite workpiece X/Y are unavailable; machine coordinates are not substituted.' }
         return @{
             connected = $true; position = @{ x = $point.x; y = $point.y }
-            context = @{ revision = $revision; size = $sizeOut }
+            context = $context
             observationAgeMs = $timer.ElapsedMilliseconds; tick = $script:Clock.ElapsedMilliseconds; error = $null
         }
     } catch {
@@ -426,7 +512,7 @@ function Get-Observation {
         if ($_.Exception.Message -eq 'No connected LightBurn machine.') { $errorText = 'LightBurn API available, but no machine connected.' }
         elseif ($_.Exception.Message -like 'Local LightBurn credentials are missing*') { $errorText = 'LightBurn permission has not been granted yet. Click Request local LightBurn permission.' }
         elseif ($_.Exception.Message -like 'HTTP authorization failed*') { $errorText = 'LightBurn API authorization failed. Check Windows clock and Manage API Security; re-pair only with consent.' }
-        elseif ($_.Exception.Message -like 'HTTP network/timeout failure*') { $errorText = 'LightBurn not listening or timed out. Open LightBurn and enable its REST API.' }
+        elseif ($_.Exception.Message -like 'HTTP network/timeout failure*') { $errorText = 'LightBurn is not listening or timed out. Open LightBurn and try again.' }
         return @{ connected = $false; position = $null; context = $null; observationAgeMs = $timer.ElapsedMilliseconds; tick = $script:Clock.ElapsedMilliseconds; error = $errorText }
     }
 }
@@ -714,26 +800,144 @@ function Start-Rap {
         $nextRead = 0L
         $nextConnect = 0L
         $nextPush = 0L
+        $nextContextRead = 0L
+        $nextStreamRetry = 0L
         $signature = ''
         $publishedSignature = ''
-        $sameReadings = 0
+        $publishedMoving = $false
         $publishedSettled = $false
+        $publishedLive = $false
         $observation = $null
         $script:OutstandingUpdates = @{}
         $script:CaptureIds = @{}
         $script:ForcePublish = $true
         $script:PreviewActive = $false
+        $script:StateStream = $null
+        $script:EventContext = $null
+        $script:EventConnected = $false
+        $script:EventPosition = $null
+        $script:EventPositionTick = 0L
+        $script:PositionConnected = $false
+        $script:PositionInitialized = $false
+        $script:PositionMotionActive = $false
+        $script:LastPositionSignature = ''
+        $script:LastPositionChangeTick = 0L
+        $streamFallbackReported = $false
+        try {
+            $state = Start-StateEventStream
+            if ($null -ne $state) {
+                $script:StateStream = $state.stream
+                $script:EventContext = $state.context
+                $script:EventConnected = $state.connected
+                $script:EventPosition = $state.position
+                $script:EventPositionTick = $state.positionTick
+                $observation = $state.observation
+                Register-PreviewObservation $observation
+                $signature = Get-ObservationSignature $observation
+                $nextContextRead = $script:Clock.ElapsedMilliseconds + 5000
+                $nextRead = [long]::MaxValue
+            } else {
+                $nextStreamRetry = $script:Clock.ElapsedMilliseconds + 30000
+            }
+        } catch {
+            $streamFallbackReported = $true
+            $nextStreamRetry = $script:Clock.ElapsedMilliseconds + 30000
+            Write-Host 'LightBurn event stream unavailable; using REST polling.'
+        }
         while (-not $script:StopRequested) {
             Read-UiCommand
             Update-Import
             if ($script:StopRequested) { break }
             $now = $script:Clock.ElapsedMilliseconds
-            if ($now -ge $nextRead) {
+            if ($null -ne $script:StateStream -and -not $script:StateStream.IsOpen) {
+                $script:StateStream.Dispose()
+                $script:StateStream = $null
+                $nextRead = 0L
+                $nextStreamRetry = $now + 30000
+                if (-not $streamFallbackReported) {
+                    Write-Host 'LightBurn event stream closed; using REST polling.'
+                    $streamFallbackReported = $true
+                }
+            }
+            if ($null -ne $script:StateStream) {
+                try {
+                    if ($now -ge $nextContextRead) {
+                        $script:EventContext = Get-ProjectContext
+                        if ($script:EventConnected -and $null -ne $script:EventPosition) {
+                            $observation = New-StateObservation $script:EventPosition $script:EventContext $true $script:EventPositionTick
+                            Register-PreviewObservation $observation
+                            $signature = Get-ObservationSignature $observation
+                        }
+                        $nextContextRead = $script:Clock.ElapsedMilliseconds + 5000
+                    }
+                    for ($eventIndex = 0; $eventIndex -lt 64; $eventIndex++) {
+                        $stateEvent = $script:StateStream.Take()
+                        if ($null -eq $stateEvent) { break }
+                        $eventTick = $script:Clock.ElapsedMilliseconds
+                        $eventAgeMs = [Math]::Max(0, ([DateTime]::UtcNow.Ticks - $stateEvent.ReceivedAtUtcTicks) / 10000.0)
+                        $eventTick = [Math]::Max(0, $eventTick - [long][Math]::Ceiling($eventAgeMs))
+                        if ($stateEvent.Name -ceq 'position') {
+                            $script:EventPosition = $stateEvent.Data | ConvertFrom-Json
+                            $script:EventPositionTick = $eventTick
+                            if ($script:EventConnected) {
+                                $observation = New-StateObservation $script:EventPosition $script:EventContext $true $eventTick $eventAgeMs
+                            }
+                        } elseif ($stateEvent.Name -ceq 'connection') {
+                            $connectionEvent = $stateEvent.Data | ConvertFrom-Json
+                            $connected = Get-Field $connectionEvent 'connected'
+                            if ($connected -isnot [bool]) { throw 'LightBurn connection event is invalid.' }
+                            if ($connected) {
+                                $state = Invoke-Local '/api/events/poll'
+                                $script:EventConnected = [bool](Get-Field (Get-Field $state 'connection') 'connected')
+                                $script:EventPosition = Get-Field $state 'position'
+                                $script:EventContext = Get-ProjectContext
+                                $script:EventPositionTick = $eventTick
+                                $observation = New-StateObservation $script:EventPosition $script:EventContext $script:EventConnected $eventTick $eventAgeMs
+                            } else {
+                                $script:EventConnected = $false
+                                $script:EventPosition = $null
+                                $observation = New-StateObservation $null $null $false $eventTick
+                            }
+                        } else { continue }
+                        Register-PreviewObservation $observation
+                        $signature = Get-ObservationSignature $observation
+                    }
+                } catch {
+                    $script:StateStream.Dispose()
+                    $script:StateStream = $null
+                    $nextRead = 0L
+                    $nextStreamRetry = $script:Clock.ElapsedMilliseconds + 30000
+                    if (-not $streamFallbackReported) {
+                        Write-Host 'LightBurn event stream failed; using REST polling.'
+                        $streamFallbackReported = $true
+                    }
+                }
+            }
+            if ($null -eq $script:StateStream -and $now -ge $nextRead) {
                 $observation = Get-Observation
-                $newSignature = Get-ObservationSignature $observation
-                if ($newSignature -ceq $signature) { $sameReadings++ }
-                else { $signature = $newSignature; $sameReadings = 1 }
+                Register-PreviewObservation $observation
+                $signature = Get-ObservationSignature $observation
                 $nextRead = [Math]::Max($now + 500, $script:Clock.ElapsedMilliseconds)
+            }
+            if ($null -eq $script:StateStream -and $now -ge $nextStreamRetry) {
+                try {
+                    $state = Start-StateEventStream
+                    if ($null -ne $state) {
+                        $script:StateStream = $state.stream
+                        $script:EventContext = $state.context
+                        $script:EventConnected = $state.connected
+                        $script:EventPosition = $state.position
+                        $script:EventPositionTick = $state.positionTick
+                        $observation = $state.observation
+                        Register-PreviewObservation $observation
+                        $signature = Get-ObservationSignature $observation
+                        $nextContextRead = $script:Clock.ElapsedMilliseconds + 5000
+                        $nextRead = [long]::MaxValue
+                        $streamFallbackReported = $false
+                    } else { $nextStreamRetry = $now + 30000 }
+                } catch {
+                    $nextStreamRetry = $script:Clock.ElapsedMilliseconds + 30000
+                }
             }
             try {
                 if ($null -eq $script:Generation -and $now -ge $nextConnect) {
@@ -758,13 +962,19 @@ function Start-Rap {
                         if ($script:Clock.ElapsedMilliseconds - $script:OutstandingUpdates[$id].tick -gt 5000) { throw 'Socket update acknowledgment timed out.' }
                     }
                     $now = $script:Clock.ElapsedMilliseconds
-                    $settled = $observation.connected -and $sameReadings -ge 3
+                    $motion = Get-PreviewMotion $observation $now
+                    $live = $motion.live
+                    $moving = $motion.moving
+                    $settled = $motion.settled
                     $due = $script:ForcePublish -or $now - $lastPush -ge 15000 -or
-                        ($script:PreviewActive -and ($signature -cne $publishedSignature -or $settled -ne $publishedSettled))
+                        ($moving -ne $publishedMoving) -or ($settled -ne $publishedSettled) -or
+                        ($live -ne $publishedLive) -or
+                        ($script:PreviewActive -and $signature -cne $publishedSignature)
                     if ($due -and $now -ge $nextPush -and $script:Socket.IsOpen) {
                         $script:Sequence++
                         $body = New-ObservationUpdate $observation
                         $body.settled = [bool]$settled
+                        $body.moving = [bool]$moving
                         $requestTick = $script:Clock.ElapsedMilliseconds
                         $script:ForcePublish = $false
                         $id = [Guid]::NewGuid().ToString()
@@ -773,7 +983,9 @@ function Start-Rap {
                         $nextPush = $requestTick + 500
                         $lastPush = $requestTick
                         $publishedSignature = $signature
+                        $publishedMoving = $moving
                         $publishedSettled = $settled
+                        $publishedLive = $live
                         foreach ($id in @($script:Journal.Keys)) {
                             if ($script:Journal[$id].pending) {
                                 try { Send-Record $id } catch { Write-Host 'Saved import state not acknowledged by cloud; retained for reconciliation.' }
@@ -807,6 +1019,7 @@ function Start-Rap {
     } finally {
         try { Stop-Import } finally {
             if ($null -ne $script:Socket) { $script:Socket.Dispose(); $script:Socket = $null }
+            if ($null -ne $script:StateStream) { $script:StateStream.Dispose(); $script:StateStream = $null }
             if ($null -ne $lock) { $lock.Dispose() }
         }
     }

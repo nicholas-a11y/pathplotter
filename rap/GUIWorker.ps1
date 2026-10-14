@@ -121,7 +121,7 @@ function Start-LightBurnConsent {
     } catch {
         $script:ConsentJob = $null
         Send-Ui 'consent-done' $false
-        Send-Ui 'notice' 'LightBurn did not respond. Open LightBurn, enable its REST API, keep network API access disabled, then try again.'
+        Send-Ui 'notice' 'LightBurn did not respond. Open LightBurn, keep network API access disabled, bring LightBurn to the foreground so the permission prompt appears, then try again.'
     }
 }
 
@@ -137,7 +137,7 @@ function Update-LightBurnConsent {
         Write-Protected 'credentials.dpapi' $script:Config
         $granted = $true
     } catch {
-        Send-Ui 'notice' 'LightBurn did not grant access. Enable its local REST API, keep network API access disabled, bring LightBurn forward and approve its dialog within 30 seconds. Retry only with consent.'
+        Send-Ui 'notice' 'LightBurn did not grant access. Keep network API access disabled, bring LightBurn to the foreground so its permission prompt appears, and approve it within 30 seconds. Retry only with consent.'
     }
     $pair = $null
     Send-Ui 'consent-done' $granted

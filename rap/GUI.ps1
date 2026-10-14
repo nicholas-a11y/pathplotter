@@ -370,7 +370,7 @@ function Start-RapDesktop {
         $layout.Controls.Add($d.approvals)
         $d.consentHelp = New-Object Windows.Forms.Label
         $d.consentHelp.AutoSize = $true; $d.consentHelp.MaximumSize = New-Object Drawing.Size(585, 0); $d.consentHelp.Visible = $false
-        $d.consentHelp.Text = 'To capture points, let RAP read LightBurn: turn on REST API in LightBurn (Settings > Extensions), click below, then approve LightBurn''s dialog within 30 seconds.'
+        $d.consentHelp.Text = 'To capture points, click below, bring LightBurn to the foreground so its permission prompt appears, then approve it within 30 seconds.'
         $layout.Controls.Add($d.consentHelp)
         $d.consent = New-UiButton 'Request local LightBurn permission' @{ action = 'consent' }
         $d.consent.Visible = $false; $layout.Controls.Add($d.consent)

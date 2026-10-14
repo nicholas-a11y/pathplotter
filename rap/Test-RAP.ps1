@@ -49,6 +49,7 @@ try {
         $script:Wire = @{ url = $Url; method = $Method; token = $Token; body = $Body; headers = $Headers; timeout = $TimeoutMs; raw = [bool]$Raw }
         return @{ code = 202 }
     }
+    function Start-StateEventStream { return $null }
     Initialize-Storage
 
     Check 'HMAC-SHA256 minute token exact known vector' {
@@ -211,6 +212,22 @@ try {
     function Fresh-Observation {
         return @{ connected = $true; position = $script:Observation.position; context = $script:Observation.context; observationAgeMs = 0; tick = $script:Clock.ElapsedMilliseconds; error = $null }
     }
+    Check 'Position activity starts on coordinate changes and settles exactly after two quiet seconds' {
+        $script:PositionConnected = $false
+        $script:PositionInitialized = $false
+        $script:PositionMotionActive = $false
+        $base = Fresh-Observation
+        $base.tick = 1000
+        Register-PreviewObservation $base
+        Assert (-not (Get-PreviewMotion $base 2999).settled)
+        Assert ((Get-PreviewMotion $base 3000).settled)
+        $moved = @{ connected = $true; position = @{ x = $base.position.x + 1; y = $base.position.y }; context = $base.context; observationAgeMs = 0; tick = 3100; error = $null }
+        Register-PreviewObservation $moved
+        Assert ((Get-PreviewMotion $moved 3100).moving -and -not (Get-PreviewMotion $moved 3100).settled)
+        Assert ((Get-PreviewMotion $moved 5099).moving)
+        $stopped = Get-PreviewMotion $moved 5100
+        Assert (-not $stopped.moving -and $stopped.settled)
+    }
     Check 'UTF-8 checksum, expiry, anchor, context and readiness validation' {
         $job = New-TestJob
         $bytes = Assert-Job $job (Fresh-Observation)
@@ -281,6 +298,28 @@ try {
             Assert ($null -eq $stream.Take(100))
             $fixture.Emit("event: file_imported`ndata: {`"success`":`ndata: true}`n`n")
             Assert ((Get-ImportResult ($stream.Take(5000))) -eq 'confirmed')
+        } finally { $stream.Dispose(); $fixture.Dispose() }
+    }
+    Check 'State SSE reader retains position and connection events without weakening import confirmation' {
+        $fixture = New-Object PathPlotterRapTests.SseFixture(':connected')
+        $stream = New-Object PathPlotterRap.StateEventStream($fixture.Url, 'synthetic-test-token')
+        try {
+            Assert ($stream.WaitReady(5000))
+            $fixture.Emit("event: job`ndata: {`"state`":`"idle`"}`n`nevent: position`ndata: {`"workpiece`":{`"x`":12.5,`"y`":-4}}`n`nevent: connection`ndata: {`"connected`":false}`n`n")
+            $first = $null
+            $second = $null
+            $deadline = $script:Clock.ElapsedMilliseconds + 3000
+            while ($null -eq $second -and $script:Clock.ElapsedMilliseconds -lt $deadline) {
+                $nextEvent = $stream.Take()
+                if ($null -ne $nextEvent) {
+                    if ($null -eq $first) { $first = $nextEvent } else { $second = $nextEvent }
+                } else { Start-Sleep -Milliseconds 10 }
+            }
+            Assert ($null -ne $first -and $first.Name -ceq 'position') 'The position event was not retained.'
+            Assert (($first.Data | ConvertFrom-Json).workpiece.x -eq 12.5)
+            Assert ($first.ReceivedAtUtcTicks -gt 0)
+            Assert ($null -ne $second -and $second.Name -ceq 'connection') 'The connection event was not retained.'
+            Assert (-not ($stream.Take()))
         } finally { $stream.Dispose(); $fixture.Dispose() }
     }
     Check 'HTTP JSON validation, authorization errors, redirects and whole-request timeout fail closed' {
@@ -717,25 +756,88 @@ try {
             param($text)
             $message = $text | ConvertFrom-Json
             $script:TimingMessages.Add(@{ tick = $script:Clock.ElapsedMilliseconds; body = $message.body })
-            $result = @{ serverTime = 1800000000000.0; previewActive = $true; pairings = @(); job = $null }
+            $result = @{ serverTime = 1800000000000.0; previewActive = [bool]$message.body.moving; pairings = @(); job = $null }
             $this.Queue.Enqueue((@{ v = 2; type = 'update-result'; id = $message.id; body = $result } | ConvertTo-Json -Depth 25 -Compress))
         }
         $mock | Add-Member ScriptMethod Take { if ($this.Queue.Count) { return $this.Queue.Dequeue() }; return $null }
         $mock | Add-Member ScriptMethod Dispose { $this.IsOpen = $false }
         return $mock
     }
-    Check 'Local 500ms reads remain independent: maximum 2Hz preview, settled once, fresh 15s idle health, no HTTP updates' {
+    Check 'REST fallback retains fresh capture health and sends a settled transition after two seconds' {
         $script:Journal = @{}; Save-Journal
         $script:TimingClock.Restart()
         Start-Rap
         Assert ($script:ReadCount -ge 30 -and $script:TimingHttp.Count -eq 0) ('Reads=' + $script:ReadCount + ' http=' + $script:TimingHttp.Count)
-        Assert ($script:TimingMessages.Count -eq 4) ('Stationary socket published too often or omitted health: ' + $script:TimingMessages.Count + ' messages.')
+        Assert ($script:TimingMessages.Count -eq 3) ('Stationary socket published too often or omitted health: ' + $script:TimingMessages.Count + ' messages.')
         for ($i = 1; $i -lt $script:TimingMessages.Count; $i++) {
             Assert ($script:TimingMessages[$i].tick - $script:TimingMessages[$i - 1].tick -ge 495) ('Publishes ' + $i + ' too close: ' + ($script:TimingMessages[$i].tick - $script:TimingMessages[$i - 1].tick) + ' ms.')
         }
-        Assert (-not $script:TimingMessages[0].body.settled -and $script:TimingMessages[2].body.settled) 'Settled flags are wrong.'
-        Assert ($script:TimingMessages[3].tick - $script:TimingMessages[2].tick -ge 15000) ('Idle health came after ' + ($script:TimingMessages[3].tick - $script:TimingMessages[2].tick) + ' ms.')
-        Assert ($script:TimingMessages[3].body.observationAgeMs -lt 600 -and $script:TimingMessages[3].body.connected) 'Idle health observation was stale.'
+        Assert (-not $script:TimingMessages[0].body.settled -and $script:TimingMessages[1].body.settled) 'The initial and settled flags are wrong.'
+        Assert ($script:TimingMessages[1].tick - $script:TimingMessages[0].tick -ge 1900) 'Preview settled before two seconds without a position change.'
+        Assert (-not $script:TimingMessages[0].body.moving -and -not $script:TimingMessages[1].body.moving) 'A stationary RAP incorrectly reported movement.'
+        Assert ($script:TimingMessages[2].tick - $script:TimingMessages[1].tick -ge 15000) ('Idle health came after ' + ($script:TimingMessages[2].tick - $script:TimingMessages[1].tick) + ' ms.')
+        Assert ($script:TimingMessages[2].body.observationAgeMs -lt 600 -and $script:TimingMessages[2].body.connected) 'Idle health observation was stale.'
+    }
+    Check 'LightBurn state events activate preview on movement and release it after two quiet seconds' {
+        $script:Journal = @{}; Save-Journal
+        $script:TimingMessages = New-Object 'Collections.Generic.List[object]'
+        $script:TimingClock.Restart()
+        $script:EventStartTick = $script:Clock.ElapsedMilliseconds
+        $script:EventIndex = 0
+        $script:EventSchedule = @(
+            @{ at = 500; x = 101 },
+            @{ at = 1000; x = 102 },
+            @{ at = 1500; x = 103 },
+            @{ at = 2000; x = 103 },
+            @{ at = 2500; x = 103 }
+        )
+        $script:EventBase = Fresh-Observation
+        function Start-StateEventStream {
+            $mock = New-Object PSObject -Property @{ IsOpen = $true; Disposed = $false }
+            $mock | Add-Member ScriptMethod Take {
+                if ($script:EventIndex -lt $script:EventSchedule.Count -and
+                    $script:Clock.ElapsedMilliseconds - $script:EventStartTick -ge $script:EventSchedule[$script:EventIndex].at) {
+                    $sample = $script:EventSchedule[$script:EventIndex]
+                    $script:EventIndex++
+                    $payload = @{ workpiece = @{ x = $sample.x; y = $script:EventBase.position.y } } | ConvertTo-Json -Depth 5 -Compress
+                    return New-Object PathPlotterRap.StateEvent('position', $payload)
+                }
+                return $null
+            }
+            $mock | Add-Member ScriptMethod Dispose { $this.IsOpen = $false; $this.Disposed = $true }
+            $position = @{ workpiece = @{ x = $script:EventBase.position.x; y = $script:EventBase.position.y } }
+            return @{ stream = $mock; context = $script:EventBase.context; connected = $true; position = $position; positionTick = $script:EventBase.tick; observation = $script:EventBase }
+        }
+        function Read-UiCommand { if ($script:TimingClock.ElapsedMilliseconds -ge 4100) { $script:StopRequested = $true } }
+        function Invoke-Cloud([string]$Path, $Body = @{}, [string]$Method = 'POST') {
+            if ($Path -eq '/agent/start') { return @{ generation = 12; serverTime = 1800000000000.0 } }
+            throw 'Unexpected event-stream test cloud call.'
+        }
+        function New-AgentSocket {
+            $mock = New-Object PSObject -Property @{ IsOpen = $true; IsFinished = $false; Failure = ''; Queue = (New-Object 'Collections.Generic.Queue[string]') }
+            $mock | Add-Member ScriptMethod Enqueue {
+                param($text)
+                $message = $text | ConvertFrom-Json
+                $script:TimingMessages.Add(@{ tick = $script:TimingClock.ElapsedMilliseconds; body = $message.body })
+                $result = @{ serverTime = 1800000000000.0; previewActive = [bool]$message.body.moving; pairings = @(); job = $null }
+                $this.Queue.Enqueue((@{ v = 2; type = 'update-result'; id = $message.id; body = $result } | ConvertTo-Json -Depth 25 -Compress))
+            }
+            $mock | Add-Member ScriptMethod Take { if ($this.Queue.Count) { return $this.Queue.Dequeue() }; return $null }
+            $mock | Add-Member ScriptMethod Dispose { $this.IsOpen = $false }
+            return $mock
+        }
+        Start-Rap
+        $movingMessages = @($script:TimingMessages | Where-Object { $_.body.moving })
+        $settledMessages = @($script:TimingMessages | Where-Object { $_.body.settled })
+        Assert ($movingMessages.Count -eq 3) ('Movement update count was ' + $movingMessages.Count + '.')
+        $motionHistory = ($script:TimingMessages | ForEach-Object { '{0}ms moving={1} settled={2}' -f $_.tick, $_.body.moving, $_.body.settled }) -join ', '
+        Assert ($settledMessages.Count -eq 1 -and -not $settledMessages[0].body.moving) ('The final settled update was missing or still marked moving. Updates: ' + $motionHistory)
+        Assert ($settledMessages[0].tick - $movingMessages[-1].tick -ge 1900) 'The preview lease was released before two quiet seconds.'
+        for ($i = 1; $i -lt $movingMessages.Count; $i++) {
+            Assert ($movingMessages[$i].tick - $movingMessages[$i - 1].tick -ge 495) 'Movement updates exceeded the documented LightBurn event cadence.'
+        }
+        Assert ($null -eq $script:StateStream) 'RAP did not dispose the position event stream on exit.'
+        function Start-StateEventStream { return $null }
     }
     Check 'Relay version refusal pauses RAP, reports Update now and backs off' {
         $script:Healths = New-Object 'Collections.Generic.List[string]'

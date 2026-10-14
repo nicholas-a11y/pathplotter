@@ -174,7 +174,7 @@ try {
     Start-LightBurnConsent
     Update-LightBurnConsent
     $kinds = @(foreach ($ev in (Read-Events)) { [string]$ev.kind + ':' + $ev.value })
-    if (($kinds -join ',') -cne 'consent-pending:,notice:LightBurn did not grant access. Enable its local REST API, keep network API access disabled, bring LightBurn forward and approve its dialog within 30 seconds. Retry only with consent.,consent-done:False' -or $script:Config.lightBurnSecret -ne '') { throw 'Denied LightBurn consent was stored or not reported: ' + ($kinds -join ',') }
+    if (($kinds -join ',') -cne 'consent-pending:,notice:LightBurn did not grant access. Keep network API access disabled, bring LightBurn to the foreground so its permission prompt appears, and approve it within 30 seconds. Retry only with consent.,consent-done:False' -or $script:Config.lightBurnSecret -ne '') { throw 'Denied LightBurn consent was stored or not reported: ' + ($kinds -join ',') }
     $script:ConsentAnswer = @{ status = 'ok'; secret = 'fixture-granted' }
     Start-LightBurnConsent
     Update-LightBurnConsent
