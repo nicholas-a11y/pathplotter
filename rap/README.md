@@ -46,6 +46,10 @@ If an update cannot be installed automatically, for example because the folder i
 | Nothing happens on start | Run **Start RAP diagnostics.cmd** to see startup errors in a console window. |
 | Windows blocks the scripts | Follow your organization's approved procedure. Do not disable security protections. |
 
+RAP considers LightBurn ready when its position API returns finite workpiece X/Y coordinates and valid project context is available. It does not require LightBurn's connection flag, which can report disconnected for a working Ruida machine. If the event stream reports disconnected or has no usable connection flag, RAP uses REST polling to verify coordinate availability instead.
+
+This checks API coordinate availability, not physical connectivity: LightBurn may return cached coordinates. Check that the reported position follows the head when you move it in LightBurn. Failed position requests or invalid coordinates/context pause capture; existing freshness checks still apply.
+
 The tray menu also has **Forget LightBurn permission** and **Forget local registration** for starting over. These do not revoke remote permissions.
 
 ## Privacy and safety

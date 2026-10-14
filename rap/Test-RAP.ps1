@@ -42,6 +42,8 @@ try {
     . (Join-Path $PSScriptRoot 'RAP.ps1') -DataDirectory $statePath
     . (Join-Path $PSScriptRoot 'Updater.ps1')
     $script:OriginalHttp = ${function:Invoke-Http}
+    $script:OriginalObservation = ${function:Get-Observation}
+    $script:OriginalStateEventStream = ${function:Start-StateEventStream}
     $script:CaptureHttp = $false
     # Nothing below may accidentally call actual cloud/LightBurn HTTP.
     function Invoke-Http([string]$Url, [string]$Method, [string]$Token, $Body = $null, [hashtable]$Headers = @{}, [int]$TimeoutMs = 5000, [switch]$Raw) {
@@ -116,12 +118,20 @@ try {
     $script:Mode = 'good'
     function Invoke-Local([string]$Path) {
         $script:LocalCalls.Add($Path)
+        if ($script:Mode -eq 'auth') { throw 'HTTP authorization failed (401). Check clock, permissions or revoke/re-pair explicitly.' }
+        if ($script:Mode -eq 'nosecret') { throw 'Local LightBurn credentials are missing.' }
         switch ($Path) {
             '/api/status' {
                 if ($script:Mode -eq 'offline') { return @{ connected = $false } }
-                if ($script:Mode -eq 'auth') { throw 'HTTP authorization failed (401). Check clock, permissions or revoke/re-pair explicitly.' }
-                if ($script:Mode -eq 'nosecret') { throw 'Local LightBurn credentials are missing.' }
+                if ($script:Mode -eq 'nostatus') { return @{} }
                 return @{ connected = $true }
+            }
+            '/api/events/poll' {
+                $connection = @{ connected = $true }
+                if ($script:Mode -eq 'offline') { $connection.connected = $false }
+                if ($script:Mode -eq 'nostatus') { $connection = @{} }
+                if ($script:Mode -eq 'invalidstatus') { $connection.connected = 'true' }
+                return @{ connection = $connection; position = @{ workpiece = @{ x = 12.5; y = 9.25 } } }
             }
             '/api/project' {
                 $workspace = @{ machine_size = @{ x = 400; y = 300 }; workpiece_size = @{ x = 100; y = 80 }; workpiece_offset = @{ x = 20; y = 30 }; machine_view = $false }
@@ -131,24 +141,65 @@ try {
                 return @{ workspace = $workspace; filename = 'work.lbrn2'; device = @{ name = 'Mock machine' } }
             }
             '/api/position' {
+                if ($script:Mode -eq 'timeout') { throw 'HTTP network/timeout failure (test).' }
+                if ($script:Mode -eq 'missing') { return @{} }
                 if ($script:Mode -eq 'machine') { return @{ machine = @{ x = 1; y = 2 } } }
                 if ($script:Mode -eq 'nan') { return @{ workpiece = @{ x = [double]::NaN; y = 2 } } }
+                if ($script:Mode -eq 'infinite') { return @{ workpiece = @{ x = 1; y = [double]::PositiveInfinity } } }
+                if ($script:Mode -eq 'malformed') { return @{ workpiece = @{ x = '12.5'; y = 2 } } }
+                if ($script:Mode -eq 'zero-negative') { return @{ workpiece = @{ x = 0; y = -9.25 } } }
                 return @{ workpiece = @{ x = 12.5; y = 9.25 }; machine = @{ x = 999; y = 999 } }
             }
             default { throw 'Unexpected local endpoint.' }
         }
     }
-    Check 'Workpiece-only reads serialized with current status and context, never zero/machine fallback' {
+    $script:ObservationLocal = ${function:Invoke-Local}
+    Check 'Workpiece-only reads require valid position and context, not the connection flag' {
         $script:Observation = Get-Observation
         Assert $script:Observation.connected
         Assert ($script:Observation.position.x -eq 12.5 -and $script:Observation.position.y -eq 9.25)
-        Assert (($script:LocalCalls -join ',') -eq '/api/status,/api/project,/api/position')
-        foreach ($mode in @('offline', 'auth', 'empty', 'machine', 'nan')) {
+        Assert (($script:LocalCalls -join ',') -eq '/api/project,/api/position')
+        foreach ($mode in @('offline', 'nostatus')) {
+            $script:Mode = $mode
+            $script:LocalCalls.Clear()
+            $valid = Get-Observation
+            Assert ($valid.connected -and $valid.position.x -eq 12.5 -and $valid.position.y -eq 9.25)
+            Assert (($script:LocalCalls -join ',') -eq '/api/project,/api/position')
+        }
+        $script:Mode = 'zero-negative'
+        $valid = Get-Observation
+        Assert ($valid.connected -and $valid.position.x -eq 0 -and $valid.position.y -eq -9.25)
+        foreach ($mode in @('auth', 'empty', 'machine', 'nan', 'infinite', 'malformed', 'missing', 'timeout')) {
             $script:Mode = $mode
             $bad = Get-Observation
-            Assert (-not $bad.connected -and $null -eq $bad.position -and $null -eq $bad.context)
+            Assert (-not $bad.connected -and $null -eq $bad.position -and $null -eq $bad.context -and $bad.error)
+            if ($mode -eq 'auth') { Assert ($bad.error -like 'LightBurn API authorization failed*') }
+            if ($mode -eq 'timeout') { Assert ($bad.error -like 'LightBurn is not listening or timed out*') }
         }
         $script:Mode = 'good'
+    }
+    Check 'Unusable stream flags dispose the stream and allow fresh REST position verification on every retry' {
+        function New-StateEventStream {
+            $script:MockStateStream = New-Object PSObject -Property @{ Disposed = $false }
+            $script:MockStateStream | Add-Member ScriptMethod WaitReady { param($timeout); return $true }
+            $script:MockStateStream | Add-Member ScriptMethod Dispose { $this.Disposed = $true }
+            return $script:MockStateStream
+        }
+        try {
+            foreach ($mode in @('offline', 'nostatus', 'invalidstatus')) {
+                $script:Mode = $mode
+                for ($attempt = 0; $attempt -lt 2; $attempt++) {
+                    Must-Throw { & $script:OriginalStateEventStream }
+                    Assert $script:MockStateStream.Disposed
+                    $valid = Get-Observation
+                    Assert ($valid.connected -and $valid.position.x -eq 12.5)
+                }
+            }
+            $script:Mode = 'good'
+            $state = & $script:OriginalStateEventStream
+            Assert ($state.connected -and $state.observation.connected -and -not $state.stream.Disposed)
+            $state.stream.Dispose()
+        } finally { $script:Mode = 'good' }
     }
     Check 'Workspace offset changes context revision; absent workpiece size remains unknown' {
         $first = Get-Observation
@@ -838,6 +889,77 @@ try {
         }
         Assert ($null -eq $script:StateStream) 'RAP did not dispose the position event stream on exit.'
         function Start-StateEventStream { return $null }
+    }
+    Check 'Stream startup with false or missing flags publishes verified REST coordinates' {
+        function Start-StateEventStream { return & $script:OriginalStateEventStream }
+        function Get-Observation { return & $script:OriginalObservation }
+        function Invoke-Local([string]$Path) { return & $script:ObservationLocal $Path }
+        function New-StateEventStream {
+            $script:MockStateStream = New-Object PSObject -Property @{ Disposed = $false }
+            $script:MockStateStream | Add-Member ScriptMethod WaitReady { param($timeout); return $true }
+            $script:MockStateStream | Add-Member ScriptMethod Dispose { $this.Disposed = $true }
+            return $script:MockStateStream
+        }
+        function Read-UiCommand { if ($script:TimingClock.ElapsedMilliseconds -ge 700) { $script:StopRequested = $true } }
+        try {
+            foreach ($mode in @('offline', 'nostatus', 'invalidstatus')) {
+                $script:Mode = $mode
+                $script:TimingMessages.Clear()
+                $script:LocalCalls.Clear()
+                $script:TimingClock.Restart()
+                Start-Rap
+                Assert $script:MockStateStream.Disposed
+                Assert ($script:LocalCalls.Contains('/api/position') -and -not $script:LocalCalls.Contains('/api/status'))
+                Assert ($script:TimingMessages.Count -ge 1 -and $script:TimingMessages[0].body.connected)
+                Assert ($script:TimingMessages[0].body.position.x -eq 12.5 -and $null -ne $script:TimingMessages[0].body.context)
+            }
+        } finally { $script:Mode = 'good' }
+    }
+    Check 'Connection events fall back to position queries, clear failed reads and recover without the flag' {
+        function Start-StateEventStream { return & $script:OriginalStateEventStream }
+        function Get-Observation { return & $script:OriginalObservation }
+        function Invoke-Local([string]$Path) { return & $script:ObservationLocal $Path }
+        function New-StateEventStream {
+            $script:MockStateStream = New-Object PSObject -Property @{ IsOpen = $true; Disposed = $false; Emitted = $false }
+            $script:MockStateStream | Add-Member ScriptMethod WaitReady { param($timeout); return $true }
+            $script:MockStateStream | Add-Member ScriptMethod Take {
+                if (-not $this.Emitted -and $script:TimingClock.ElapsedMilliseconds -ge 100) {
+                    $this.Emitted = $true
+                    $script:Mode = $script:ConnectionScenario
+                    $connected = $script:ConnectionScenario -ne 'offline'
+                    $payload = @{ connected = $connected } | ConvertTo-Json -Compress
+                    return New-Object PathPlotterRap.StateEvent('connection', $payload)
+                }
+                return $null
+            }
+            $script:MockStateStream | Add-Member ScriptMethod Dispose { $this.IsOpen = $false; $this.Disposed = $true }
+            return $script:MockStateStream
+        }
+        function Read-UiCommand {
+            $elapsed = $script:TimingClock.ElapsedMilliseconds
+            if ($elapsed -ge 2200) { $script:StopRequested = $true }
+            elseif ($elapsed -ge 1200) { $script:Mode = 'offline' }
+            elseif ($elapsed -ge 600) { $script:Mode = 'timeout' }
+        }
+        try {
+            foreach ($scenario in @('offline', 'nostatus', 'invalidstatus')) {
+                $script:ConnectionScenario = $scenario
+                $script:Mode = 'good'
+                $script:TimingMessages.Clear()
+                $script:LocalCalls.Clear()
+                $script:TimingClock.Restart()
+                Start-Rap
+                Assert ($script:MockStateStream.Emitted -and $script:MockStateStream.Disposed)
+                $positionReads = @($script:LocalCalls | Where-Object { $_ -ceq '/api/position' })
+                Assert ($positionReads.Count -ge 4 -and -not $script:LocalCalls.Contains('/api/status'))
+                $failed = @($script:TimingMessages | Where-Object { -not $_.body.connected })
+                Assert ($failed.Count -ge 1) 'A failed position request did not clear the live observation.'
+                Assert ($null -eq $failed[0].body.position -and $null -eq $failed[0].body.context -and $failed[0].body.error)
+                $recovered = $script:TimingMessages[$script:TimingMessages.Count - 1]
+                Assert ($recovered.body.connected -and $recovered.body.position.x -eq 12.5 -and $recovered.tick -gt $failed[0].tick) 'Valid position responses did not restore readiness.'
+                Assert ($null -eq $script:StateStream)
+            }
+        } finally { $script:Mode = 'good' }
     }
     Check 'Relay version refusal pauses RAP, reports Update now and backs off' {
         $script:Healths = New-Object 'Collections.Generic.List[string]'

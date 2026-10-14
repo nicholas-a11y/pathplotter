@@ -479,7 +479,7 @@ function Start-StateEventStream {
         if (-not $stream.WaitReady(1500)) { throw 'LightBurn state event stream did not become ready.' }
         $state = Invoke-Local '/api/events/poll'
         $connection = Get-Field (Get-Field $state 'connection') 'connected'
-        if ($connection -isnot [bool]) { throw 'LightBurn event snapshot has no connection state.' }
+        if ($connection -isnot [bool] -or -not $connection) { throw 'LightBurn event connection state is not usable; verify coordinates through REST polling.' }
         $context = Get-ProjectContext
         $observation = New-StateObservation (Get-Field $state 'position') $context $connection
         return @{
@@ -496,8 +496,6 @@ function Start-StateEventStream {
 function Get-Observation {
     $timer = [Diagnostics.Stopwatch]::StartNew()
     try {
-        $status = Invoke-Local '/api/status'
-        if ((Get-Field $status 'connected') -isnot [bool] -or $status.connected -ne $true) { throw 'No connected LightBurn machine.' }
         $context = Get-ProjectContext
         $position = Invoke-Local '/api/position'
         $point = Get-Field $position 'workpiece'
@@ -509,8 +507,7 @@ function Get-Observation {
         }
     } catch {
         $errorText = 'LightBurn returned invalid or unavailable workpiece/context data.'
-        if ($_.Exception.Message -eq 'No connected LightBurn machine.') { $errorText = 'LightBurn API available, but no machine connected.' }
-        elseif ($_.Exception.Message -like 'Local LightBurn credentials are missing*') { $errorText = 'LightBurn permission has not been granted yet. Click Request local LightBurn permission.' }
+        if ($_.Exception.Message -like 'Local LightBurn credentials are missing*') { $errorText = 'LightBurn permission has not been granted yet. Click Request local LightBurn permission.' }
         elseif ($_.Exception.Message -like 'HTTP authorization failed*') { $errorText = 'LightBurn API authorization failed. Check Windows clock and Manage API Security; re-pair only with consent.' }
         elseif ($_.Exception.Message -like 'HTTP network/timeout failure*') { $errorText = 'LightBurn is not listening or timed out. Open LightBurn and try again.' }
         return @{ connected = $false; position = $null; context = $null; observationAgeMs = $timer.ElapsedMilliseconds; tick = $script:Clock.ElapsedMilliseconds; error = $errorText }
@@ -888,15 +885,15 @@ function Start-Rap {
                             if ($connected -isnot [bool]) { throw 'LightBurn connection event is invalid.' }
                             if ($connected) {
                                 $state = Invoke-Local '/api/events/poll'
-                                $script:EventConnected = [bool](Get-Field (Get-Field $state 'connection') 'connected')
+                                $snapshotConnected = Get-Field (Get-Field $state 'connection') 'connected'
+                                if ($snapshotConnected -isnot [bool] -or -not $snapshotConnected) { throw 'LightBurn event connection state is not usable; verify coordinates through REST polling.' }
+                                $script:EventConnected = $true
                                 $script:EventPosition = Get-Field $state 'position'
                                 $script:EventContext = Get-ProjectContext
                                 $script:EventPositionTick = $eventTick
                                 $observation = New-StateObservation $script:EventPosition $script:EventContext $script:EventConnected $eventTick $eventAgeMs
                             } else {
-                                $script:EventConnected = $false
-                                $script:EventPosition = $null
-                                $observation = New-StateObservation $null $null $false $eventTick
+                                throw 'LightBurn event reported disconnected; verify coordinates through REST polling.'
                             }
                         } else { continue }
                         Register-PreviewObservation $observation
